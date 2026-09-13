@@ -1,0 +1,30 @@
+database:
+  url: "duckdb:///./data/marketmind.duckdb"
+
+quote:
+  refresh_seconds: 60
+  stale_seconds: 180
+
+tushare:
+  token: "YOUR_TUSHARE_TOKEN"
+
+providers:
+  quote:
+    cn_stock: akshare
+    cn_etf: tencent
+    hk_stock: tencent
+    hk_etf: tencent
+    cn_index: tencent
+    hk_index: tencent
+
+  fundamental:
+    cn_stock: tushare
+
+  # 第三方数据源超时（秒）：可按线上实际耗时调整；缺省时使用默认值
+  timeout:
+    tencent: 8
+    akshare: 15
+    tushare: 15
+
+logging:
+  level: INFO

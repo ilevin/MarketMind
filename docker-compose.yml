@@ -1,0 +1,11 @@
+services:
+  marketmind:
+    build: .
+    image: marketmind
+    container_name: marketmind
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro

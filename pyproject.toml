@@ -1,0 +1,39 @@
+[project]
+name = "marketmind"
+version = "0.1.0"
+description = "以 DuckDB 为本地分析内核的个人证券研究工具（A股/港股，AKShare + Tushare）"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "SQLAlchemy>=2.0",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "akshare>=1.14",
+    "tushare>=1.4",
+    "alembic>=1.13",
+    # DuckDB 持久层：精确锁定版本（技术方案 D1，第三方方言与 DuckDB 版本强耦合）
+    "duckdb==1.5.5",
+    "duckdb-sqlalchemy==1.5.5.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not online'"
+markers = ["online: 需要真实网络的在线测试"]

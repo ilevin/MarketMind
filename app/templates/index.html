@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>股票与 ETF 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="index">
+  <header class="topbar">
+    <h1>股票与 ETF 行情看板</h1>
+    <nav>
+      <a href="/watchlist">自选管理 →</a>
+      <a href="/tags">标签管理 →</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div id="market-status" class="market-status">
+      <span class="market-badge" id="status-CN">A股 · --</span>
+      <span class="market-badge" id="status-HK">港股 · --</span>
+    </div>
+
+    <section class="panel">
+      <h2>指数行情</h2>
+      <div id="indices" class="indices"></div>
+      <p id="indices-empty" class="empty hidden">还没有配置指数，去自选管理页添加。</p>
+    </section>
+
+    <section class="panel">
+      <h2>自选行情</h2>
+      <div class="filter-bar">
+        <label for="tag-filter">标签：</label>
+        <select id="tag-filter">
+          <option value="all">全部</option>
+          <option value="untagged">无标签</option>
+        </select>
+      </div>
+      <table class="table" id="quotes-table">
+        <thead>
+          <tr>
+            <th>名称</th><th>代码</th><th>市场</th><th>标签</th>
+            <th class="right">当前价格</th><th class="right">今日涨幅</th><th class="right">量比</th>
+            <th class="right">PE(TTM)</th><th class="right">PB</th><th class="right">股息率(TTM)</th>
+            <th class="right">行情更新时间</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="quotes-empty" class="empty hidden">还没有自选标的，去<a href="/watchlist">添加一个</a>。</p>
+      <p id="quotes-filter-empty" class="empty hidden">没有符合当前筛选的标的。</p>
+    </section>
+
+    <p id="error-message" class="message error hidden"></p>
+  </main>
+
+  <footer class="footer">marketmind {{ app_version }}</footer>
+
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>标签管理 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="tags">
+  <header class="topbar">
+    <h1>标签管理</h1>
+    <nav>
+      <a href="/">← 行情首页</a>
+      <a href="/watchlist">自选管理 →</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>标签</h2>
+      <form id="add-tag-form" class="add-form">
+        <input type="text" id="tag-name-input" placeholder="标签名称，如 高股息、科技" required maxlength="50">
+        <button type="submit">新增标签</button>
+      </form>
+      <p id="tag-message" class="message hidden"></p>
+      <table class="table" id="tags-table">
+        <thead>
+          <tr>
+            <th>标签名称</th><th class="right">使用数量</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="tags-empty" class="empty hidden">还没有标签，先创建一个，再到自选管理页关联股票 / ETF。</p>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

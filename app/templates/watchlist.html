@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自选管理 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="watchlist">
+  <header class="topbar">
+    <h1>自选管理</h1>
+    <nav>
+      <a href="/">← 行情首页</a>
+      <a href="/tags">标签管理 →</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>股票 / ETF 自选</h2>
+      <form id="add-watchlist-form" class="add-form">
+        <input type="text" id="wl-symbol" placeholder="证券代码，如 600519" required>
+        <select id="wl-market">
+          <option value="CN">A股</option>
+          <option value="HK">港股</option>
+        </select>
+        <select id="wl-type">
+          <option value="STOCK">股票</option>
+          <option value="ETF">ETF</option>
+        </select>
+        <button type="submit">添加</button>
+      </form>
+      <p id="wl-message" class="message hidden"></p>
+      <table class="table" id="wl-table">
+        <thead>
+          <tr>
+            <th>名称</th><th>代码</th><th>市场</th><th>类型</th><th>标签</th><th class="right">排序</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="wl-empty" class="empty hidden">还没有自选标的，去添加一个。</p>
+    </section>
+
+    <section class="panel">
+      <h2>指数行情配置</h2>
+      <form id="add-index-form" class="add-form">
+        <input type="text" id="idx-symbol" placeholder="指数代码，如 000001（上证指数）、HSTECH（恒生科技指数）" required>
+        <select id="idx-market">
+          <option value="CN">A股</option>
+          <option value="HK">港股</option>
+        </select>
+        <button type="submit">添加指数</button>
+      </form>
+      <p id="idx-message" class="message hidden"></p>
+      <table class="table" id="idx-table">
+        <thead>
+          <tr>
+            <th>名称</th><th>代码</th><th>市场</th><th class="right">排序</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="idx-empty" class="empty hidden">还没有配置指数。</p>
+    </section>
+  </main>
+
+  <!-- 标签编辑弹层：操作列「标签」按钮打开，层内点击标签即添加/取消关联 -->
+  <div id="tag-edit-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3 id="tag-edit-title">编辑标签</h3>
+      <div id="tag-edit-chips" class="modal-chips"></div>
+      <p class="modal-hint">点击标签即可添加 / 取消关联（即时保存）；新标签请先在标签管理页创建。</p>
+      <div class="modal-actions">
+        <button type="button" id="tag-edit-close">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

@@ -80,4 +80,4 @@
 - [x] 10.1 对照技术方案 §52 Phase 1 验收清单逐项勾验（20 项，含"全新 docker compose up 自动建库、无 SQLite 依赖、无 PRAGMA、无 batch、单 worker、重启数据不丢、quote_snapshot 一证券一行"等）
 - [x] 10.2 对照本变更 `specs/` 16 个能力规格的 Scenario 抽查关键契约（API 响应结构、错误码、时间格式、缓存回退、删除保护）
 - [x] 10.3 `grep -ri sqlite` 全库确认无残留（`reference/`、`research/`、`openspec/` 归档除外）
-- [ ] 10.4 整理 git 提交（按任务组拆分），CHANGELOG 补记 v0.1.0 发布说明，准备进入第二里程碑（T11–T16 升级工具链）
+- [x] 10.4 整理 git 提交（按任务组拆分），CHANGELOG 补记 v0.1.0 发布说明，准备进入第二里程碑（T11–T16 升级工具链）

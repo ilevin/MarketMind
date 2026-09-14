@@ -9,6 +9,8 @@ from app.models.trading_calendar import TradingCalendarDay
 from app.models.tag import Tag
 from app.models.job_status import JobStatus
 from app.models.watchlist_tag import WatchlistTag
+from app.models.user import AppUser
+from app.models.user_session import UserSession
 
 __all__ = [
     "Instrument",
@@ -21,4 +23,6 @@ __all__ = [
     "Tag",
     "JobStatus",
     "WatchlistTag",
+    "AppUser",
+    "UserSession",
 ]

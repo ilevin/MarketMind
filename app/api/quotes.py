@@ -1,9 +1,15 @@
-"""行情与指数查询 API：只读缓存，浏览器不直接触发数据源请求。"""
+"""行情与指数查询 API：只读缓存，浏览器不直接触发数据源请求。
+
+multi-user-auth：要求登录；行情条目按当前登录用户的自选聚合，
+市场数据（快照/估值）仍全局共享一份。
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from app.auth.dependencies import require_user
+from app.auth.session import CurrentUser
 from app.schemas import (
     IndexQuoteItem,
     IndicesResponse,
@@ -14,7 +20,11 @@ from app.schemas import (
 from app.services.market_session_service import MarketStatus
 from app.services.quote_cache import QuoteCache
 
-router = APIRouter(prefix="/api", tags=["quotes"])
+router = APIRouter(
+    prefix="/api",
+    tags=["quotes"],
+    dependencies=[Depends(require_user)],
+)
 
 
 def _iso(dt) -> str | None:
@@ -25,6 +35,7 @@ def _iso(dt) -> str | None:
 
 def _assemble(
     request: Request,
+    current_user: CurrentUser,
     asset_type_filter: set[str],
     tag_id: int | None = None,
     untagged: bool = False,
@@ -33,6 +44,7 @@ def _assemble(
 
     tag_id / untagged 仅对股票/ETF 生效：标签是纯展示层过滤，
     不触发任何 Provider 请求（v0.03 技术方案 §12.2）。
+    行情按当前用户的自选聚合（multi-user-auth）。
     """
     app = request.app
     session_service = app.state.session_service
@@ -46,13 +58,17 @@ def _assemble(
         if asset_type_filter == {"INDEX"}:
             pairs = [
                 (inst, row.sort_order)
-                for row, inst in IndexWatchlistRepository(session).list_ordered()
+                for row, inst in IndexWatchlistRepository(
+                    session, current_user.user_id
+                ).list_ordered()
             ]
             fundamentals: dict = {}
         else:
             triples = [
                 (row, inst, tags)
-                for row, inst, tags in WatchlistRepository(session).list_ordered_with_tags()
+                for row, inst, tags in WatchlistRepository(
+                    session, current_user.user_id
+                ).list_ordered_with_tags()
                 if inst.asset_type in asset_type_filter
             ]
             if tag_id is not None:
@@ -134,6 +150,7 @@ def _assemble(
 @router.get("/quotes", response_model=QuotesResponse)
 def get_quotes(
     request: Request,
+    current_user: CurrentUser = Depends(require_user),
     tag_id: int | None = Query(default=None, description="仅返回关联该标签的条目"),
     untagged: bool = Query(default=False, description="仅返回无标签条目"),
 ):
@@ -142,12 +159,14 @@ def get_quotes(
             status_code=422, detail="tag_id 与 untagged 不能同时使用"
         )
     items, market_status = _assemble(
-        request, {"STOCK", "ETF"}, tag_id=tag_id, untagged=untagged
+        request, current_user, {"STOCK", "ETF"}, tag_id=tag_id, untagged=untagged
     )
     return QuotesResponse(market_status=market_status, items=items)
 
 
 @router.get("/indices", response_model=IndicesResponse)
-def get_indices(request: Request):
-    items, market_status = _assemble(request, {"INDEX"})
+def get_indices(
+    request: Request, current_user: CurrentUser = Depends(require_user)
+):
+    items, market_status = _assemble(request, current_user, {"INDEX"})
     return IndicesResponse(items=items, market_status=market_status)

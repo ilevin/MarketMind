@@ -67,13 +67,20 @@ class TagNotAllowedError(ServiceError):
 
 
 class BaseWatchlistService:
-    """股票/ETF 自选与指数配置共用的服务逻辑。"""
+    """股票/ETF 自选与指数配置共用的服务逻辑（按当前用户隔离，multi-user-auth）。"""
 
     allowed_asset_types: frozenset[str]
 
-    def __init__(self, session: Session, name_provider: InstrumentNameProvider):
+    def __init__(
+        self,
+        session: Session,
+        name_provider: InstrumentNameProvider,
+        user_id: int,
+    ):
         self.session = session
         self.name_provider = name_provider
+        # 身份由认证依赖解析注入（CurrentUser），不接受客户端传入归属 user_id
+        self.user_id = user_id
         self.instrument_repo = InstrumentRepository(session)
         self.repo = self._make_repo(session)
 
@@ -120,14 +127,18 @@ class BaseWatchlistService:
             # 注意须分两次提交：DuckDB 1.5.5 的 FK 检查看不到同事务内已删的
             # 子表行，同事务"先删关联再删条目"会被误拦（Phase 0 结论）；
             # 写锁保证两段之间无其他写者，单写者模型下无中间态并发风险。
+            # 仅清理当前用户的关联，不影响其他用户（user-data-isolation spec）。
             self.session.execute(
-                sa_delete(WatchlistTag).where(WatchlistTag.instrument_id == instrument_id)
+                sa_delete(WatchlistTag).where(
+                    WatchlistTag.user_id == self.user_id,
+                    WatchlistTag.instrument_id == instrument_id,
+                )
             )
             self.session.commit()
             removed = self.repo.remove(instrument_id)
             self.session.commit()
         if removed:
-            logger.info("已删除自选: %s", instrument_id)
+            logger.info("已删除自选: %s (user_id=%s)", instrument_id, self.user_id)
         return removed
 
     def reorder(self, orders: dict[str, int]) -> None:
@@ -141,7 +152,7 @@ class WatchlistService(BaseWatchlistService):
     allowed_asset_types = frozenset({"STOCK", "ETF"})
 
     def _make_repo(self, session: Session) -> WatchlistRepository:
-        return WatchlistRepository(session)
+        return WatchlistRepository(session, self.user_id)
 
     def list_with_tags(self) -> list[tuple[Instrument, int, list[Tag]]]:
         """列表（含标签数组）；指数服务无此能力（指数不支持标签）。"""
@@ -158,6 +169,7 @@ class WatchlistService(BaseWatchlistService):
         校验顺序（design D2 修订）：先判 instrument 的 asset_type（INDEX→400，
         指数条目只存在于 index_watchlist、不在 watchlist 表，先判类型使该
         场景经 API 可达），再查自选行（404）、各 tag_id 存在性（404）。
+        多用户：TagRepository 按当前用户过滤，他人 tag_id 与不存在同返回 404。
         """
         inst = self.instrument_repo.get(instrument_id)
         if inst is None or inst.asset_type == "INDEX":
@@ -168,7 +180,7 @@ class WatchlistService(BaseWatchlistService):
         if row is None:
             raise WatchlistEntryNotFoundError(f"自选中不存在: {instrument_id}")
 
-        tag_repo = TagRepository(self.session)
+        tag_repo = TagRepository(self.session, self.user_id)
         tags: list[Tag] = []
         for tag_id in dict.fromkeys(tag_ids):  # 去重且保序
             tag = tag_repo.get(tag_id)
@@ -181,10 +193,19 @@ class WatchlistService(BaseWatchlistService):
         # 全量替换：清空旧关联后重建（一个条目可关联多个标签，v0.03b 多对多）
         with write_coordinator.write():
             self.session.execute(
-                sa_delete(WatchlistTag).where(WatchlistTag.instrument_id == instrument_id)
+                sa_delete(WatchlistTag).where(
+                    WatchlistTag.user_id == self.user_id,
+                    WatchlistTag.instrument_id == instrument_id,
+                )
             )
             for tag in tags:
-                self.session.add(WatchlistTag(instrument_id=instrument_id, tag_id=tag.tag_id))
+                self.session.add(
+                    WatchlistTag(
+                        user_id=self.user_id,
+                        instrument_id=instrument_id,
+                        tag_id=tag.tag_id,
+                    )
+                )
             self.session.commit()
         logger.info(
             "已更新自选标签: %s -> %s",
@@ -198,4 +219,4 @@ class IndexWatchlistService(BaseWatchlistService):
     allowed_asset_types = frozenset({"INDEX"})
 
     def _make_repo(self, session: Session) -> IndexWatchlistRepository:
-        return IndexWatchlistRepository(session)
+        return IndexWatchlistRepository(session, self.user_id)

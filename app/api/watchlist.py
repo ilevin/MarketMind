@@ -1,4 +1,4 @@
-"""股票/ETF 自选 API。"""
+"""股票/ETF 自选 API（multi-user-auth：要求登录，按当前用户隔离）。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from typing import Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.auth.dependencies import require_user
+from app.auth.session import CurrentUser
 from app.schemas import (
     OrderUpdateRequest,
     TagBrief,
@@ -26,17 +28,29 @@ from app.services.watchlist_service import (
     WatchlistService,
 )
 
-router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
+router = APIRouter(
+    prefix="/api/watchlist",
+    tags=["watchlist"],
+    dependencies=[Depends(require_user)],
+)
 
 
-def get_watchlist_service(request: Request) -> Iterator[WatchlistService]:
+def get_watchlist_service(
+    request: Request, current_user: CurrentUser = Depends(require_user)
+) -> Iterator[WatchlistService]:
     with request.app.state.session_factory() as session:
-        yield WatchlistService(session, request.app.state.name_provider)
+        yield WatchlistService(
+            session, request.app.state.name_provider, current_user.user_id
+        )
 
 
-def get_index_watchlist_service(request: Request) -> Iterator[IndexWatchlistService]:
+def get_index_watchlist_service(
+    request: Request, current_user: CurrentUser = Depends(require_user)
+) -> Iterator[IndexWatchlistService]:
     with request.app.state.session_factory() as session:
-        yield IndexWatchlistService(session, request.app.state.name_provider)
+        yield IndexWatchlistService(
+            session, request.app.state.name_provider, current_user.user_id
+        )
 
 
 def _error_status(exc: Exception) -> int:

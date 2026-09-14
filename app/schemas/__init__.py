@@ -37,6 +37,16 @@ class WatchlistTagsRequest(BaseModel):
     tag_ids: list[int] = Field(default_factory=list)
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
 # ---- 响应 ----
 
 
@@ -118,3 +128,65 @@ class RefreshResult(BaseModel):
     success: bool
     updated: int
     failed: int
+
+
+# ---- 认证（multi-user-auth） ----
+
+
+class LoginResponse(BaseModel):
+    username: str
+    role: str
+
+
+class MeResponse(BaseModel):
+    user_id: int
+    username: str
+    role: str
+
+
+class ChangePasswordResponse(BaseModel):
+    success: bool
+
+
+class LogoutResponse(BaseModel):
+    success: bool
+
+
+# ---- 用户管理（multi-user-auth，admin 专用） ----
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+    role: str = Field(default="user", pattern="^(user|admin)$")
+
+
+class UserPatchRequest(BaseModel):
+    """修改角色 / 启用状态（可选字段，仅更新提供项）。"""
+
+    role: str | None = Field(default=None, pattern="^(user|admin)$")
+    is_active: bool | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+class UserItem(BaseModel):
+    """用户信息（不含 password_hash）。"""
+
+    user_id: int
+    username: str
+    role: str
+    is_active: bool
+    must_change_password: bool
+    created_at: str | None = None
+    last_login_at: str | None = None
+
+
+class UserListResponse(BaseModel):
+    items: list[UserItem]
+
+
+class ResetPasswordResponse(BaseModel):
+    success: bool

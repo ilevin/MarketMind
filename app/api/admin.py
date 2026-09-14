@@ -1,16 +1,25 @@
-"""管理 API：手动刷新（调试与维护用，普通首页禁止周期调用）。"""
+"""管理 API：手动刷新（调试与维护用，普通首页禁止周期调用）。
+
+multi-user-auth：Router 层统一声明 require_admin（design D6），
+未登录 401、普通用户 403；新增接口自动受保护。
+"""
 
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
+from app.auth.dependencies import require_admin
 from app.schemas import RefreshResult
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/api/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.post("/refresh/quotes", response_model=RefreshResult)

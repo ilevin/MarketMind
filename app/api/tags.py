@@ -1,4 +1,4 @@
-"""标签管理 API（v0.03 技术方案 §9）：列表 / 新增 / 改名 / 删除。"""
+"""标签管理 API（v0.03 技术方案 §9；multi-user-auth：要求登录，按当前用户隔离）。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from typing import Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.auth.dependencies import require_user
+from app.auth.session import CurrentUser
 from app.schemas import TagCreateRequest, TagItem, TagListResponse, TagUpdateRequest
 from app.services.tag_service import (
     DuplicateTagNameError,
@@ -16,12 +18,18 @@ from app.services.tag_service import (
     TagService,
 )
 
-router = APIRouter(prefix="/api/tags", tags=["tags"])
+router = APIRouter(
+    prefix="/api/tags",
+    tags=["tags"],
+    dependencies=[Depends(require_user)],
+)
 
 
-def get_tag_service(request: Request) -> Iterator[TagService]:
+def get_tag_service(
+    request: Request, current_user: CurrentUser = Depends(require_user)
+) -> Iterator[TagService]:
     with request.app.state.session_factory() as session:
-        yield TagService(session)
+        yield TagService(session, current_user.user_id)
 
 
 def _error_status(exc: Exception) -> int:

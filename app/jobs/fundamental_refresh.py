@@ -106,12 +106,13 @@ class FundamentalRefreshJob:
         self._refresh(trade_date, missing)
 
     def _watchlist_cn_stocks(self) -> list:
-        from app.repositories.watchlist import WatchlistRepository
+        # 系统作用域：跨用户聚合全部自选（DISTINCT），供后台估值刷新
+        from app.repositories.watchlist import SystemWatchlistRepository
 
         with self.session_factory() as session:
             return [
                 inst
-                for _, inst in WatchlistRepository(session).list_ordered()
+                for inst in SystemWatchlistRepository(session).all_instruments()
                 if inst.market == "CN" and inst.asset_type == "STOCK"
             ]
 

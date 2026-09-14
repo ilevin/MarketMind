@@ -56,12 +56,12 @@ class RefreshService:
     # ---- 读取待刷新标的 ----
 
     def _load_instruments(self) -> list[Instrument]:
-        from app.repositories.watchlist import IndexWatchlistRepository, WatchlistRepository
+        # 系统作用域：跨用户 DISTINCT instrument 集合，多用户关注同一证券
+        # 仍只刷新一次（multi-user-auth design D8）
+        from app.repositories.watchlist import SystemWatchlistRepository
 
         with self.session_factory() as session:
-            instruments = [inst for _, inst in WatchlistRepository(session).list_ordered()]
-            instruments += [inst for _, inst in IndexWatchlistRepository(session).list_ordered()]
-            return instruments
+            return SystemWatchlistRepository(session).all_instruments()
 
     # ---- 刷新入口 ----
 

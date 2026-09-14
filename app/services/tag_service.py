@@ -44,9 +44,13 @@ class TagInUseError(TagServiceError):
 
 
 class TagService:
-    def __init__(self, session: Session):
+    """标签业务服务（multi-user-auth：命名空间为同一用户内）。"""
+
+    def __init__(self, session: Session, user_id: int):
+        # 身份由认证依赖解析注入（CurrentUser），不接受客户端传入归属 user_id
         self.session = session
-        self.repo = TagRepository(session)
+        self.user_id = user_id
+        self.repo = TagRepository(session, user_id)
 
     def _validate_name(self, name: str) -> str:
         name = (name or "").strip()

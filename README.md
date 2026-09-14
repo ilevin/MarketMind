@@ -73,10 +73,63 @@ docker run -d --name marketmind \
 
 容器启动命令为 `alembic upgrade head && uvicorn app.main:app --workers 1`：每次启动先自动执行数据库迁移，成功后才以单 worker 启动应用；迁移失败容器直接退出（不会出现代码与数据库版本不一致的情况）。
 
+> 端口映射（`-p 8000:8000`）部署下，应用看到的客户端 IP 是 Docker 网桥地址，
+> 登录限速的 IP 维度退化为「全部外部客户端共享同一计数」（用户名维度仍各自独立）。
+> 单人 / 家庭自用无影响；多用户对外部署时建议置于反向代理之后，并知悉此限制。
+
+## 用户账户与管理 CLI
+
+应用启用登录认证（v0.2.0）：页面与业务 API 均要求登录，账户由管理员在「用户管理」页（`/admin/users`）创建，或在服务器上通过管理 CLI 创建：
+
+```bash
+python -m app.cli users set-password <用户名>      # 设置/重置密码（该用户全部登录会话失效）
+python -m app.cli users create [--admin] <用户名>  # 创建用户（--admin 直接创建管理员）
+python -m app.cli users promote <用户名>           # 将用户提升为管理员
+```
+
+说明：
+
+- 密码经终端安全输入（getpass，不回显），不会出现在 shell history 与仓库文件中；要求至少 8 位，两次输入须一致
+- CLI 从当前目录读取 `config.yaml`（与应用一致），操作其中 `database.url` 指向的 DuckDB 数据库；执行前数据库须已完成 `alembic upgrade head`
+- **从旧版本升级到多用户认证后，必须先运行 `python -m app.cli users set-password admin`**：迁移写入的 legacy owner 占位密码哈希不可登录，设置真实密码后才能登录并创建其他用户
+- 全新部署可用 `users create --admin <用户名>` 直接创建第一个管理员（或 `users create` 后再 `users promote`）
+- Docker 部署：CLI 与应用服务**不能同时运行**——DuckDB 为单写者嵌入式库，
+  服务进程独占数据库文件锁，容器运行时另一进程（CLI）无法打开数据库。
+  先停服务、以一次性容器执行 CLI、再重启：
+
+```bash
+docker compose down
+docker compose run --rm marketmind python -m app.cli users set-password admin
+docker compose up -d
+```
+
+多用户数据隔离：自选列表、指数配置与标签按用户完全隔离（各自可见、同名标签互不冲突、排序互不影响）；行情快照、估值与证券主数据全局共享一份，多用户关注同一证券时行情仍只刷新一次。管理员不例外——同样只能看到自己的自选数据，其权限仅体现在用户管理与系统状态接口。
+
+### 认证配置
+
+`config.yaml` 中 `auth.session` 可调（全部字段可省略）：
+
+```yaml
+auth:
+  session:
+    ttl_days: 7          # 登录 Session 有效期（天），到期需重新登录
+    cookie_secure: false # HTTPS 部署必须置 true（Cookie 仅经加密通道发送）
+```
+
 ## 升级思路
 
-- **本版本（v0.1.0）仅支持全新部署**：从零 `alembic upgrade head` 建库
-- 旧 stocksview（SQLite 版）数据**不能**原地升级到本版本；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
+- v0.1.0 → v0.2.0（多用户认证）：
+
+```bash
+cp data/marketmind.duckdb data/marketmind.duckdb.bak   # 1. 备份数据库文件
+docker compose up -d && docker compose logs -f marketmind   # 2. 部署：启动即自动执行迁移（失败容器退出，数据库整体回滚）
+docker compose down                                    # 3. 临时停服（CLI 需独占数据库文件，见单写者约束）
+docker compose run --rm marketmind python -m app.cli users set-password admin   # 4. 设置管理员密码
+docker compose up -d                                   # 5. 重启，登录创建普通用户
+```
+
+  迁移写入的占位密码不可登录——第 4 步完成前无人能登录 Web 界面。
+- 旧 stocksview（SQLite 版）数据**不能**原地升级；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
 - 后续版本的常规升级：构建新镜像替换容器即可（启动时自动增量迁移，迁移内置数据校验）
 
 ## 数据支持情况
@@ -166,8 +219,9 @@ app/
 ├── config.py          # config.yaml -> Pydantic 配置模型
 ├── version.py         # 应用版本号唯一来源
 ├── db.py              # engine / session / WriteCoordinator（写事务协调）
-├── api/               # quotes / watchlist / index_watchlist / admin / status / tags 路由
-├── models/            # SQLAlchemy 模型（instrument / watchlist / quote / fundamental / tag / job_status ...）
+├── api/               # quotes / watchlist / index_watchlist / admin / status / tags / auth / admin_users 路由
+├── auth/              # 认证：密码 Argon2id / Session / CSRF / 限速 / FastAPI 依赖
+├── models/            # SQLAlchemy 模型（instrument / watchlist / quote / fundamental / tag / app_user / user_session ...）
 ├── schemas/           # API Pydantic Schema
 ├── providers/
 │   ├── base.py        # Quote/Fundamental 模型与 Provider Protocol
@@ -178,10 +232,11 @@ app/
 ├── observability/     # ProviderMetrics 指标与超时包装层
 ├── repositories/      # 数据访问
 ├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status
+├── cli/               # 管理 CLI：python -m app.cli users set-password/create/promote
 ├── jobs/              # 60 秒行情刷新任务、估值刷新任务（均接入 JobStatus）
-├── templates/         # index.html / watchlist.html / tags.html（Jinja2）
+├── templates/         # index / watchlist / tags / login / change_password / admin_users（Jinja2）
 └── static/            # 原生 JS / CSS
-alembic/               # 数据库迁移（versions/0001_duckdb_baseline）
+alembic/               # 数据库迁移（0001_duckdb_baseline → 0002_multi_user_auth）
 alembic.ini
 scripts/               # 运维/数据工具（本版本为占位）
 tests/                 # unit + integration（含迁移测试）

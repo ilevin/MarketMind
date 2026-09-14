@@ -1,0 +1,137 @@
+# watchlist-management Specification(Delta)
+
+## MODIFIED Requirements
+
+### Requirement: 股票/ETF 自选添加
+
+系统 SHALL 提供 `POST /api/watchlist`,接收 symbol、market、asset_type;仅允许 STOCK/ETF;自动识别名称后写入全局 instrument(多用户复用同一 instrument 记录)与当前登录用户的 watchlist。添加成功后 SHALL 无论市场状态如何(OPEN/LUNCH_BREAK/CLOSED/HOLIDAY)均触发一次该资产行情更新;即时刷新失败 SHALL NOT 影响添加结果。添加 CN/STOCK 成功后 SHALL 同时立即获取该股最近一期估值,估值获取失败 SHALL NOT 影响添加结果。接口 SHALL 要求登录。
+
+#### Scenario: 添加成功
+- **WHEN** 登录用户 POST `{symbol:"600519", market:"CN", asset_type:"STOCK"}` 且证券可识别
+- **THEN** 返回 201 Created
+
+#### Scenario: 重复添加
+- **WHEN** instrument_id 已在当前用户的 watchlist
+- **THEN** 返回 409 Conflict
+
+#### Scenario: 证券不存在
+- **WHEN** 代码无法识别
+- **THEN** 返回 404 Not Found 及明确错误信息
+
+#### Scenario: 拒绝指数类型
+- **WHEN** asset_type 为 INDEX
+- **THEN** 返回校验错误,不写入
+
+#### Scenario: 休市时段添加后立即获取行情
+- **WHEN** 市场 CLOSED(或 LUNCH_BREAK/HOLIDAY)时 POST 添加自选成功
+- **THEN** 系统对该标的执行一次行情更新,页面能显示最近收盘行情
+
+#### Scenario: 即时刷新失败不影响添加
+- **WHEN** 添加成功但行情 Provider 抛异常或超时
+- **THEN** 添加接口仍返回 201,刷新失败仅记录日志
+
+#### Scenario: 添加后立即获取估值
+- **WHEN** 添加 CN/STOCK 自选成功
+- **THEN** 系统立即获取该股最近一期估值并写入,页面无需等待收盘后刷新即可显示
+
+#### Scenario: 估值获取失败不影响添加
+- **WHEN** 添加成功但估值 Provider 抛异常或超时
+- **THEN** 添加接口仍返回 201,失败仅记录日志
+
+### Requirement: 股票/ETF 自选删除
+
+系统 SHALL 提供 `DELETE /api/watchlist/{instrument_id}`,仅删除当前登录用户 watchlist 记录,保留 instrument/quote/fundamental 全局历史数据;其他用户对同一证券的自选 SHALL NOT 受影响。删除自选条目时当前用户的标签关联 SHALL 在同一写锁内一并清理(先删关联提交、再删条目提交,见 database-persistence 外键与删除行为);对外可观察行为不变:删除后该条目的标签关联消失、对应标签 usage_count 递减。接口 SHALL 要求登录。
+
+#### Scenario: 删除成功
+- **WHEN** 删除一个存在的自选
+- **THEN** 返回 204 No Content,历史行情快照仍在数据库
+
+#### Scenario: 删除不影响其他用户
+- **WHEN** 用户 A 与 B 均关注 600519,A 删除该自选
+- **THEN** B 的自选列表中 600519 仍存在
+
+### Requirement: 股票/ETF 自选查询与排序
+
+系统 SHALL 提供 `GET /api/watchlist`(按 sort_order 返回当前登录用户的列表)与 `PUT /api/watchlist/order`(批量更新当前用户的排序)。列表 items SHALL 含 instrument_id、symbol、name、market、asset_type、sort_order、tags(`[{id, name}]` 数组,空数组表示无标签)。接口 SHALL 要求登录。
+
+#### Scenario: 查询列表
+- **WHEN** GET /api/watchlist
+- **THEN** 返回含 instrument_id、symbol、name、market、asset_type、sort_order、tags 的 items,无标签条目 tags 为空数组
+
+#### Scenario: 调整排序
+- **WHEN** PUT /api/watchlist/order 传入新的 instrument_id/sort_order 列表
+- **THEN** 排序持久化,GET 按新顺序返回
+
+#### Scenario: 排序互不影响
+- **WHEN** 用户 A 调整自己的自选排序
+- **THEN** 用户 B 的自选顺序不变
+
+### Requirement: 指数配置
+
+系统 SHALL 提供 `GET/POST/DELETE /api/index-watchlist` 与 `PUT /api/index-watchlist/order`,行为与股票/ETF 自选一致,但仅允许 INDEX 类型,存储于独立的 index_watchlist 表,数据按当前登录用户隔离(不同用户可拥有不同指数配置)。添加成功后 SHALL 无论市场状态如何均触发一次该指数行情更新;即时刷新失败 SHALL NOT 影响添加结果。接口 SHALL 要求登录。
+
+#### Scenario: 添加指数
+- **WHEN** POST `{symbol:"000300", market:"CN", asset_type:"INDEX"}`
+- **THEN** 返回 201,名称自动识别
+
+#### Scenario: 禁止股票/ETF 进入指数配置
+- **WHEN** POST /api/index-watchlist 时 asset_type 为 STOCK 或 ETF
+- **THEN** 返回校验错误
+
+#### Scenario: 指数重复添加
+- **WHEN** 该指数已在当前用户的 index_watchlist
+- **THEN** 返回 409 Conflict
+
+#### Scenario: 休市时段添加指数后立即获取行情
+- **WHEN** 市场 CLOSED(或 LUNCH_BREAK/HOLIDAY)时 POST 添加指数成功
+- **THEN** 系统对该指数执行一次行情更新,页面能显示最近收盘行情
+
+#### Scenario: 即时刷新不改变周期刷新策略
+- **WHEN** 市场 CLOSED/LUNCH_BREAK/HOLIDAY 时发生添加操作触发的即时刷新
+- **THEN** 该一次性刷新执行后,60 秒后台任务仍遵守「仅 OPEN 市场刷新」策略,不对该市场做周期性行情请求
+
+### Requirement: 自选条目标签关联 API
+
+系统 SHALL 提供 `PUT /api/watchlist/{instrument_id}/tags`,body 为 `{"tag_ids": [int...]}`:以全量集合替换当前登录用户该条目的全部标签关联(幂等;空数组即解除全部标签)。一个自选条目 SHALL 可同时关联多个标签(多对多)。自选条目不存在或任一 tag_id 不存在或不属于当前用户返回 404;指数类型返回 400。接口 SHALL 要求登录。
+
+#### Scenario: 股票设置多个标签
+- **WHEN** PUT `/api/watchlist/CN:STOCK:600519/tags` `{"tag_ids": [3, 5]}`
+- **THEN** 返回 200,该自选条目同时关联标签 3 与 5
+
+#### Scenario: ETF 设置标签
+- **WHEN** PUT ETF 自选条目 tags `{"tag_ids": [3]}`
+- **THEN** 返回 200,该 ETF 关联标签 3
+
+#### Scenario: 全量替换语义
+- **WHEN** 条目已关联 [1, 2],PUT `{"tag_ids": [2, 4]}`
+- **THEN** 条目改为关联且仅关联 [2, 4]
+
+#### Scenario: 解除全部标签
+- **WHEN** 已有标签的条目 PUT tags `{"tag_ids": []}`
+- **THEN** 返回 200,该条目 tags 为空
+
+#### Scenario: 标签不存在
+- **WHEN** PUT tags 传入含不存在 id 的数组
+- **THEN** 返回 404
+
+#### Scenario: 指数拒绝设置标签
+- **WHEN** 对指数条目设置标签
+- **THEN** 返回 400,指数不支持标签
+
+#### Scenario: 他人标签拒绝
+- **WHEN** PUT tags 传入属于其他用户的 tag_id
+- **THEN** 返回 404,不创建关联
+
+## ADDED Requirements
+
+### Requirement: 自选数据用户隔离
+
+`watchlist` 与 `index_watchlist` SHALL 以 `(user_id, instrument_id)` 为复合主键并外键关联 `app_user.user_id`;同一证券 SHALL 可被多个用户同时关注,各自独立增删与排序。自选管理页面 `/watchlist` SHALL 要求登录,仅展示与操作当前用户的数据。
+
+#### Scenario: 多用户同时关注同一证券
+- **WHEN** 用户 A 与用户 B 各自添加 CN:STOCK:600519
+- **THEN** 两人均成功(各 201),互不冲突
+
+#### Scenario: 列表仅见自己的数据
+- **WHEN** 用户 A 添加 600519、用户 B 添加 00700 后,A 请求 GET /api/watchlist
+- **THEN** A 仅看到 600519,看不到 00700

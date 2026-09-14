@@ -1,6 +1,6 @@
 [project]
 name = "marketmind"
-version = "0.1.0"
+version = "0.2.0"
 description = "以 DuckDB 为本地分析内核的个人证券研究工具（A股/港股，AKShare + Tushare）"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,6 +17,8 @@ dependencies = [
     # DuckDB 持久层：精确锁定版本（技术方案 D1，第三方方言与 DuckDB 版本强耦合）
     "duckdb==1.5.5",
     "duckdb-sqlalchemy==1.5.5.5",
+    # 多用户认证：密码 Argon2id 哈希（multi-user-auth design D2）
+    "pwdlib[argon2]>=0.2",
 ]
 
 [project.optional-dependencies]

@@ -28,3 +28,11 @@ providers:
 
 logging:
   level: INFO
+
+# 多用户认证（multi-user-auth v0.2.0）：全部字段可省略，缺省如下
+auth:
+  session:
+    # 登录 Session 有效期（天），到期需重新登录
+    ttl_days: 7
+    # HTTPS 部署时必须置 true（Cookie 仅经加密通道发送）；本地 http 调试保持 false
+    cookie_secure: false

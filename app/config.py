@@ -65,12 +65,25 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+class SessionConfig(BaseModel):
+    """登录会话配置（multi-user-auth design D12）。"""
+
+    ttl_days: int = Field(default=7, ge=1)
+    # 生产 HTTPS 环境置 true；本地 HTTP 开发保持 false（design D1）
+    cookie_secure: bool = False
+
+
+class AuthConfig(BaseModel):
+    session: SessionConfig = Field(default_factory=SessionConfig)
+
+
 class AppConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
     tushare: TushareConfig = Field(default_factory=TushareConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
 
     @property
     def has_tushare_token(self) -> bool:

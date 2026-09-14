@@ -5,13 +5,18 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
+from app.auth.dependencies import require_admin
 from app.config import BUSINESS_TZ_NAME
 from app.version import APP_VERSION
 
-router = APIRouter(prefix="/api/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/api/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+)
 
 _BEIJING = ZoneInfo(BUSINESS_TZ_NAME)
 
@@ -57,9 +62,11 @@ def _iso_beijing(dt: datetime | None) -> str | None:
     return dt.astimezone(_BEIJING).isoformat()
 
 
-@router.get("/status", response_model=AdminStatusResponse)
-def get_admin_status(request: Request):
-    """后台 Job 最近运行状态 + Provider 运行指标；未运行过的字段为 null 而非缺键。"""
+def collect_admin_status(request: Request) -> AdminStatusResponse:
+    """后台 Job 最近运行状态 + Provider 运行指标；未运行过的字段为 null 而非缺键。
+
+    API（GET /api/admin/status）与 /admin/status 页面共用（页面为服务端渲染）。
+    """
     jobs: dict[str, JobStatusItem] = {}
     job_service = getattr(request.app.state, "job_status_service", None)
     if job_service is not None:
@@ -94,3 +101,8 @@ def get_admin_status(request: Request):
         providers.setdefault(source, ProviderStatusItem())
 
     return AdminStatusResponse(version=APP_VERSION, jobs=jobs, providers=providers)
+
+
+@router.get("/status", response_model=AdminStatusResponse)
+def get_admin_status(request: Request):
+    return collect_admin_status(request)

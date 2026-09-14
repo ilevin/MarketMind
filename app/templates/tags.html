@@ -3,15 +3,20 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
   <title>标签管理 · 行情看板</title>
   <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
 </head>
 <body data-page="tags">
   <header class="topbar">
     <h1>标签管理</h1>
-    <nav>
+    <nav class="user-nav">
       <a href="/">← 行情首页</a>
       <a href="/watchlist">自选管理 →</a>
+      <span class="current-user">{{ current_user.username }}（{{ "管理员" if current_user.role == "admin" else "用户" }}）</span>
+      <a href="/change-password">修改密码</a>
+      {% if current_user.role == "admin" %}<a href="/admin/users">用户管理</a><a href="/admin/status">系统状态</a>{% endif %}
+      <a href="#" id="logout-link">退出登录</a>
     </nav>
   </header>
 

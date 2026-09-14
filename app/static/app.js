@@ -1,12 +1,30 @@
-/* 原生 JS：自选管理页（watchlist）+ 行情首页（index）+ 标签管理页（tags）。
- * 页面通过 body[data-page] 区分；v0.03 增加标签管理与行情页标签筛选（本地过滤）。 */
+/* 原生 JS：自选管理页（watchlist）+ 行情首页（index）+ 标签管理页（tags）
+ * + 登录页（login）+ 修改密码页（change-password）+ 用户管理页（admin-users）。
+ * 页面通过 body[data-page] 区分；v0.03 增加标签管理与行情页标签筛选（本地过滤）；
+ * multi-user-auth：统一 fetch 封装注入 X-CSRF-Token，会话失效自动回登录页。 */
 
 "use strict";
 
 // ---------- 通用 ----------
 
+function csrfToken() {
+  const meta = document.querySelector('meta[name="csrf-token"]');
+  return meta ? meta.content : "";
+}
+
 async function api(path, options) {
+  options = options || {};
+  if (options.method && options.method !== "GET") {
+    // 写请求统一携带 CSRF Token（登录除外：登录前无 Session，页面无 meta）
+    options.headers = Object.assign({}, options.headers, { "X-CSRF-Token": csrfToken() });
+    options.credentials = "same-origin";
+  }
   const resp = await fetch(path, options);
+  if (resp.status === 401 && document.body.dataset.page !== "login") {
+    // 会话失效：回到登录页（避免后续轮询反复报错）
+    window.location.href = "/login";
+    throw new Error("登录已失效");
+  }
   if (resp.status === 204) return null;
   const data = await resp.json().catch(() => null);
   if (!resp.ok) {
@@ -14,6 +32,20 @@ async function api(path, options) {
     throw new Error(detail);
   }
   return data;
+}
+
+function bindLogout() {
+  const link = document.getElementById("logout-link");
+  if (!link) return;
+  link.addEventListener("click", async (ev) => {
+    ev.preventDefault();
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch (err) {
+      /* 即使撤销失败也回登录页（会话可能已失效） */
+    }
+    window.location.href = "/login";
+  });
 }
 
 function showMsg(el, text, kind) {
@@ -500,9 +532,168 @@ function initTagsPage() {
   loadList().catch((err) => showMsg(msg, err.message, "error"));
 }
 
+// ---------- 登录页 ----------
+
+function initLoginPage() {
+  const form = document.getElementById("login-form");
+  if (!form) return;
+  const msg = document.getElementById("login-message");
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    try {
+      await api("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("login-username").value.trim(),
+          password: document.getElementById("login-password").value,
+        }),
+      });
+      window.location.href = "/";
+    } catch (err) {
+      showMsg(msg, err.message, "error");
+    }
+  });
+}
+
+// ---------- 修改密码页 ----------
+
+function initChangePasswordPage() {
+  const form = document.getElementById("change-password-form");
+  if (!form) return;
+  const msg = document.getElementById("cp-message");
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const newPwd = document.getElementById("new-password").value;
+    const newPwd2 = document.getElementById("new-password2").value;
+    if (newPwd !== newPwd2) {
+      showMsg(msg, "两次输入的新密码不一致", "error");
+      return;
+    }
+    try {
+      await api("/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          old_password: document.getElementById("old-password").value,
+          new_password: newPwd,
+        }),
+      });
+      showMsg(msg, "密码已修改，请重新登录…", "success");
+      setTimeout(() => (window.location.href = "/login"), 800);
+    } catch (err) {
+      showMsg(msg, `修改失败：${err.message}`, "error");
+    }
+  });
+}
+
+// ---------- 用户管理页（admin） ----------
+
+function initAdminUsersPage() {
+  const form = document.getElementById("create-user-form");
+  const msg = document.getElementById("users-message");
+  if (!form) return;
+
+  function fmtDateTime(iso) {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    if (isNaN(d)) return "-";
+    return d.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  }
+
+  async function loadList() {
+    const data = await api("/api/admin/users");
+    const tbody = document.querySelector("#users-table tbody");
+    const empty = document.getElementById("users-empty");
+    tbody.innerHTML = "";
+    empty.classList.toggle("hidden", data.items.length > 0);
+    document.getElementById("users-table").classList.toggle("hidden", data.items.length === 0);
+
+    data.items.forEach((u) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${esc(u.username)}</td>
+        <td><span class="role-badge ${u.role === "admin" ? "admin" : ""}">${u.role === "admin" ? "管理员" : "用户"}</span></td>
+        <td>${u.is_active ? "启用" : '<span class="badge-disabled">已禁用</span>'}</td>
+        <td class="muted">${fmtDateTime(u.created_at)}</td>
+        <td class="muted">${fmtDateTime(u.last_login_at)}</td>
+        <td class="user-actions">
+          <button class="link" data-act="toggle-active" data-id="${u.user_id}" data-active="${u.is_active}">${u.is_active ? "禁用" : "启用"}</button>
+          <button class="link" data-act="toggle-role" data-id="${u.user_id}" data-role="${u.role}">${u.role === "admin" ? "降为用户" : "设为管理员"}</button>
+          <button class="link" data-act="reset-pwd" data-id="${u.user_id}" data-name="${esc(u.username)}">重置密码</button>
+        </td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const createMsg = document.getElementById("create-message");
+    try {
+      await api("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("new-username").value.trim(),
+          password: document.getElementById("new-password").value,
+          role: document.getElementById("new-role").value,
+        }),
+      });
+      showMsg(createMsg, "创建成功", "success");
+      form.reset();
+      await loadList();
+    } catch (err) {
+      showMsg(createMsg, `创建失败：${err.message}`, "error");
+    }
+  });
+
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    try {
+      if (btn.dataset.act === "toggle-active") {
+        await api(`/api/admin/users/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_active: btn.dataset.active !== "true" }),
+        });
+        showMsg(msg, "状态已更新", "success");
+      } else if (btn.dataset.act === "toggle-role") {
+        await api(`/api/admin/users/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role: btn.dataset.role === "admin" ? "user" : "admin" }),
+        });
+        showMsg(msg, "角色已更新（该用户需重新登录）", "success");
+      } else if (btn.dataset.act === "reset-pwd") {
+        const pwd = prompt(`为用户「${btn.dataset.name}」设置新密码（至少 8 位）：`);
+        if (!pwd) return;
+        await api(`/api/admin/users/${id}/reset-password`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ new_password: pwd }),
+        });
+        showMsg(msg, `已重置「${btn.dataset.name}」的密码（其全部会话已失效）`, "success");
+      }
+      await loadList();
+    } catch (err) {
+      showMsg(msg, err.message, "error");
+    }
+  });
+
+  loadList().catch((err) => showMsg(msg, err.message, "error"));
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const page = document.body.dataset.page;
+  bindLogout();
   if (page === "watchlist") initWatchlistPage();
   else if (page === "index") initIndexPage();
   else if (page === "tags") initTagsPage();
+  else if (page === "login") initLoginPage();
+  else if (page === "change-password") initChangePasswordPage();
+  else if (page === "admin-users") initAdminUsersPage();
 });

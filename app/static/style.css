@@ -192,3 +192,34 @@ button.link { border: none; background: none; padding: 2px 6px; }
 
 table quote-time { font-variant-numeric: tabular-nums; }
 td.num { font-variant-numeric: tabular-nums; }
+
+/* ---- 多用户认证（multi-user-auth） ---- */
+
+/* 顶栏用户导航：用户名/角色 + 修改密码 / 用户管理 / 退出登录 */
+.topbar nav.user-nav { align-items: center; }
+.current-user { color: #555; font-size: 13px; }
+
+/* 登录页 */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-panel { width: 320px; padding: 28px 26px; }
+.login-panel h1 { font-size: 18px; margin: 0 0 4px; }
+.login-fields { display: flex; flex-direction: column; gap: 6px; margin: 14px 0; }
+.login-fields label { font-size: 13px; color: #555; }
+.login-fields input {
+  padding: 7px 9px;
+  border: 1px solid #ccd2d8;
+  border-radius: 4px;
+  font-size: 14px;
+}
+.login-submit { width: 100%; margin-top: 4px; }
+
+/* 用户管理页 */
+.user-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.role-badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #e9edf2; }
+.role-badge.admin { background: #fdebd0; color: #9c640c; }
+.badge-disabled { color: #c0392b; }

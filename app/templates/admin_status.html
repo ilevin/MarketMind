@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>系统状态 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="admin-status">
+  <header class="topbar">
+    <h1>系统状态</h1>
+    <nav class="user-nav">
+      <a href="/">← 行情首页</a>
+      <span class="current-user">{{ current_user.username }}（管理员）</span>
+      <a href="/admin/users">用户管理</a>
+      <a href="/change-password">修改密码</a>
+      <a href="#" id="logout-link">退出登录</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>后台任务</h2>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>任务</th>
+            <th>最近开始</th>
+            <th>最近成功</th>
+            <th>最近耗时</th>
+            <th>连续失败</th>
+            <th>最近错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for job in jobs.values() %}
+          <tr>
+            <td>{{ job.job_name }}</td>
+            <td>{{ job.last_started_at or "—" }}</td>
+            <td>{{ job.last_success_at or "—" }}</td>
+            <td>{{ (job.last_duration_ms ~ " ms") if job.last_duration_ms is not none else "—" }}</td>
+            <td>{{ job.consecutive_failures }}</td>
+            <td class="muted">{{ job.last_error_at or "" }}{% if job.last_error %} {{ job.last_error }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>数据源</h2>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>数据源</th>
+            <th>请求</th>
+            <th>成功</th>
+            <th>失败</th>
+            <th>超时</th>
+            <th>最近成功</th>
+            <th>最近错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for source, p in providers.items() %}
+          <tr>
+            <td>{{ source }}</td>
+            <td>{{ p.request_count }}</td>
+            <td>{{ p.success_count }}</td>
+            <td>{{ p.error_count }}</td>
+            <td>{{ p.timeout_count }}</td>
+            <td>{{ p.last_success_at or "—" }}</td>
+            <td class="muted">{{ p.last_error_at or "" }}{% if p.last_error %} {{ p.last_error }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="muted">明细 JSON 见 GET /api/admin/status；本页为只读快照，刷新页面更新。</p>
+    </section>
+  </main>
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

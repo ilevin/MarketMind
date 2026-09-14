@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 - 股票与 ETF 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="login">
+  <main class="login-wrap">
+    <form id="login-form" class="panel login-panel" autocomplete="on">
+      <h1>股票与 ETF 行情看板</h1>
+      <p class="muted">请登录后使用</p>
+      <div class="login-fields">
+        <label for="login-username">用户名</label>
+        <input id="login-username" name="username" type="text" required
+               autocomplete="username" autofocus>
+        <label for="login-password">密码</label>
+        <input id="login-password" name="password" type="password" required
+               autocomplete="current-password">
+      </div>
+      <p id="login-message" class="message hidden"></p>
+      <button type="submit" class="login-submit">登录</button>
+    </form>
+  </main>
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

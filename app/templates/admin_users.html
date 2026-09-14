@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
+  <title>用户管理 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="admin-users">
+  <header class="topbar">
+    <h1>用户管理</h1>
+    <nav class="user-nav">
+      <a href="/">← 行情首页</a>
+      <span class="current-user">{{ current_user.username }}（管理员）</span>
+      <a href="/admin/status">系统状态</a>
+      <a href="/change-password">修改密码</a>
+      <a href="#" id="logout-link">退出登录</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>创建用户</h2>
+      <form id="create-user-form" class="add-form">
+        <input type="text" id="new-username" placeholder="用户名（3~32 位字母/数字/_/-）" required>
+        <input type="password" id="new-password" placeholder="初始密码（至少 8 位）" required>
+        <select id="new-role">
+          <option value="user">普通用户</option>
+          <option value="admin">管理员</option>
+        </select>
+        <button type="submit">创建</button>
+      </form>
+      <p id="create-message" class="message hidden"></p>
+    </section>
+
+    <section class="panel">
+      <h2>用户列表</h2>
+      <table class="table" id="users-table">
+        <thead>
+          <tr>
+            <th>用户名</th>
+            <th>角色</th>
+            <th>状态</th>
+            <th>创建时间</th>
+            <th>最近登录</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="users-empty" class="empty hidden">暂无用户</p>
+      <p id="users-message" class="message hidden"></p>
+    </section>
+  </main>
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

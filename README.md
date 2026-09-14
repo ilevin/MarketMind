@@ -6,6 +6,7 @@
 - 估值数据：Tushare `daily_basic`（A 股股票）
 - 持久层：DuckDB（单文件 `data/marketmind.duckdb`，列式分析型数据库）
 - 单体应用：FastAPI + DuckDB + Jinja2 + 原生 JS/CSS，无 Redis / MySQL / Node.js / 前端框架
+- 多用户认证（v0.2.0）：登录后使用，自选 / 指数配置 / 标签按用户隔离，行情与估值数据全局共享
 
 ## 环境要求
 
@@ -21,11 +22,17 @@ pip install -e .
 cp config.example.yaml config.yaml
 # 编辑 config.yaml，填写 tushare.token（不使用估值功能可不填）
 alembic upgrade head          # 建表/升级数据库结构（必须，应用启动不做自动建表）
+python -m app.cli users set-password admin   # 首次部署：设置管理员密码（必须在启动服务前执行）
 uvicorn app.main:app --reload --workers 1
 ```
 
 访问 <http://localhost:8000>。数据库结构由 Alembic 管理：启动前必须执行
 `alembic upgrade head`（容器镜像已内置该步骤），迁移失败时应用不会启动。
+
+v0.2.0 起页面与 API 均要求登录：迁移只写入**占位密码**的管理员 `admin`
+（不可登录），必须先经上方 CLI 设置真实密码，或另建管理员：
+`python -m app.cli users create --admin <用户名>`。CLI 与服务进程不能同时打开
+同一数据库文件（DuckDB 单写者约束），故须在启动 uvicorn **之前**执行。
 
 > uv 等价流程：`uv venv && uv pip install -e ".[dev]"` 后同上。
 
@@ -73,6 +80,17 @@ docker run -d --name marketmind \
 
 容器启动命令为 `alembic upgrade head && uvicorn app.main:app --workers 1`：每次启动先自动执行数据库迁移，成功后才以单 worker 启动应用；迁移失败容器直接退出（不会出现代码与数据库版本不一致的情况）。
 
+首次部署后同样须设置管理员密码才能登录（迁移只写入占位密码的 `admin`）：
+先执行：
+
+```bash
+docker compose down
+docker compose run --rm marketmind python -m app.cli users set-password admin
+docker compose up -d
+```
+
+（CLI 与服务不能同时运行，详见「用户账户与管理 CLI」）。
+
 > 端口映射（`-p 8000:8000`）部署下，应用看到的客户端 IP 是 Docker 网桥地址，
 > 登录限速的 IP 维度退化为「全部外部客户端共享同一计数」（用户名维度仍各自独立）。
 > 单人 / 家庭自用无影响；多用户对外部署时建议置于反向代理之后，并知悉此限制。
@@ -103,7 +121,7 @@ docker compose run --rm marketmind python -m app.cli users set-password admin
 docker compose up -d
 ```
 
-多用户数据隔离：自选列表、指数配置与标签按用户完全隔离（各自可见、同名标签互不冲突、排序互不影响）；行情快照、估值与证券主数据全局共享一份，多用户关注同一证券时行情仍只刷新一次。管理员不例外——同样只能看到自己的自选数据，其权限仅体现在用户管理与系统状态接口。
+多用户数据隔离：自选列表、指数配置与标签按用户完全隔离（各自可见、同名标签互不冲突、排序互不影响）；行情快照、估值与证券主数据全局共享一份，多用户关注同一证券时行情仍只刷新一次。管理员不例外——同样只能看到自己的自选数据，其权限仅体现在用户管理与系统状态页面。
 
 ### 认证配置
 
@@ -201,7 +219,8 @@ providers:
 ## 运行状态
 
 - `GET /health`：应用与数据库健康 + 当前版本号
-- `GET /api/admin/status`：后台任务最近运行状态（最近开始/成功/失败时间、耗时、连续失败次数）与各数据源运行指标
+- `GET /api/admin/status`：后台任务最近运行状态（最近开始/成功/失败时间、耗时、连续失败次数）与各数据源运行指标（管理员）
+- `/admin/status`：系统状态页面（管理员，服务端渲染上述任务与指标快照）
 
 ## 测试执行方法
 
@@ -231,13 +250,13 @@ app/
 │   └── trading_calendar/  # 交易日历（Tushare + DuckDB 缓存）
 ├── observability/     # ProviderMetrics 指标与超时包装层
 ├── repositories/      # 数据访问
-├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status
+├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status / auth / user
 ├── cli/               # 管理 CLI：python -m app.cli users set-password/create/promote
 ├── jobs/              # 60 秒行情刷新任务、估值刷新任务（均接入 JobStatus）
-├── templates/         # index / watchlist / tags / login / change_password / admin_users（Jinja2）
+├── templates/         # index / watchlist / tags / login / change_password / admin_users / admin_status（Jinja2）
 └── static/            # 原生 JS / CSS
 alembic/               # 数据库迁移（0001_duckdb_baseline → 0002_multi_user_auth）
 alembic.ini
-scripts/               # 运维/数据工具（本版本为占位）
+scripts/               # spike 验证脚本（DuckDB 选型期结论：并发 / ORM / sequence / upsert）
 tests/                 # unit + integration（含迁移测试）
 ```

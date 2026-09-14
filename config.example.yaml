@@ -23,7 +23,7 @@ providers:
   # 第三方数据源超时（秒）：可按线上实际耗时调整；缺省时使用默认值
   timeout:
     tencent: 8
-    akshare: 15
+    akshare: 45
     tushare: 15
 
 logging:

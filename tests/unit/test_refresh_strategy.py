@@ -65,7 +65,7 @@ def _inst(iid, market, asset_type="STOCK"):
 
 
 @pytest.fixture()
-def env(session_factory):
+def env(session_factory, user_factory):
     registry = FakeRegistry()
     registry.quotes = {
         "CN:STOCK:600519": Quote("CN:STOCK:600519", 1450.12, 1.25, volume_ratio=0.86, source="akshare"),
@@ -73,20 +73,23 @@ def env(session_factory):
         "CN:INDEX:000001": Quote("CN:INDEX:000001", 3990.30, 0.19, source="tencent"),
     }
 
-    # 预置自选 + 指数
+    # 预置用户 + 自选 + 指数：watchlist 数据按用户隔离，Repository 构造需传
+    # user_id；RefreshService 走系统作用域跨用户聚合，与写入视角无关
     from app.repositories.instrument import InstrumentRepository
     from app.repositories.watchlist import IndexWatchlistRepository, WatchlistRepository
     from app.services.instrument_id import MARKET_CURRENCY
 
+    user = user_factory("refresh_user")
     with session_factory() as s:
         irepo = InstrumentRepository(s)
         for iid, at in [("CN:STOCK:600519", "STOCK"), ("HK:STOCK:00700", "STOCK"), ("CN:INDEX:000001", "INDEX")]:
             mkt, _, sym = iid.split(":", 2)
             irepo.upsert(instrument_id=iid, symbol=sym, name="X", market=mkt,
                          asset_type=at, currency=MARKET_CURRENCY[mkt])
-        WatchlistRepository(s).add("CN:STOCK:600519", 10)
-        WatchlistRepository(s).add("HK:STOCK:00700", 20)
-        IndexWatchlistRepository(s).add("CN:INDEX:000001", 10)
+        wrepo = WatchlistRepository(s, user["user_id"])
+        wrepo.add("CN:STOCK:600519", 10)
+        wrepo.add("HK:STOCK:00700", 20)
+        IndexWatchlistRepository(s, user["user_id"]).add("CN:INDEX:000001", 10)
         s.commit()
 
     config = AppConfig(quote=QuoteConfig(refresh_seconds=60, stale_seconds=180))

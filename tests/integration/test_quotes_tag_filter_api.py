@@ -49,7 +49,9 @@ class SpyRegistry:
 
 @pytest.fixture()
 def client(client_factory):
-    with client_factory(FakeNameProvider()) as c:
+    # multi-user-auth：业务 API 均要求登录，统一以 alice 视角访问
+    # （自选/标签自动归属 alice；AuthedClient 写请求自动注入 X-CSRF-Token）。
+    with client_factory(FakeNameProvider(), login_as="alice") as c:
         c.app.state.refresh_service = FakeRefreshService()
         c.app.state.session_service = ClosedSessionService()
         yield c

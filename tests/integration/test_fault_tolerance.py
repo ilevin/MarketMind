@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.models.instrument import Instrument
+from app.version import APP_VERSION
 from app.models.quote import QuoteSnapshot
 
 
@@ -23,9 +24,14 @@ class FailingRegistry:
 
 
 @pytest.fixture()
-def client_with_cached_data(client_factory):
-    with client_factory(FakeNameProvider()) as client:
+def client_with_cached_data(client_factory, user_factory):
+    # multi-user-auth：POST /api/admin/refresh/quotes 要求 admin 角色，
+    # 统一以 admin 登录；/api/quotes 要求登录且按当前用户聚合自选。
+    admin = user_factory("admin", role="admin")
+    with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
         # 预写缓存数据：Instrument + Watchlist + QuoteSnapshot
+        #（watchlist 为用户私有数据，须归属登录的 admin 才会被 /api/quotes 聚合；
+        #  instrument / quote_snapshot 全局共享，无需 user_id）
         factory = client.app.state.session_factory
         with factory() as s:
             s.add(
@@ -36,7 +42,13 @@ def client_with_cached_data(client_factory):
             )
             from app.models.watchlist import Watchlist
 
-            s.add(Watchlist(instrument_id="CN:STOCK:600519", sort_order=10))
+            s.add(
+                Watchlist(
+                    user_id=admin["user_id"],
+                    instrument_id="CN:STOCK:600519",
+                    sort_order=10,
+                )
+            )
             s.add(
                 QuoteSnapshot(
                     instrument_id="CN:STOCK:600519",
@@ -97,4 +109,4 @@ def test_health_ok_on_provider_failure(client_with_cached_data):
     app.state.refresh_service.quote_providers = FailingRegistry()
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "database": "ok", "version": "v0.1.0"}
+    assert resp.json() == {"status": "ok", "database": "ok", "version": APP_VERSION}

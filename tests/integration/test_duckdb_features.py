@@ -94,7 +94,7 @@ def test_fundamental_composite_pk_upsert_is_idempotent(session):
 # 2. sequence 取号
 # ---------------------------------------------------------------------------
 
-def test_tag_sequence_generates_incrementing_ids(session):
+def test_tag_sequence_generates_incrementing_ids(session, user_factory):
     """tag.tag_id 由 seq_tag_id sequence 生成：两次 flush 后 tag_id 为正整数且递增。
 
     验证 design D3（显式 sequence 取代自增主键）；
@@ -103,9 +103,13 @@ def test_tag_sequence_generates_incrementing_ids(session):
     注：SQLAlchemy Sequence 在 flush 时是否立即触发 nextval 取决于方言实现。
     若 flush 后 tag_id 仍为 None（未触发），需改为 commit 后再断言——
     以实际行为为准，Phase 0 环境就绪后校准。
+
+    multi-user-auth：tag 为用户私有数据（user_id NOT NULL），
+    须先建属主用户再写 tag；sequence 语义本身不受影响。
     """
-    tag1 = Tag(name="高股息")
-    tag2 = Tag(name="成长股")
+    owner = user_factory("tag_owner")
+    tag1 = Tag(user_id=owner["user_id"], name="高股息")
+    tag2 = Tag(user_id=owner["user_id"], name="成长股")
     session.add_all([tag1, tag2])
     session.flush()
 

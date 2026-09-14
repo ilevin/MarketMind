@@ -8,6 +8,7 @@ import pytest
 
 from app.services.job_status_service import JobStatusService
 from app.services.market_session_service import MarketStatus
+from app.version import APP_VERSION
 
 
 class FakeNameProvider:
@@ -25,7 +26,9 @@ class ClosedSessionService:
 
 @pytest.fixture()
 def client(client_factory):
-    with client_factory(FakeNameProvider()) as c:
+    # multi-user-auth：/api/admin/* 全部要求 admin 角色（未登录 401、普通用户 403），
+    # 统一以 admin 登录访问。
+    with client_factory(FakeNameProvider(), login_as="admin", role="admin") as c:
         c.app.state.session_service = ClosedSessionService()
         yield c
 
@@ -35,7 +38,7 @@ def test_admin_status_structure(client):
     assert resp.status_code == 200
     body = resp.json()
 
-    assert body["version"] == "v0.1.0"
+    assert body["version"] == APP_VERSION
     assert set(body["jobs"]) == {"quote_refresh", "fundamental_refresh"}
     assert set(body["providers"]) == {"tencent", "akshare", "tushare"}
 

@@ -37,17 +37,20 @@ def test_instrument_upsert_idempotent(session):
     assert repo.get("CN:STOCK:600519").name == "贵州茅台A"
 
 
-def test_watchlist_add_duplicate_exists(session):
+def test_watchlist_add_duplicate_exists(session, user_factory):
     _make_instrument(session)
-    repo = WatchlistRepository(session)
+    # watchlist 行按用户隔离：仓储构造需传 user_id（multi-user-auth）
+    user_id = user_factory("repo_owner")["user_id"]
+    repo = WatchlistRepository(session, user_id)
     repo.add("CN:STOCK:600519", sort_order=10)
     session.commit()
     assert repo.exists("CN:STOCK:600519") is True
 
 
-def test_watchlist_remove_keeps_instrument(session):
+def test_watchlist_remove_keeps_instrument(session, user_factory):
     _make_instrument(session)
-    repo = WatchlistRepository(session)
+    user_id = user_factory("repo_owner")["user_id"]
+    repo = WatchlistRepository(session, user_id)
     repo.add("CN:STOCK:600519")
     session.commit()
 
@@ -58,10 +61,11 @@ def test_watchlist_remove_keeps_instrument(session):
     assert InstrumentRepository(session).get("CN:STOCK:600519") is not None
 
 
-def test_watchlist_reorder(session):
+def test_watchlist_reorder(session, user_factory):
     _make_instrument(session, "CN:STOCK:600519")
     _make_instrument(session, "HK:STOCK:00700", name="腾讯控股")
-    repo = WatchlistRepository(session)
+    user_id = user_factory("repo_owner")["user_id"]
+    repo = WatchlistRepository(session, user_id)
     repo.add("CN:STOCK:600519", sort_order=20)
     repo.add("HK:STOCK:00700", sort_order=10)
     session.commit()
@@ -72,10 +76,11 @@ def test_watchlist_reorder(session):
     assert ordered == ["CN:STOCK:600519", "HK:STOCK:00700"]
 
 
-def test_index_watchlist_separate_from_watchlist(session):
+def test_index_watchlist_separate_from_watchlist(session, user_factory):
     _make_instrument(session, "CN:INDEX:000001", name="上证指数")
-    wrepo = WatchlistRepository(session)
-    irepo = IndexWatchlistRepository(session)
+    user_id = user_factory("repo_owner")["user_id"]
+    wrepo = WatchlistRepository(session, user_id)
+    irepo = IndexWatchlistRepository(session, user_id)
     irepo.add("CN:INDEX:000001")
     session.commit()
     # 指数只在 index_watchlist，不进入普通 watchlist

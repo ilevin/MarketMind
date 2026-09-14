@@ -49,7 +49,9 @@ class ClosedSessionService:
 
 @pytest.fixture()
 def client(client_factory):
-    with client_factory(FakeNameProvider()) as c:
+    # multi-user-auth：业务 API 均要求登录，统一以 alice 视角访问
+    # （AuthedClient 写请求自动注入 X-CSRF-Token，测试体调用形态不变）。
+    with client_factory(FakeNameProvider(), login_as="alice") as c:
         c.app.state.refresh_service = FakeRefreshService()
         c.app.state.session_service = ClosedSessionService()
         yield c

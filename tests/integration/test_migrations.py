@@ -1,13 +1,15 @@
 """Alembic 迁移集成测试（DuckDB 版，技术方案 §9 / design D2/D4/D5）。
 
 覆盖：
-- 空库全链建库：alembic programmatic API 跑 ``upgrade head``，断言 10 张表
-  与 ``seq_tag_id`` sequence 全部就绪；
-- 版本记录正确：``alembic_version.version_num == "0001_duckdb_baseline"``；
+- 空库全链建库：alembic programmatic API 跑 ``upgrade head``，断言 12 张表
+  （含 multi-user-auth 的 app_user / user_session）与 sequence 全部就绪；
+- 版本记录正确：``alembic_version.version_num == "0002_multi_user_auth"``；
 - 回滚：``downgrade base`` 后核心表与 sequence 全部消失；
 - 外键 RESTRICT：被引用的 instrument 行删除被数据库层拦截（design D4，
   无级联删除，数据库兜底）；
 - 列精度抽查：``quote_snapshot.price`` 为 ``DECIMAL(20,6)``，防类型漂移。
+
+multi-user-auth 升级/降级的旧数据归属与回滚用例见 test_migrations_multi_user.py。
 
 注意：DuckDB 基线是一次性建表，不继承 stocksview 的 SQLite 迁移历史
 （v0.02/v0.03 搬迁用例废弃——历史链已移除）。
@@ -24,7 +26,7 @@ from alembic.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# 基线迁移应创建的全部 10 张业务表（不含 alembic_version 系统表）
+# head（0002）应创建的全部 12 张业务表（不含 alembic_version 系统表）
 EXPECTED_TABLES = {
     "instrument",
     "watchlist",
@@ -36,8 +38,10 @@ EXPECTED_TABLES = {
     "trading_calendar",
     "job_status",
     "app_setting",
+    "app_user",
+    "user_session",
 }
-BASELINE_REVISION = "0001_duckdb_baseline"
+HEAD_REVISION = "0002_multi_user_auth"
 
 
 def _alembic_config(db_path: Path) -> Config:
@@ -65,9 +69,9 @@ def _list_tables(engine) -> set[str]:
 
 
 def test_empty_db_upgrade_head_creates_all_tables(tmp_path):
-    """空库 upgrade head：10 张业务表 + alembic_version 系统表全部就位。
+    """空库 upgrade head：12 张业务表 + alembic_version 系统表全部就位。
 
-    验证 design D2（Alembic 管理 schema 演进）与基线迁移的完整性；
+    验证 design D2（Alembic 管理 schema 演进）与迁移链（0001 -> 0002）的完整性；
     防止遗漏表或 sequence 导致运行时建表失败。
     """
     db = tmp_path / "mig.duckdb"
@@ -76,23 +80,23 @@ def test_empty_db_upgrade_head_creates_all_tables(tmp_path):
     engine = sa.create_engine(f"duckdb:///{db}")
     try:
         tables = _list_tables(engine)
-        # 业务表 10 张 + 版本表 1 张
+        # 业务表 12 张 + 版本表 1 张
         assert EXPECTED_TABLES.issubset(tables), f"缺失表: {EXPECTED_TABLES - tables}"
         assert "alembic_version" in tables
 
-        # sequence 存在（tag_id 取号依赖，design D3：显式 sequence 取代自增主键）
+        # sequence 存在（tag_id / user_id 取号依赖，design D3：显式 sequence 取代自增主键）
         # 注：duckdb_sequences() 的列名是 schema_name（不是 information_schema 风格的 sequence_schema）
         seqs = engine.connect().execute(sa.text(
             "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
         )).fetchall()
         seq_names = {s[0] for s in seqs}
-        assert "seq_tag_id" in seq_names
+        assert {"seq_tag_id", "seq_user_id"} <= seq_names
     finally:
         engine.dispose()
 
 
-def test_alembic_version_points_to_baseline_revision(tmp_path):
-    """upgrade head 后 alembic_version 记录为基线版本号。
+def test_alembic_version_points_to_head_revision(tmp_path):
+    """upgrade head 后 alembic_version 记录为当前 head 版本号。
 
     防止 revision 命名漂移或 head 指向错误；生产环境升级前会核对该值。
     """
@@ -103,7 +107,7 @@ def test_alembic_version_points_to_baseline_revision(tmp_path):
     try:
         with engine.connect() as conn:
             version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == BASELINE_REVISION
+        assert version == HEAD_REVISION
     finally:
         engine.dispose()
 
@@ -131,7 +135,7 @@ def test_downgrade_base_removes_all_tables_and_sequence(tmp_path):
         seqs = engine.connect().execute(sa.text(
             "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
         )).fetchall()
-        assert "seq_tag_id" not in {s[0] for s in seqs}
+        assert {"seq_tag_id", "seq_user_id"} & {s[0] for s in seqs} == set()
     finally:
         engine.dispose()
 
@@ -149,7 +153,7 @@ def test_foreign_key_restrict_blocks_deleting_referenced_instrument(tmp_path):
     from sqlalchemy.exc import IntegrityError
 
     from app.db import create_db_engine, init_db, make_session_factory
-    from app.models import Instrument, Tag, Watchlist, WatchlistTag
+    from app.models import AppUser, Instrument, Tag, Watchlist, WatchlistTag
 
     db = tmp_path / "fk.duckdb"
     engine = create_db_engine(f"duckdb:///{db}")
@@ -157,8 +161,10 @@ def test_foreign_key_restrict_blocks_deleting_referenced_instrument(tmp_path):
     factory = make_session_factory(engine)
 
     try:
-        # 构造关联链：instrument -> watchlist -> watchlist_tag <- tag
+        # 构造关联链：user -> instrument -> watchlist -> watchlist_tag <- tag
         with factory() as session:
+            user = AppUser(username="alice", password_hash="x")
+            session.add(user)
             session.add(
                 Instrument(
                     instrument_id="CN:STOCK:600519",
@@ -169,12 +175,17 @@ def test_foreign_key_restrict_blocks_deleting_referenced_instrument(tmp_path):
                     currency="CNY",
                 )
             )
-            tag = Tag(name="高股息")
+            session.flush()
+            tag = Tag(user_id=user.user_id, name="高股息")
             session.add(tag)
             session.flush()
-            session.add(Watchlist(instrument_id="CN:STOCK:600519", sort_order=0))
+            session.add(Watchlist(user_id=user.user_id, instrument_id="CN:STOCK:600519", sort_order=0))
             session.flush()
-            session.add(WatchlistTag(instrument_id="CN:STOCK:600519", tag_id=tag.tag_id))
+            session.add(
+                WatchlistTag(
+                    user_id=user.user_id, instrument_id="CN:STOCK:600519", tag_id=tag.tag_id
+                )
+            )
             session.commit()
 
         # 直接删除被引用的 instrument 应被外键拦截
@@ -214,3 +225,54 @@ def test_quote_snapshot_price_column_precision(tmp_path):
         assert row[2] == 6
     finally:
         engine.dispose()
+
+
+def test_alembic_head_matches_models_schema(tmp_path):
+    """防漂移：Alembic head 与模型 create_all 建出的库全表全列一致。
+
+    生产建表走 Alembic（容器 CMD `alembic upgrade head`），测试大多走
+    init_db（create_all）——两路径 schema 若漂移，"测试全绿但生产缺列"。
+    已知可接受差异（白名单，逐一说明而非忽略整列）：
+    - alembic_version 表仅 Alembic 路径有；
+    - app_user.user_id / tag.tag_id 的 column_default：Alembic 写入
+      nextval('seq_*')，create_all 不写（ORM 端经 Sequence 客户端取号，
+      两条路径运行时行为等价）。
+    """
+    from app.db import create_db_engine, init_db
+
+    alembic_db = tmp_path / "alembic.duckdb"
+    command.upgrade(_alembic_config(alembic_db), "head")
+
+    model_db = tmp_path / "models.duckdb"
+    engine = create_db_engine(f"duckdb:///{model_db}")
+    try:
+        init_db(engine)
+    finally:
+        engine.dispose()
+
+    def columns_of(db_path) -> set[tuple]:
+        e = sa.create_engine(f"duckdb:///{db_path}")
+        try:
+            with e.connect() as conn:
+                return {
+                    tuple(r) for r in conn.execute(sa.text(
+                        "SELECT table_name, column_name, is_nullable, column_default, "
+                        "data_type FROM information_schema.columns "
+                        "WHERE table_schema = 'main'"
+                    ))
+                }
+        finally:
+            e.dispose()
+
+    alembic_only = columns_of(alembic_db) - columns_of(model_db)
+    models_only = columns_of(model_db) - columns_of(alembic_db)
+
+    assert alembic_only == {
+        ("alembic_version", "version_num", "NO", None, "VARCHAR"),
+        ("app_user", "user_id", "NO", "nextval('seq_user_id')", "BIGINT"),
+        ("tag", "tag_id", "NO", "nextval('seq_tag_id')", "BIGINT"),
+    }
+    assert models_only == {
+        ("app_user", "user_id", "NO", None, "BIGINT"),
+        ("tag", "tag_id", "NO", None, "BIGINT"),
+    }

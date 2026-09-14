@@ -118,15 +118,19 @@ def test_request_failure_returns_empty(monkeypatch):
 
 
 @pytest.fixture()
-def job_env(monkeypatch, session_factory):
+def job_env(monkeypatch, session_factory, user_factory):
+    # multi-user-auth：自选表按 user_id 隔离，后台 job 经 SystemWatchlistRepository
+    # 跨用户聚合，故先建一个真实用户作为自选数据归属
+    owner = user_factory("fund_job_owner")
     with session_factory() as s:
         irepo = InstrumentRepository(s)
         irepo.upsert(instrument_id="CN:STOCK:600519", symbol="600519", name="贵州茅台",
                      market="CN", asset_type="STOCK", currency="CNY")
         irepo.upsert(instrument_id="HK:STOCK:00700", symbol="00700", name="腾讯控股",
                      market="HK", asset_type="STOCK", currency="HKD")
-        WatchlistRepository(s).add("CN:STOCK:600519", 10)
-        WatchlistRepository(s).add("HK:STOCK:00700", 20)
+        wrepo = WatchlistRepository(s, owner["user_id"])
+        wrepo.add("CN:STOCK:600519", 10)
+        wrepo.add("HK:STOCK:00700", 20)
         s.commit()
 
     config = AppConfig(tushare=TushareConfig(token="fake-token-for-test"))
@@ -136,7 +140,7 @@ def job_env(monkeypatch, session_factory):
     job = FundamentalRefreshJob(
         config, session_factory, provider, MarketSessionService(_AlwaysTrading())
     )
-    return {"job": job, "factory": session_factory}
+    return {"job": job, "factory": session_factory, "user_id": owner["user_id"]}
 
 
 class _AlwaysTrading:
@@ -170,7 +174,7 @@ def test_job_skips_when_data_exists(job_env):
 # ---- 覆盖率判定与补刷（回归：当日已有部分数据时新加自选不补抓） ----
 
 
-def _add_watchlist_stock(factory, instrument_id, symbol, name):
+def _add_watchlist_stock(factory, user_id, instrument_id, symbol, name):
     from app.repositories.instrument import InstrumentRepository
     from app.repositories.watchlist import WatchlistRepository
 
@@ -179,7 +183,7 @@ def _add_watchlist_stock(factory, instrument_id, symbol, name):
             instrument_id=instrument_id, symbol=symbol, name=name,
             market="CN", asset_type="STOCK", currency="CNY",
         )
-        WatchlistRepository(s).add(instrument_id, 30)
+        WatchlistRepository(s, user_id).add(instrument_id, 30)
         s.commit()
 
 
@@ -204,7 +208,7 @@ def test_maybe_run_backfills_newly_added_stock(job_env, monkeypatch):
     monkeypatch.setattr(job, "_latest_trade_date", lambda: trade_date)
 
     job._maybe_run()  # 首次：仅 600519 获得当日估值
-    _add_watchlist_stock(factory, "CN:STOCK:000001", "000001", "平安银行")
+    _add_watchlist_stock(factory, job_env["user_id"], "CN:STOCK:000001", "000001", "平安银行")
 
     job._maybe_run()  # 覆盖率检查发现缺口并补刷
     with factory() as s:
@@ -229,7 +233,7 @@ def test_attempted_marking_and_manual_reset(job_env, monkeypatch):
     trade_date = date(2026, 8, 18)
     monkeypatch.setattr(job, "_latest_trade_date", lambda: trade_date)
 
-    _add_watchlist_stock(factory, "CN:STOCK:300750", "300750", "宁德时代")  # df 中无该行
+    _add_watchlist_stock(factory, job_env["user_id"], "CN:STOCK:300750", "300750", "宁德时代")  # df 中无该行
     calls = _spy_provider_calls(job, monkeypatch)
 
     job._maybe_run()
@@ -317,7 +321,7 @@ def test_all_null_snapshot_counts_as_missing(job_env, monkeypatch):
     trade_date = date(2026, 8, 18)
     monkeypatch.setattr(job, "_latest_trade_date", lambda: trade_date)
 
-    _add_watchlist_stock(factory, "CN:STOCK:000001", "000001", "平安银行")
+    _add_watchlist_stock(factory, job_env["user_id"], "CN:STOCK:000001", "000001", "平安银行")
     job._maybe_run()  # 000001 写入全空行（_df 中该行指标均为脏值）
 
     calls = _spy_provider_calls(job, monkeypatch)

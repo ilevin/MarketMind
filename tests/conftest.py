@@ -81,12 +81,14 @@ class AuthedClient:
 
 @pytest.fixture(autouse=True)
 def _reset_login_rate_limiter():
-    """登录限速单例按测试隔离（失败计数不跨测试累积）。"""
-    from app.auth.rate_limit import login_rate_limiter
+    """登录和 setup 限速单例按测试隔离。"""
+    from app.auth.rate_limit import login_rate_limiter, setup_rate_limiter
 
     login_rate_limiter.clear()
+    setup_rate_limiter.clear()
     yield
     login_rate_limiter.clear()
+    setup_rate_limiter.clear()
 
 
 @pytest.fixture()

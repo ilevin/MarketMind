@@ -17,6 +17,7 @@ from datetime import timedelta
 from sqlalchemy.orm import Session
 
 from app.auth.password import (
+    WeakPasswordError,
     dummy_verify,
     hash_password,
     validate_password,
@@ -31,8 +32,17 @@ from app.auth.session import (
 )
 from app.db import write_coordinator
 from app.models.user import utcnow
-from app.repositories.user import UserRepository
+from app.repositories.user import (
+    INITIALIZATION_EMPTY,
+    INITIALIZATION_PLACEHOLDER,
+    UserRepository,
+)
 from app.repositories.user_session import UserSessionRepository
+from app.services.user_service import (
+    DuplicateUsernameError,
+    UserService,
+    UsernameRuleError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +61,14 @@ class AccountDisabledError(AuthError):
 
 class RateLimitedError(AuthError):
     """登录尝试过于频繁。"""
+
+
+class SetupAlreadyInitializedError(AuthError):
+    """系统已经完成初始化。"""
+
+
+class PasswordMismatchError(AuthError):
+    """两次输入的密码不一致。"""
 
 
 class SessionRevokedError(AuthError):
@@ -133,6 +151,95 @@ class AuthService:
                 csrf_token=csrf_token,
             ),
         )
+
+    def setup_first_admin(
+        self,
+        *,
+        username: str,
+        password: str,
+        password_confirmation: str,
+        client_key: str,
+        limiter: LoginRateLimiter,
+    ) -> LoginResult:
+        """创建或认领首用户，并在同一事务中建立登录 Session。"""
+        if limiter.is_blocked(client_key):
+            raise RateLimitedError("初始化尝试过于频繁，请稍后再试")
+
+        try:
+            username = UserService._validate_username(username)
+            validate_password(password)
+            validate_password(password_confirmation)
+            if password != password_confirmation:
+                raise PasswordMismatchError("两次输入的密码不一致")
+            state = self.user_repo.get_initialization_state()
+            if state not in (INITIALIZATION_EMPTY, INITIALIZATION_PLACEHOLDER):
+                raise SetupAlreadyInitializedError("系统已完成初始化")
+        except (PasswordMismatchError, WeakPasswordError, UsernameRuleError):
+            limiter.record_failure(client_key)
+            raise
+        except SetupAlreadyInitializedError:
+            raise
+        except Exception:
+            # 初始化状态查询失败时不把数据库故障伪装成未初始化。
+            raise
+
+        # Argon2 哈希放在锁外，避免阻塞其他数据库写事务。
+        password_hash = hash_password(password)
+        token = generate_session_token()
+        csrf_token = generate_csrf_token()
+        now = utcnow()
+        self.session.rollback()
+        with write_coordinator.write():
+            try:
+                state = self.user_repo.get_initialization_state()
+                if state == INITIALIZATION_EMPTY:
+                    user = self.user_repo.create(
+                        username=username,
+                        password_hash=password_hash,
+                        role="admin",
+                    )
+                elif state == INITIALIZATION_PLACEHOLDER:
+                    user = self.user_repo.get_placeholder_owner()
+                    if user is None:
+                        raise SetupAlreadyInitializedError("系统已完成初始化")
+                    existing = self.user_repo.get_by_username(username)
+                    if existing is not None and existing.user_id != user.user_id:
+                        raise DuplicateUsernameError(f"用户名已存在: {username}")
+                    self.user_repo.claim_placeholder_admin(
+                        user, username=username, password_hash=password_hash
+                    )
+                else:
+                    raise SetupAlreadyInitializedError("系统已完成初始化")
+
+                self.session_repo.create(
+                    session_token_hash=hash_token(token),
+                    user_id=user.user_id,
+                    csrf_token=csrf_token,
+                    expires_at=now + self._ttl,
+                )
+                self.user_repo.touch_last_login(user, now)
+                self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+
+        limiter.reset(client_key)
+        logger.info("首用户初始化成功: user_id=%s", user.user_id)
+        return LoginResult(
+            token=token,
+            csrf_token=csrf_token,
+            user=CurrentUser(
+                user_id=user.user_id,
+                username=user.username,
+                role=user.role,
+                session_token_hash=hash_token(token),
+                csrf_token=csrf_token,
+            ),
+        )
+
+    def get_initialization_state(self) -> str:
+        """读取初始化状态；数据库异常必须向上抛出以保持 fail-closed。"""
+        return self.user_repo.get_initialization_state()
 
     # ---- Session 校验链 ----
 

@@ -3,7 +3,7 @@
 Cookie 认证下，所有改变状态的请求（POST/PUT/PATCH/DELETE）要求请求头
 X-CSRF-Token 与当前 Session 绑定的 csrf_token 一致；不一致返回 403。
 
-- 登录接口豁免（登录前无 Session）；
+- 登录与首次 setup 接口豁免（调用前无 Session）；
 - 匿名请求不拦截（由 require_user 返回 401/302，保持未登录语义优先）；
 - GET/HEAD/OPTIONS 安全方法不校验。
 """
@@ -17,7 +17,7 @@ from starlette.types import ASGIApp
 from app.auth.session import SESSION_COOKIE_NAME
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
-EXEMPT_PATHS = frozenset({"/api/auth/login"})
+EXEMPT_PATHS = frozenset({"/api/auth/login", "/api/auth/setup"})
 CSRF_HEADER = "X-CSRF-Token"
 
 

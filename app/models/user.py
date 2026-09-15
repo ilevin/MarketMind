@@ -34,7 +34,7 @@ class AppUser(Base):
 
     user_id: Mapped[int] = mapped_column(BigInteger, Sequence("seq_user_id"), primary_key=True)
     username: Mapped[str] = mapped_column(String(32))
-    # 不可登录的占位哈希（迁移 legacy owner）；正式密码经 CLI/管理接口设置
+    # 不可登录的占位哈希（迁移 legacy owner）；正式密码经 /setup、CLI 或管理接口设置
     password_hash: Mapped[str] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(8), server_default=text("'user'"))
     is_active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))

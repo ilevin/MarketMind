@@ -117,12 +117,12 @@ def test_business_api_anonymous_returns_401(client_factory, path):
 # ---- /admin/status 系统状态页（dashboard-ui spec：管理员导航「系统状态」入口） ----
 
 
-def test_admin_status_page_anonymous_redirects_to_login(client_factory):
-    """匿名访问 /admin/status：302 跳转 /login（页面依赖，非 401）。"""
+def test_admin_status_page_anonymous_redirects_to_setup(client_factory):
+    """空用户库匿名访问 /admin/status：302 跳转 /setup。"""
     client = client_factory(FakeNameProvider())
     resp = client.get("/admin/status", follow_redirects=False)
     assert resp.status_code == 302
-    assert resp.headers["location"] == "/login"
+    assert resp.headers["location"] == "/setup"
 
 
 def test_admin_status_page_normal_user_returns_403(client_factory):

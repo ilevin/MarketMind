@@ -1,7 +1,7 @@
 """应用入口：FastAPI、Jinja2 页面、静态资源、健康检查、后台任务生命周期。
 
-页面访问控制（multi-user-auth）：/login、/health、/static/* 匿名可访问，
-其余页面要求登录（未登录 302 -> /login）。
+页面访问控制（multi-user-auth）：/login、/setup、/health、/static/* 匿名可访问，
+其余页面要求登录；未登录时按系统初始化状态跳转 /setup 或 /login。
 """
 
 from __future__ import annotations
@@ -16,7 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.auth.csrf import CsrfMiddleware
-from app.auth.dependencies import require_admin_page, require_user_page
+from app.auth.dependencies import (
+    redirect_if_uninitialized,
+    redirect_to_setup_if_uninitialized,
+    require_admin_page,
+    require_user_page,
+)
 from app.auth.session import CurrentUser
 from app.config import AppConfig, load_config
 from app.db import check_database, create_db_engine, make_session_factory
@@ -43,10 +48,9 @@ def _all_watchlist_ids(session_factory) -> list[str]:
 
 
 def _warn_if_password_setup_pending(session_factory, logger) -> None:
-    """存在占位哈希账户（迁移 legacy owner，不可登录）时提示运行 CLI 设置密码。
+    """存在迁移占位账户时提示通过 /setup 完成首用户初始化。
 
-    db-migration spec（tasks 6.3）：升级后 admin 密码必须经 CLI 设置；
-    此处仅读库检测，不修改任何数据。
+    此处仅读库检测，不修改任何数据；停服后仍可使用 CLI 作为后备路径。
     """
     from sqlalchemy import select
 
@@ -60,7 +64,7 @@ def _warn_if_password_setup_pending(session_factory, logger) -> None:
     if pending:
         logger.warning(
             "以下账户仍为占位密码（不可登录，来自数据库迁移）：%s；"
-            "请运行 `marketmind users set-password <用户名>` 设置密码",
+            "请在受控网络访问 /setup 完成首用户初始化；无法使用 Web 时，停服后可使用 CLI 作为后备",
             ", ".join(pending),
         )
 
@@ -83,14 +87,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         from app.providers.trading_calendar.provider import TushareTradingCalendarProvider
         from app.repositories.quote import QuoteSnapshotRepository
-        from app.repositories.trading_calendar import TradingCalendarRepository
         from app.services.market_session_service import MarketSessionService
         from app.services.quote_cache import QuoteCache
         from app.services.refresh_service import RefreshService
 
-        with session_factory() as session:
-            calendar_repo = TradingCalendarRepository(session)
-        calendar = TushareTradingCalendarProvider(config, calendar_repo)
+        calendar = TushareTradingCalendarProvider(config, session_factory)
         session_service = MarketSessionService(calendar)
 
         cache = QuoteCache(stale_seconds=config.quote.stale_seconds)
@@ -139,7 +140,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await fundamental_job.stop()
             logger.info("应用已停止")
 
-    # 匿名可达路由仅 /login、/health、/static/*（user-authentication spec），
+    # 匿名可达路由仅 /login、/setup、/health、/static/*（user-authentication spec），
     # 关闭 FastAPI 默认文档端点（/docs、/redoc、/openapi.json）
     app = FastAPI(
         title="股票与 ETF 行情看板",
@@ -211,9 +212,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         )
 
     @app.get("/login")
-    def login_page(request: Request):
-        """登录页：匿名可访问（/login、/health、/static/* 为仅有的匿名路由）。"""
+    def login_page(
+        request: Request,
+        _: None = Depends(redirect_to_setup_if_uninitialized),
+    ):
+        """登录页：未初始化时先引导创建首用户。"""
         return templates.TemplateResponse(request, "login.html")
+
+    @app.get("/setup")
+    def setup_page(
+        request: Request,
+        _: None = Depends(redirect_if_uninitialized),
+    ):
+        """首次访问引导：初始化完成后不再展示。"""
+        return templates.TemplateResponse(request, "setup.html")
 
     @app.get("/")
     def index(request: Request, current_user: CurrentUser = Depends(require_user_page)):

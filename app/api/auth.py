@@ -13,7 +13,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.auth.dependencies import require_user
 from app.auth.password import WeakPasswordError
-from app.auth.rate_limit import login_rate_key, login_rate_limiter
+from app.auth.rate_limit import (
+    login_rate_key,
+    login_rate_limiter,
+    setup_rate_key,
+    setup_rate_limiter,
+)
 from app.auth.session import SESSION_COOKIE_NAME, CurrentUser
 from app.schemas import (
     ChangePasswordRequest,
@@ -22,13 +27,18 @@ from app.schemas import (
     LoginResponse,
     LogoutResponse,
     MeResponse,
+    SetupRequest,
 )
 from app.services.auth_service import (
     AccountDisabledError,
     AuthService,
     InvalidCredentialsError,
+    PasswordMismatchError,
     RateLimitedError,
+    SetupAlreadyInitializedError,
 )
+
+from app.services.user_service import DuplicateUsernameError, UsernameRuleError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -77,6 +87,36 @@ def login(body: LoginRequest, request: Request, response: Response):
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except InvalidCredentialsError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
+    _set_session_cookie(request, response, result.token)
+    return LoginResponse(username=result.user.username, role=result.user.role)
+
+
+@router.post("/setup", response_model=LoginResponse)
+def setup(body: SetupRequest, request: Request, response: Response):
+    """首次访问创建由用户自行命名的首个管理员。"""
+    client_ip = request.client.host if request.client else "unknown"
+    key = setup_rate_key(client_ip)
+    with request.app.state.session_factory() as session:
+        auth = AuthService(
+            session, session_ttl_days=request.app.state.config.auth.session.ttl_days
+        )
+        try:
+            result = auth.setup_first_admin(
+                username=body.username,
+                password=body.password,
+                password_confirmation=body.password_confirmation,
+                client_key=key,
+                limiter=setup_rate_limiter,
+            )
+        except RateLimitedError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except (PasswordMismatchError, WeakPasswordError, UsernameRuleError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (SetupAlreadyInitializedError, DuplicateUsernameError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("首用户初始化失败: error_type=%s", type(exc).__name__)
+            raise HTTPException(status_code=500, detail="初始化失败，请稍后重试") from exc
     _set_session_cookie(request, response, result.token)
     return LoginResponse(username=result.user.username, role=result.user.role)
 

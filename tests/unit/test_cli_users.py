@@ -105,6 +105,22 @@ def test_create_admin_user(cli_env):
     assert verify_password("pw12345678", row["password_hash"]) is True
 
 
+def test_create_user_after_first_admin_exists(cli_env):
+    """首访管理员存在后，CLI 仍可创建普通用户且不改变首管理员。"""
+    owner_hash = hash_password("owner-password123")
+    _seed_user(cli_env["db_url"], "first-owner", password_hash=owner_hash, role="admin")
+
+    result = _run_cli(
+        cli_env["cwd"], "users", "create", "bob",
+        input_text="pw12345678\npw12345678\n",
+    )
+    assert result.returncode == 0
+    assert _read_user(cli_env["db_url"], "bob")["role"] == "user"
+    owner = _read_user(cli_env["db_url"], "first-owner")
+    assert owner["role"] == "admin"
+    assert owner["password_hash"] == owner_hash
+
+
 def test_create_password_mismatch_three_attempts(cli_env):
     """连续 3 次两次输入不一致：拒绝并退出非 0，且不产生任何用户。
 
@@ -161,11 +177,7 @@ def test_set_password_replaces_old_password(cli_env):
 
 
 def test_set_password_on_legacy_placeholder(cli_env):
-    """legacy owner 占位哈希：设密码前任何明文都不可登录，经 CLI 设密码后可登录。
-
-    对应"升级后必须先 set-password admin 才能登录"的部署要求
-    （迁移写入 PLACEHOLDER_HASH，见 user-management spec / design D10）。
-    """
+    """legacy owner 占位哈希可在停服后通过 CLI 后备路径设置真实密码。"""
     _seed_user(cli_env["db_url"], "admin", password_hash=PLACEHOLDER_HASH, role="admin")
     placeholder = _read_user(cli_env["db_url"], "admin")["password_hash"]
     assert verify_password("password123", placeholder) is False

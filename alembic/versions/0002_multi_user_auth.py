@@ -5,7 +5,7 @@
 - watchlist / index_watchlist / tag / watchlist_tag 改为用户私有
   （复合主键含 user_id，watchlist_tag 复合外键 -> watchlist(user_id, instrument_id)）；
 - 旧单用户数据全部归属 legacy owner（username=admin，占位密码哈希，
-  must_change_password=true；迁移后经 CLI 设置真实密码，迁移内不含明文密码）。
+  must_change_password=true；迁移后经 /setup 认领，CLI 为后备路径，迁移内不含明文密码）。
 
 DuckDB 1.5.5 约束（spike 验证结论）：
 - 被 FK 引用的表无法 RENAME，也不支持 ALTER TABLE ADD FOREIGN KEY——
@@ -105,7 +105,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("session_token_hash"),
     )
 
-    # --- 2. legacy owner：占位哈希不可登录，密码由 CLI 设置（design D10） ---
+    # --- 2. legacy owner：占位哈希不可登录，由 /setup 认领或停服后通过 CLI 设置 ---
     op.execute(
         sa.text(
             "INSERT INTO app_user (username, password_hash, role, is_active, "

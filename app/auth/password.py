@@ -2,7 +2,7 @@
 
 - 明文/可逆形式禁止入库，日志禁止输出密码；
 - 占位哈希 PLACEHOLDER_HASH 用于迁移产生的 legacy owner（不可登录，
-  直到经 CLI/管理接口设置真实密码）。
+  直到经 /setup、CLI 或管理接口设置真实密码）。
 """
 
 from __future__ import annotations

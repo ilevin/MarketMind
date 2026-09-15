@@ -22,17 +22,15 @@ pip install -e .
 cp config.example.yaml config.yaml
 # 编辑 config.yaml，填写 tushare.token（不使用估值功能可不填）
 alembic upgrade head          # 建表/升级数据库结构（必须，应用启动不做自动建表）
-python -m app.cli users set-password admin   # 首次部署：设置管理员密码（必须在启动服务前执行）
 uvicorn app.main:app --reload --workers 1
 ```
 
 访问 <http://localhost:8000>。数据库结构由 Alembic 管理：启动前必须执行
 `alembic upgrade head`（容器镜像已内置该步骤），迁移失败时应用不会启动。
 
-v0.2.0 起页面与 API 均要求登录：迁移只写入**占位密码**的管理员 `admin`
-（不可登录），必须先经上方 CLI 设置真实密码，或另建管理员：
-`python -m app.cli users create --admin <用户名>`。CLI 与服务进程不能同时打开
-同一数据库文件（DuckDB 单写者约束），故须在启动 uvicorn **之前**执行。
+v0.2.0 起页面与 API 均要求登录。首次访问系统时会自动进入 `/setup`，请自行设置第一个用户的用户名和密码；该用户将自动成为管理员并登录。用户名不固定为 `admin`。
+
+从 v0.1.0 升级时，迁移会写入不可登录的占位 legacy owner。首次访问 `/setup` 会用你填写的用户名和密码认领该账户，并保留其原有自选、指数和标签数据。也可在停服后使用管理 CLI 作为后备初始化方式；CLI 与服务进程不能同时打开同一个数据库文件（DuckDB 单写者约束）。
 
 > uv 等价流程：`uv venv && uv pip install -e ".[dev]"` 后同上。
 
@@ -80,12 +78,13 @@ docker run -d --name marketmind \
 
 容器启动命令为 `alembic upgrade head && uvicorn app.main:app --workers 1`：每次启动先自动执行数据库迁移，成功后才以单 worker 启动应用；迁移失败容器直接退出（不会出现代码与数据库版本不一致的情况）。
 
-首次部署后同样须设置管理员密码才能登录（迁移只写入占位密码的 `admin`）：
-先执行：
+首次部署无需在启动前运行 CLI：容器启动并完成迁移后，访问 <http://localhost:8000>，系统会引导至 `/setup`。填写你自行选择的用户名和密码后，该用户立即成为管理员并登录。
+
+无法使用浏览器时，先停掉服务，再执行 CLI 后备流程，完成后重新启动：
 
 ```bash
 docker compose down
-docker compose run --rm marketmind python -m app.cli users set-password admin
+docker compose run --rm marketmind python -m app.cli users create --admin <用户名>
 docker compose up -d
 ```
 
@@ -109,8 +108,9 @@ python -m app.cli users promote <用户名>           # 将用户提升为管理
 
 - 密码经终端安全输入（getpass，不回显），不会出现在 shell history 与仓库文件中；要求至少 8 位，两次输入须一致
 - CLI 从当前目录读取 `config.yaml`（与应用一致），操作其中 `database.url` 指向的 DuckDB 数据库；执行前数据库须已完成 `alembic upgrade head`
-- **从旧版本升级到多用户认证后，必须先运行 `python -m app.cli users set-password admin`**：迁移写入的 legacy owner 占位密码哈希不可登录，设置真实密码后才能登录并创建其他用户
-- 全新部署可用 `users create --admin <用户名>` 直接创建第一个管理员（或 `users create` 后再 `users promote`）
+- 从旧版本升级到多用户认证后，首次访问 `/setup` 可自行设置第一个管理员的用户名和密码；系统会认领迁移生成的 legacy owner，并保留原有用户私有数据
+- 如无法使用 Web 引导，可停服后运行 `python -m app.cli users set-password admin` 设置迁移占位账户密码，或使用 `users create --admin <用户名>` 创建管理员
+- 全新部署默认通过 `/setup` 创建第一个管理员；也可用 `users create --admin <用户名>` 作为 CLI 后备方式
 - Docker 部署：CLI 与应用服务**不能同时运行**——DuckDB 为单写者嵌入式库，
   服务进程独占数据库文件锁，容器运行时另一进程（CLI）无法打开数据库。
   先停服务、以一次性容器执行 CLI、再重启：
@@ -140,13 +140,19 @@ auth:
 
 ```bash
 cp data/marketmind.duckdb data/marketmind.duckdb.bak   # 1. 备份数据库文件
-docker compose up -d && docker compose logs -f marketmind   # 2. 部署：启动即自动执行迁移（失败容器退出，数据库整体回滚）
-docker compose down                                    # 3. 临时停服（CLI 需独占数据库文件，见单写者约束）
-docker compose run --rm marketmind python -m app.cli users set-password admin   # 4. 设置管理员密码
-docker compose up -d                                   # 5. 重启，登录创建普通用户
+docker compose up -d                                   # 2. 自动执行迁移并启动应用
+docker compose logs -f marketmind                     # 3. 确认迁移成功后，在受控网络访问 /setup
 ```
 
-  迁移写入的占位密码不可登录——第 4 步完成前无人能登录 Web 界面。
+  部署后访问 <http://localhost:8000>，按页面提示进入 `/setup`。迁移生成的占位 owner 只允许被认领一次；首用户用户名由使用者自行设置，不固定为 `admin`，认领会保留原有用户私有数据。
+
+  无法使用 Web 引导时，CLI 可作为后备路径（必须先停服，避免与应用同时打开同一 DuckDB 文件）：
+
+```bash
+docker compose down
+docker compose run --rm marketmind python -m app.cli users set-password admin
+docker compose up -d
+```
 - 旧 stocksview（SQLite 版）数据**不能**原地升级；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
 - 后续版本的常规升级：构建新镜像替换容器即可（启动时自动增量迁移，迁移内置数据校验）
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from app.auth.password import PLACEHOLDER_HASH
+from app.models.user import AppUser
 from app.services.user_service import (
     DuplicateUsernameError,
     InvalidRoleError,
@@ -100,6 +102,26 @@ def test_cannot_demote_last_admin(session):
     with pytest.raises(LastAdminError):
         svc.set_role(admin.user_id, "user")
     assert svc.get(admin.user_id).role == "admin"
+
+
+def test_placeholder_admin_does_not_bypass_last_admin_protection(session):
+    """迁移占位账户不可登录，不能让唯一真实管理员被禁用。"""
+    svc = UserService(session)
+    session.add(
+        AppUser(
+            username="admin",
+            password_hash=PLACEHOLDER_HASH,
+            role="admin",
+            is_active=True,
+            must_change_password=True,
+        )
+    )
+    session.commit()
+    real_admin = _create(svc, username="recovery-admin", role="admin")
+
+    with pytest.raises(LastAdminError):
+        svc.set_active(real_admin.user_id, False)
+    assert svc.get(real_admin.user_id).is_active is True
 
 
 def test_can_disable_admin_when_another_exists(session):

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>初始化 - 股票与 ETF 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="setup">
+  <main class="login-wrap">
+    <form id="setup-form" class="panel login-panel" autocomplete="on">
+      <h1>股票与 ETF 行情看板</h1>
+      <p class="muted">请创建第一个用户，该用户将拥有管理员权限</p>
+      <div class="login-fields">
+        <label for="setup-username">用户名</label>
+        <input id="setup-username" name="username" type="text" required
+               minlength="3" maxlength="32" autocomplete="username" autofocus>
+        <label for="setup-password">密码</label>
+        <input id="setup-password" name="password" type="password" required
+               minlength="8" maxlength="128" autocomplete="new-password">
+        <label for="setup-password-confirmation">确认密码</label>
+        <input id="setup-password-confirmation" name="password_confirmation" type="password" required
+               minlength="8" maxlength="128" autocomplete="new-password">
+      </div>
+      <p class="muted">用户名需为 3 到 32 位字母、数字、下划线或连字符，密码至少 8 位。</p>
+      <p id="setup-message" class="message hidden"></p>
+      <button id="setup-submit" type="submit" class="login-submit">创建管理员账户</button>
+    </form>
+  </main>
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

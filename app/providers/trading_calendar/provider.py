@@ -14,7 +14,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import date, timedelta
+
+from sqlalchemy.orm import Session
 
 from app.config import AppConfig
 from app.db import write_coordinator
@@ -32,20 +35,22 @@ def _weekday_approx(day: date) -> bool:
 
 
 class TushareTradingCalendarProvider:
-    def __init__(self, config: AppConfig, repo: TradingCalendarRepository):
+    def __init__(self, config: AppConfig, session_factory: Callable[[], Session]):
         self.config = config
-        self.repo = repo
+        self.session_factory = session_factory
         self._warned_fallback = False
 
     def is_trading_day(self, market: str, day: date) -> bool:
         market = market.upper()
-        cached = self.repo.get(market, day)
+        with self.session_factory() as session:
+            cached = TradingCalendarRepository(session).get(market, day)
         if cached is not None:
             return cached
 
         self._load_year(market, day.year)
 
-        cached = self.repo.get(market, day)
+        with self.session_factory() as session:
+            cached = TradingCalendarRepository(session).get(market, day)
         if cached is not None:
             return cached
 
@@ -58,14 +63,25 @@ class TushareTradingCalendarProvider:
         return _weekday_approx(day)
 
     def _load_year(self, market: str, year: int) -> None:
-        if self.repo.has_year(market, year):
-            return
-        # 网络请求在写锁外；落库 + 提交持锁串行化（design D6，save_days 不自行 commit）
+        with self.session_factory() as session:
+            if TradingCalendarRepository(session).has_year(market, year):
+                return
+
+        # 网络请求在写锁外；落库 + 提交持锁串行化（design D6）。
         days = self._fetch_year_from_tushare(market, year)
         if days:
             with write_coordinator.write():
-                self.repo.save_days(market, days)
-                self.repo.session.commit()
+                with self.session_factory() as session:
+                    repo = TradingCalendarRepository(session)
+                    # 其他任务可能已在网络请求期间完成同一年份的缓存。
+                    if repo.has_year(market, year):
+                        return
+                    try:
+                        repo.save_days(market, days)
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        raise
             logger.info("已缓存 %s 年 %s 交易日历（%d 天）", year, market, len(days))
 
     def _fetch_year_from_tushare(self, market: str, year: int) -> list[tuple[date, bool]] | None:

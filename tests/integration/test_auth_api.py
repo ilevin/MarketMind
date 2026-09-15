@@ -262,8 +262,8 @@ def test_change_password_validation_and_revocation(client_factory):
 # ---------------------------------------------------------------------------
 
 
-def test_anonymous_api_401_and_pages_redirect_to_login(client_factory):
-    """匿名访问：业务 API 401（含匿名写请求不触发 CSRF）；页面 302 → /login。"""
+def test_anonymous_api_401_and_pages_redirect_by_initialization_state(client_factory):
+    """匿名访问：业务 API 401；空用户库的页面 302 → /setup。"""
     with client_factory(FakeNameProvider()) as client:
         # 业务 / admin API：未登录 401
         for url in (
@@ -282,14 +282,14 @@ def test_anonymous_api_401_and_pages_redirect_to_login(client_factory):
         )
         assert resp.status_code == 401
 
-        # 页面：未登录 302 → /login（须关闭重定向跟随才能断言 302）
+        # 页面：空用户库未初始化时 302 → /setup
         for url in ("/", "/watchlist", "/tags", "/change-password", "/admin/users"):
             resp = client.get(url, follow_redirects=False)
             assert resp.status_code == 302, url
-            assert resp.headers["location"] == "/login"
+            assert resp.headers["location"] == "/setup"
 
-        # 匿名可达：登录页与健康检查
-        assert client.get("/login").status_code == 200
+        # /login 也引导到 setup，健康检查保持匿名可达
+        assert client.get("/login", follow_redirects=False).headers["location"] == "/setup"
         assert client.get("/health").status_code == 200
 
 

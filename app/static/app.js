@@ -557,6 +557,42 @@ function initLoginPage() {
   });
 }
 
+// ---------- 首次初始化页 ----------
+
+function initSetupPage() {
+  const form = document.getElementById("setup-form");
+  if (!form) return;
+  const msg = document.getElementById("setup-message");
+  const submit = document.getElementById("setup-submit");
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const password = document.getElementById("setup-password").value;
+    const confirmation = document.getElementById("setup-password-confirmation").value;
+    if (password !== confirmation) {
+      showMsg(msg, "两次输入的密码不一致", "error");
+      return;
+    }
+    submit.disabled = true;
+    try {
+      await api("/api/auth/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("setup-username").value.trim(),
+          password,
+          password_confirmation: confirmation,
+        }),
+      });
+      window.location.href = "/";
+    } catch (err) {
+      showMsg(msg, err.message, "error");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+}
+
 // ---------- 修改密码页 ----------
 
 function initChangePasswordPage() {
@@ -694,6 +730,7 @@ document.addEventListener("DOMContentLoaded", () => {
   else if (page === "index") initIndexPage();
   else if (page === "tags") initTagsPage();
   else if (page === "login") initLoginPage();
+  else if (page === "setup") initSetupPage();
   else if (page === "change-password") initChangePasswordPage();
   else if (page === "admin-users") initAdminUsersPage();
 });

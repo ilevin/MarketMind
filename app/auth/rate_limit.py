@@ -21,6 +21,11 @@ def login_rate_key(client_ip: str, username: str) -> str:
     return f"{client_ip}|{username.strip().lower()}"
 
 
+def setup_rate_key(client_ip: str) -> str:
+    """首访初始化按 IP 限速，避免通过更换用户名绕过配额。"""
+    return f"setup|{client_ip}"
+
+
 class LoginRateLimiter:
     def __init__(
         self,
@@ -82,3 +87,5 @@ class LoginRateLimiter:
 
 # 模块级单例：与 write_coordinator 同思路，全部登录路径共用
 login_rate_limiter = LoginRateLimiter()
+# setup 独立按 IP 计数，避免登录失败影响首次初始化。
+setup_rate_limiter = LoginRateLimiter()

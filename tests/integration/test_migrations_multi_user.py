@@ -3,7 +3,8 @@
 覆盖旧单用户库升级到多用户 schema 的完整链路：
 - 旧 schema（0001）+ 真实数据 → upgrade head → 数据全部归属 legacy owner，
   行数 / 排序 / 标签关联 / tag_id 完整保留，全局表不动；
-- legacy owner 不可登录：占位哈希 + must_change_password=true（密码经 CLI 设置）；
+- legacy owner 不可登录：占位哈希 + must_change_password=true（可由 `/setup`
+  认领，停服后的 CLI 为后备路径）；
 - 校验失败整体回滚：迁移中途抛异常 → alembic 事务回滚 → 库保持 0001 原样
   （DuckDB 事务性 DDL，迁移内 staging 方案的前提）；
 - 降级 0002 -> 0001：仅保留 legacy owner 数据，其余用户数据丢弃（破坏性，

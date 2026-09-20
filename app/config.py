@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -47,6 +48,12 @@ class FundamentalProviderConfig(BaseModel):
     cn_stock: str = "tushare"
 
 
+class HistoryProviderConfig(BaseModel):
+    """历史行情数据源选源（a-share-historical-data，技术方案 §31.4）。"""
+
+    market_data: str = "tushare"
+
+
 class TimeoutConfig(BaseModel):
     """第三方 Provider 超时（秒，技术方案 §27；数值可按线上耗时调整）。"""
 
@@ -58,7 +65,48 @@ class TimeoutConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     quote: QuoteProviderConfig = Field(default_factory=QuoteProviderConfig)
     fundamental: FundamentalProviderConfig = Field(default_factory=FundamentalProviderConfig)
+    history: HistoryProviderConfig = Field(default_factory=HistoryProviderConfig)
     timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)
+
+
+class HistoryAvailabilityConfig(BaseModel):
+    """各日级数据集默认可用时间 cutoff（技术方案 §27，北京时间）。
+
+    moneyflow 的 20:30 属保守运行策略，非 Tushare 官方承诺。
+    """
+
+    adj_factor: str = "09:30"
+    daily: str = "16:30"
+    daily_basic: str = "17:30"
+    moneyflow: str = "20:30"
+
+
+class HistoryConfig(BaseModel):
+    """历史数据同步配置（a-share-historical-data，技术方案 §57）。"""
+
+    enabled: bool = True
+    start_date: date = date(2010, 1, 1)
+    # 每日统一调度时间（Asia/Shanghai，含周末运行——不产生虚假交易日）
+    schedule_time: str = "20:30"
+    startup_catchup: bool = True
+
+    # 单 dataset×单交易日重试（技术方案 §29）
+    max_attempts: int = Field(default=10, ge=1)
+    backoff_initial_seconds: float = Field(default=5, gt=0)
+    backoff_max_seconds: float = Field(default=300, gt=0)
+    jitter_ratio: float = Field(default=0.2, ge=0, le=1)
+
+    # Tushare 全局请求节奏（技术方案 §30.3；gate 覆盖全部 Tushare Provider）
+    request_min_interval_seconds: float = Field(default=0.6, gt=0)
+    stock_basic_min_interval_seconds: float = Field(default=1.25, gt=0)
+
+    # 主档刷新周期（技术方案 §41）
+    stock_basic_refresh_hours: int = Field(default=24, ge=1)
+    master_refresh_days: int = Field(default=7, ge=1)
+
+    availability: HistoryAvailabilityConfig = Field(
+        default_factory=HistoryAvailabilityConfig
+    )
 
 
 class LoggingConfig(BaseModel):
@@ -84,6 +132,7 @@ class AppConfig(BaseModel):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    history: HistoryConfig = Field(default_factory=HistoryConfig)
 
     @property
     def has_tushare_token(self) -> bool:

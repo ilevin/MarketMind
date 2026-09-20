@@ -1,6 +1,6 @@
 [project]
 name = "marketmind"
-version = "0.2.0"
+version = "0.3.0"
 description = "以 DuckDB 为本地分析内核的个人证券研究工具（A股/港股，AKShare + Tushare）"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,6 +14,9 @@ dependencies = [
     "akshare>=1.14",
     "tushare>=1.4",
     "alembic>=1.13",
+    # Tushare 返回 DataFrame 的字段规整；历史事实表批量写入的 DuckDB 注册视图
+    # （DuckDB register 只接受 DataFrame/Arrow/ndarray，不接受 dict）
+    "pandas>=2.0",
     # DuckDB 持久层：精确锁定版本（技术方案 D1，第三方方言与 DuckDB 版本强耦合）
     "duckdb==1.5.5",
     "duckdb-sqlalchemy==1.5.5.5",

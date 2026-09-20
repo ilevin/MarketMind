@@ -20,6 +20,10 @@ providers:
   fundamental:
     cn_stock: tushare
 
+  # A 股历史行情数据源（a-share-historical-data v0.3.0）
+  history:
+    market_data: tushare
+
   # 第三方数据源超时（秒）：可按线上实际耗时调整；缺省时使用默认值
   timeout:
     tencent: 8
@@ -28,6 +32,39 @@ providers:
 
 logging:
   level: INFO
+
+# A 股历史数据同步（v0.3.0，技术方案 §57）：全部字段可省略，缺省如下
+history:
+  # 总开关：false 时不启动历史同步 Job（不影响已有估值/行情功能）
+  enabled: true
+  # 历史数据起点（首个回填交易日 >= 该日期）
+  start_date: "2010-01-01"
+  # 每日统一调度时间（Asia/Shanghai，含周末——不产生虚假交易日）
+  schedule_time: "20:30"
+  # 启动时发现任一数据集落后目标即自动触发一次补齐
+  startup_catchup: true
+
+  # 单 dataset×单交易日最多尝试次数与退避（指数 + 抖动）
+  max_attempts: 10
+  backoff_initial_seconds: 5
+  backoff_max_seconds: 300
+  jitter_ratio: 0.2
+
+  # Tushare 全局请求节奏（对所有 Tushare Provider 生效）
+  request_min_interval_seconds: 0.6
+  # stock_basic 接口限额更严格（>= 1.25 秒/请求）
+  stock_basic_min_interval_seconds: 1.25
+
+  # 主档刷新周期：证券主档 24 小时；公司资料/历史名称 7 天
+  stock_basic_refresh_hours: 24
+  master_refresh_days: 7
+
+  # 各日级数据集可用时间 cutoff（北京时间；moneyflow 为保守默认，非官方承诺）
+  availability:
+    adj_factor: "09:30"
+    daily: "16:30"
+    daily_basic: "17:30"
+    moneyflow: "20:30"
 
 # 多用户认证（multi-user-auth v0.2.0）：全部字段可省略，缺省如下
 auth:

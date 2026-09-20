@@ -15,7 +15,7 @@
       <a href="/tags">标签管理 →</a>
       <span class="current-user">{{ current_user.username }}（{{ "管理员" if current_user.role == "admin" else "用户" }}）</span>
       <a href="/change-password">修改密码</a>
-      {% if current_user.role == "admin" %}<a href="/admin/users">用户管理</a><a href="/admin/status">系统状态</a>{% endif %}
+      {% if current_user.role == "admin" %}<a href="/admin/data">数据管理</a><a href="/admin/users">用户管理</a><a href="/admin/status">系统状态</a>{% endif %}
       <a href="#" id="logout-link">退出登录</a>
     </nav>
   </header>

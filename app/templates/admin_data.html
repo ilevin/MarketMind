@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
+  <title>数据管理 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="admin-data">
+  <header class="topbar">
+    <h1>数据管理</h1>
+    <nav class="user-nav">
+      <a href="/">← 行情首页</a>
+      <span class="current-user">{{ current_user.username }}（管理员）</span>
+      <a href="/admin/users">用户管理</a>
+      <a href="/admin/status">系统状态</a>
+      <a href="/change-password">修改密码</a>
+      <a href="#" id="logout-link">退出登录</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <div class="data-overview">
+        <div class="overview-item">
+          <span class="overview-label">整体状态</span>
+          <span id="overall-status" class="status-badge">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">数据起点</span>
+          <span id="history-start-date">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">最新市场交易日</span>
+          <span id="latest-trade-date">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">当前任务</span>
+          <span id="current-task">无</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">最后执行</span>
+          <span id="last-run">—</span>
+        </div>
+        <div class="overview-action">
+          <button id="sync-button">检查并更新数据</button>
+        </div>
+      </div>
+      <p id="sync-message" class="message hidden"></p>
+      <p class="muted">
+        首次回填自 2010-01-01 起，受 Tushare 限流影响可能跨多次运行完成；中途停止后下次自动从水位继续。
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>日级数据集</h2>
+      <div id="daily-cards" class="data-cards">
+        <p class="muted">加载中…</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>主档数据集</h2>
+      <table class="table" id="master-table">
+        <thead>
+          <tr>
+            <th>数据集</th>
+            <th>状态</th>
+            <th class="right">记录数</th>
+            <th>上次成功刷新</th>
+            <th>bootstrap / cursor</th>
+            <th>最后错误</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>当前任务进度</h2>
+      <div id="active-run">
+        <p class="muted">当前没有运行中的同步任务。</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>最近执行记录</h2>
+      <table class="table" id="runs-table">
+        <thead>
+          <tr>
+            <th>开始时间</th>
+            <th>触发方式</th>
+            <th>整体结果</th>
+            <th class="right">耗时</th>
+            <th>各数据集推进</th>
+            <th>错误摘要</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="runs-empty" class="empty hidden">还没有执行记录。</p>
+      <p class="muted">运行中每 4 秒自动刷新；任务结束后停止轮询，可手动刷新页面更新。</p>
+    </section>
+  </main>
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

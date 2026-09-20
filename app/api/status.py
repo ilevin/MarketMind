@@ -20,7 +20,10 @@ router = APIRouter(
 
 _BEIJING = ZoneInfo(BUSINESS_TZ_NAME)
 
-JOB_NAMES = ("quote_refresh", "fundamental_refresh")
+# 未运行过的 Job 也要出现在 jobs 中（字段为 null 而非缺键，job-status spec）。
+# 新增 Job 必须同步登记，并由 tests 中的一致性断言守护，避免与
+# 各 Job 类的 JOB_NAME 漂移：quote_refresh / fundamental_refresh / history_sync。
+JOB_NAMES = ("quote_refresh", "fundamental_refresh", "history_sync")
 PROVIDER_SOURCES = ("tencent", "akshare", "tushare")
 
 

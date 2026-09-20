@@ -85,6 +85,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         logger.info("数据库结构由 Alembic 管理: %s", config.database.url)
         _warn_if_password_setup_pending(session_factory, logger)
 
+        # 进程级 Tushare 请求节奏：全部 Tushare Provider 共享同一 gate（技术方案 §30）
+        from app.providers.tushare_common import build_gate_from_config, configure_shared_gate
+
+        configure_shared_gate(build_gate_from_config(config))
+
         from app.providers.trading_calendar.provider import TushareTradingCalendarProvider
         from app.repositories.quote import QuoteSnapshotRepository
         from app.services.market_session_service import MarketSessionService
@@ -128,16 +133,38 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         )
         app.state.fundamental_refresh = fundamental_job
 
+        # 历史数据同步（a-share-historical-data，design D17~D18）：
+        # 业务编排在 HistorySyncService，Job 只做调度与进程级 single-flight。
+        history_job = None
+        if config.history.enabled:
+            from app.jobs.history_sync import HistorySyncJob
+            from app.providers.history import HistoryProviderRegistry
+            from app.services.history.sync_service import HistorySyncService
+
+            history_service = HistorySyncService(
+                config,
+                session_factory,
+                HistoryProviderRegistry(config, app.state.provider_metrics),
+                calendar,
+            )
+            history_job = HistorySyncJob(config, history_service, job_status_service)
+            app.state.history_sync_service = history_service
+        app.state.history_sync_job = history_job
+
         from app.jobs.quote_refresh import QuoteRefreshJob
 
         job = QuoteRefreshJob(config, refresh_service, job_status_service)
         await job.start()
         await fundamental_job.start()
+        if history_job is not None:
+            await history_job.start()
         try:
             yield
         finally:
             await job.stop()
             await fundamental_job.stop()
+            if history_job is not None:
+                await history_job.stop()
             logger.info("应用已停止")
 
     # 匿名可达路由仅 /login、/setup、/health、/static/*（user-authentication spec），
@@ -172,6 +199,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # API 路由
     from app.api import (
         admin,
+        admin_history,
         admin_users,
         auth,
         index_watchlist,
@@ -186,6 +214,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.include_router(watchlist.router)
     app.include_router(index_watchlist.router)
     app.include_router(admin.router)
+    app.include_router(admin_history.router)
     app.include_router(admin_users.router)
     app.include_router(status.router)
     app.include_router(tags.router)
@@ -259,6 +288,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     ):
         return templates.TemplateResponse(
             request, "admin_users.html", {"current_user": current_user}
+        )
+
+    @app.get("/admin/data")
+    def admin_data_page(
+        request: Request, current_user: CurrentUser = Depends(require_admin_page)
+    ):
+        """数据管理页（admin-data-management spec）：服务端渲染首屏壳，
+        数据由原生 JS 调 /api/admin/history-data/* 填充（运行中每 4 秒轮询）。"""
+        return templates.TemplateResponse(
+            request, "admin_data.html", {"current_user": current_user}
         )
 
     @app.get("/admin/status")

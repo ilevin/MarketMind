@@ -1,7 +1,9 @@
 /* 原生 JS：自选管理页（watchlist）+ 行情首页（index）+ 标签管理页（tags）
- * + 登录页（login）+ 修改密码页（change-password）+ 用户管理页（admin-users）。
+ * + 登录页（login）+ 修改密码页（change-password）+ 用户管理页（admin-users）
+ * + 数据管理页（admin-data）。
  * 页面通过 body[data-page] 区分；v0.03 增加标签管理与行情页标签筛选（本地过滤）；
- * multi-user-auth：统一 fetch 封装注入 X-CSRF-Token，会话失效自动回登录页。 */
+ * multi-user-auth：统一 fetch 封装注入 X-CSRF-Token，会话失效自动回登录页；
+ * a-share-historical-data：数据管理页在运行中每 4 秒轮询 sync 小表 API。 */
 
 "use strict";
 
@@ -723,6 +725,293 @@ function initAdminUsersPage() {
   loadList().catch((err) => showMsg(msg, err.message, "error"));
 }
 
+// ---------- 数据管理页（admin，a-share-historical-data） ----------
+
+const DATASET_STATUS_LABEL = {
+  UNINITIALIZED: "未初始化",
+  CHECKING: "检查中",
+  SYNCING: "同步中",
+  RETRYING: "重试中",
+  CAUGHT_UP: "已追平",
+  LAGGING: "落后",
+  FAILED: "失败",
+  WAITING_SOURCE: "等待数据源",
+};
+
+const DATASET_STATUS_CLASS = {
+  CAUGHT_UP: "ok",
+  SYNCING: "busy",
+  CHECKING: "busy",
+  RETRYING: "busy",
+  LAGGING: "warn",
+  WAITING_SOURCE: "warn",
+  FAILED: "bad",
+};
+
+const OVERALL_STATUS_LABEL = {
+  HEALTHY: "正常",
+  RUNNING: "同步中",
+  LAGGING: "落后",
+  WAITING: "等待数据源",
+  ERROR: "异常",
+  UNINITIALIZED: "未初始化",
+};
+
+const OVERALL_STATUS_CLASS = {
+  HEALTHY: "ok",
+  RUNNING: "busy",
+  LAGGING: "warn",
+  WAITING: "warn",
+  ERROR: "bad",
+};
+
+const TRIGGER_LABEL = { SCHEDULED: "定时", MANUAL: "手动", STARTUP: "启动补数" };
+const RUN_STATUS_LABEL = {
+  RUNNING: "运行中",
+  SUCCESS: "成功",
+  PARTIAL: "部分成功",
+  FAILED: "失败",
+  INTERRUPTED: "已中断",
+  NOOP: "无事可做",
+};
+
+function initAdminDataPage() {
+  const syncBtn = document.getElementById("sync-button");
+  if (!syncBtn) return;
+
+  const msg = document.getElementById("sync-message");
+  const POLL_MS = 4000;
+  let pollTimer = null;
+
+  function fmtDateTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  }
+
+  function fmtDuration(ms) {
+    if (ms == null) return "—";
+    if (ms < 1000) return `${ms} ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)} 秒`;
+    return `${Math.floor(s / 60)} 分 ${Math.round(s % 60)} 秒`;
+  }
+
+  function statusBadge(status, labels, classes) {
+    const label = labels[status] || status || "—";
+    const cls = classes[status] ? ` ${classes[status]}` : "";
+    return `<span class="status-badge${cls}">${esc(label)}</span>`;
+  }
+
+  function renderOverview(summary) {
+    const overall = document.getElementById("overall-status");
+    overall.textContent = OVERALL_STATUS_LABEL[summary.overall_status] || summary.overall_status;
+    overall.className = `status-badge ${OVERALL_STATUS_CLASS[summary.overall_status] || ""}`.trim();
+    document.getElementById("history-start-date").textContent = summary.history_start_date || "—";
+    document.getElementById("latest-trade-date").textContent = summary.latest_market_trade_date || "—";
+
+    const active = summary.active_run;
+    document.getElementById("current-task").textContent = active
+      ? `${active.run_id.slice(0, 8)}… · ${TRIGGER_LABEL[active.trigger_type] || active.trigger_type} · 开始于 ${fmtDateTime(active.started_at)}`
+      : "无";
+    syncBtn.disabled = !!active;
+    syncBtn.textContent = active ? "正在更新..." : "检查并更新数据";
+  }
+
+  function renderDailyCards(summary) {
+    const box = document.getElementById("daily-cards");
+    box.innerHTML = "";
+    summary.daily_datasets.forEach((d) => {
+      const card = document.createElement("div");
+      card.className = "data-card";
+      const range = d.data_min_date
+        ? `${d.data_min_date} ~ ${d.data_max_date || "—"}`
+        : "尚无数据";
+      const lag = d.lag_trade_days > 0 ? `${d.lag_trade_days} 个交易日` : "已追平";
+      card.innerHTML = `
+        <div class="data-card-head">
+          <span class="data-card-title">${esc(d.display_name)}</span>
+          ${statusBadge(d.status, DATASET_STATUS_LABEL, DATASET_STATUS_CLASS)}
+        </div>
+        <dl class="data-card-body">
+          <dt>数据范围</dt><dd>${esc(range)}</dd>
+          <dt>连续水位</dt><dd>${esc(d.latest_complete_trade_date || "—")}</dd>
+          <dt>当前目标</dt><dd>${esc(d.latest_expected_trade_date || "—")}</dd>
+          <dt>落后</dt><dd>${esc(lag)}</dd>
+          <dt>记录数</dt><dd class="num">${(d.record_count || 0).toLocaleString("zh-CN")}</dd>
+          <dt>当前处理</dt><dd>${
+            d.current_trade_date
+              ? `${esc(d.current_trade_date)}（第 ${d.current_attempt} 次）`
+              : "—"
+          }</dd>
+          <dt>最后成功</dt><dd>${fmtDateTime(d.last_success_at)}</dd>
+          <dt>最后错误</dt><dd class="muted">${
+            d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
+          }</dd>
+        </dl>`;
+      box.appendChild(card);
+    });
+  }
+
+  function renderMasterTable(summary) {
+    const tbody = document.querySelector("#master-table tbody");
+    tbody.innerHTML = "";
+    summary.master_datasets.forEach((m) => {
+      const cursor = m.bootstrap_complete
+        ? "bootstrap 完成"
+        : m.master_cursor
+          ? `游标 ${m.master_cursor}`
+          : "—";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${esc(m.display_name)}<span class="muted"> ${esc(m.dataset)}</span></td>
+        <td>${statusBadge(m.status, DATASET_STATUS_LABEL, DATASET_STATUS_CLASS)}</td>
+        <td class="right num">${(m.record_count || 0).toLocaleString("zh-CN")}</td>
+        <td>${fmtDateTime(m.last_success_at)}</td>
+        <td>${esc(cursor)}</td>
+        <td class="muted">${
+          m.last_error ? `${esc(m.last_error_code || "")} ${esc(m.last_error)}` : "—"
+        }</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderActiveRun(run, datasets) {
+    const box = document.getElementById("active-run");
+    if (!run) {
+      box.innerHTML = '<p class="muted">当前没有运行中的同步任务。</p>';
+      return;
+    }
+    const done = datasets.filter((d) => d.status !== "RUNNING");
+    const rows = datasets
+      .map(
+        (d) => `
+        <tr>
+          <td>${esc(d.display_name)}</td>
+          <td>${statusBadge(
+            { RUNNING: "SYNCING", SUCCESS: "CAUGHT_UP", FAILED: "FAILED", NOOP: "UNINITIALIZED" }[d.status] || d.status,
+            DATASET_STATUS_LABEL,
+            DATASET_STATUS_CLASS
+          )}</td>
+          <td>${esc(d.start_watermark || "—")} → ${esc(d.end_watermark || "—")}</td>
+          <td>${esc(d.target_trade_date || "—")}</td>
+          <td class="right num">${d.dates_completed || 0}</td>
+          <td class="right num">${(d.rows_written || 0).toLocaleString("zh-CN")}</td>
+          <td class="right num">${d.retry_count || 0}</td>
+          <td class="muted">${
+            d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
+          }</td>
+        </tr>`
+      )
+      .join("");
+    box.innerHTML = `
+      <p class="muted">
+        run ${esc(run.run_id)} · ${TRIGGER_LABEL[run.trigger_type] || run.trigger_type} ·
+        开始于 ${fmtDateTime(run.started_at)} · 已完成 ${done.length}/${datasets.length} 个数据集
+      </p>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>数据集</th><th>状态</th><th>起止水位</th><th>目标</th>
+            <th class="right">完成天数</th><th class="right">写入行数</th>
+            <th class="right">重试</th><th>最后错误</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function renderRuns() {
+    const data = await api("/api/admin/history-data/runs?limit=20");
+    const tbody = document.querySelector("#runs-table tbody");
+    tbody.innerHTML = "";
+    document.getElementById("runs-empty").classList.toggle("hidden", data.items.length > 0);
+    document.getElementById("runs-table").classList.toggle("hidden", data.items.length === 0);
+    for (const run of data.items) {
+      const detail = await api(`/api/admin/history-data/runs/${encodeURIComponent(run.run_id)}`);
+      const advanced = detail.datasets
+        .map((d) => {
+          const mark = d.dates_completed > 0 ? `${d.dates_completed} 天` : "无";
+          return `<span class="chip readonly">${esc(d.display_name)}：${mark}</span>`;
+        })
+        .join("");
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${fmtDateTime(run.started_at)}</td>
+        <td>${TRIGGER_LABEL[run.trigger_type] || esc(run.trigger_type)}</td>
+        <td>${statusBadge(
+          { SUCCESS: "CAUGHT_UP", PARTIAL: "LAGGING", FAILED: "FAILED", RUNNING: "SYNCING", INTERRUPTED: "FAILED" }[run.status] || run.status,
+          RUN_STATUS_LABEL,
+          DATASET_STATUS_CLASS
+        )}</td>
+        <td class="right num">${fmtDuration(run.duration_ms)}</td>
+        <td>${advanced || "—"}</td>
+        <td class="muted">${esc(run.error_summary || "")}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function refresh() {
+    const summary = await api("/api/admin/history-data/summary");
+    renderOverview(summary);
+    renderDailyCards(summary);
+    renderMasterTable(summary);
+    if (summary.active_run) {
+      const detail = await api(
+        `/api/admin/history-data/runs/${encodeURIComponent(summary.active_run.run_id)}`
+      );
+      renderActiveRun(detail.run, detail.datasets);
+      startPolling();
+    } else {
+      renderActiveRun(null, []);
+      stopPolling();
+    }
+    await renderRuns();
+    return summary;
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollTimer = window.setInterval(() => {
+      refresh().catch((err) => {
+        stopPolling();
+        showMsg(msg, err.message, "error");
+      });
+    }, POLL_MS);
+  }
+
+  function stopPolling() {
+    // 任务结束即停止高频轮询，页面保持最终状态（spec 前端轮询）
+    if (pollTimer === null) return;
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  syncBtn.addEventListener("click", async () => {
+    syncBtn.disabled = true;
+    syncBtn.textContent = "正在更新...";
+    msg.classList.add("hidden");
+    try {
+      await api("/api/admin/history-data/sync", { method: "POST" });
+      await refresh();
+    } catch (err) {
+      if (String(err.message).includes("正在运行")) {
+        showMsg(msg, "历史数据同步正在运行", "success");
+        await refresh().catch(() => {});
+      } else {
+        syncBtn.disabled = false;
+        syncBtn.textContent = "检查并更新数据";
+        showMsg(msg, err.message, "error");
+      }
+    }
+  });
+
+  window.addEventListener("beforeunload", stopPolling);
+
+  refresh().catch((err) => showMsg(msg, err.message, "error"));
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const page = document.body.dataset.page;
   bindLogout();
@@ -733,4 +1022,5 @@ document.addEventListener("DOMContentLoaded", () => {
   else if (page === "setup") initSetupPage();
   else if (page === "change-password") initChangePasswordPage();
   else if (page === "admin-users") initAdminUsersPage();
+  else if (page === "admin-data") initAdminDataPage();
 });

@@ -17,6 +17,7 @@ from app.config import AppConfig
 from app.models.instrument import Instrument
 from app.providers.base import Fundamental
 from app.providers.safe_values import safe_float
+from app.providers.tushare_common import TushareClientProxy, TushareTransport
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +30,23 @@ def to_ts_code(symbol: str) -> str:
 
 
 class TushareFundamentalProvider:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, transport: TushareTransport | None = None):
         self.config = config
+        self._transport = transport
+
+    def _get_transport(self) -> TushareTransport:
+        # 未显式注入时基于自身 config 构造；gate 取进程级共享单例（技术方案 §30）
+        if self._transport is None:
+            self._transport = TushareTransport(self.config)
+        return self._transport
 
     def _pro(self):
-        if not self.config.has_tushare_token:
-            raise RuntimeError("Tushare Token 未配置（config.yaml -> tushare.token）")
-        import tushare as ts
+        """client 代理：endpoint 调用经共享 transport（gate 节奏 + 异常归一化）。
 
-        # v0.03：超时由配置注入（技术方案 §27），替换 SDK 默认 30 秒
-        return ts.pro_api(
-            self.config.tushare.token,
-            timeout=self.config.providers.timeout.tushare,
-        )
+        v0.3.0 改造（技术方案 §30）：不再各自 ``ts.pro_api``；Token 校验与
+        timeout 注入移入 ``create_tushare_pro_client``。
+        """
+        return TushareClientProxy(self._get_transport())
 
     def get_fundamentals(
         self, instruments: list[Instrument], trade_date: date | None = None

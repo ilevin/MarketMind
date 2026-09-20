@@ -63,7 +63,8 @@ def test_admin_status_admin_returns_200(client_factory):
         assert resp.status_code == 200
         body = resp.json()
         assert body["version"] == APP_VERSION
-        assert set(body["jobs"]) == {"quote_refresh", "fundamental_refresh"}
+        # 三个 Job 均接入 JobStatusService（v0.3.0 起含 history_sync）
+        assert set(body["jobs"]) == {"quote_refresh", "fundamental_refresh", "history_sync"}
         assert set(body["providers"]) == {"tencent", "akshare", "tushare"}
 
 

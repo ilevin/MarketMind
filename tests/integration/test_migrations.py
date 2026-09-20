@@ -1,15 +1,16 @@
 """Alembic 迁移集成测试（DuckDB 版，技术方案 §9 / design D2/D4/D5）。
 
 覆盖：
-- 空库全链建库：alembic programmatic API 跑 ``upgrade head``，断言 12 张表
-  （含 multi-user-auth 的 app_user / user_session）与 sequence 全部就绪；
-- 版本记录正确：``alembic_version.version_num == "0002_multi_user_auth"``；
+- 空库全链建库：alembic programmatic API 跑 ``upgrade head``，断言 23 张表
+  （含 multi-user-auth 与 a-share-historical-data 全部表）与 sequence 就绪；
+- 版本记录正确：``alembic_version.version_num == "0003_a_share_historical_data"``；
 - 回滚：``downgrade base`` 后核心表与 sequence 全部消失；
 - 外键 RESTRICT：被引用的 instrument 行删除被数据库层拦截（design D4，
   无级联删除，数据库兜底）；
 - 列精度抽查：``quote_snapshot.price`` 为 ``DECIMAL(20,6)``，防类型漂移。
 
-multi-user-auth 升级/降级的旧数据归属与回滚用例见 test_migrations_multi_user.py。
+multi-user-auth 升级/降级与 a-share-historical-data 旧数据无损升级的
+专用用例分别见 test_migrations_multi_user.py / test_migrations_history.py。
 
 注意：DuckDB 基线是一次性建表，不继承 stocksview 的 SQLite 迁移历史
 （v0.02/v0.03 搬迁用例废弃——历史链已移除）。
@@ -26,7 +27,7 @@ from alembic.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# head（0002）应创建的全部 12 张业务表（不含 alembic_version 系统表）
+# head（0003）应创建的全部 23 张业务表（不含 alembic_version 系统表）
 EXPECTED_TABLES = {
     "instrument",
     "watchlist",
@@ -40,8 +41,20 @@ EXPECTED_TABLES = {
     "app_setting",
     "app_user",
     "user_session",
+    # --- a-share-historical-data（0003） ---
+    "cn_stock_basic",
+    "cn_stock_company",
+    "cn_stock_name_change",
+    "market_daily_bar",
+    "market_adj_factor",
+    "market_daily_basic",
+    "market_moneyflow",
+    "history_sync_state",
+    "history_day_status",
+    "history_sync_run",
+    "history_sync_run_dataset",
 }
-HEAD_REVISION = "0002_multi_user_auth"
+HEAD_REVISION = "0003_a_share_historical_data"
 
 
 def _alembic_config(db_path: Path) -> Config:
@@ -69,7 +82,7 @@ def _list_tables(engine) -> set[str]:
 
 
 def test_empty_db_upgrade_head_creates_all_tables(tmp_path):
-    """空库 upgrade head：12 张业务表 + alembic_version 系统表全部就位。
+    """空库 upgrade head：23 张业务表 + alembic_version 系统表全部就位。
 
     验证 design D2（Alembic 管理 schema 演进）与迁移链（0001 -> 0002）的完整性；
     防止遗漏表或 sequence 导致运行时建表失败。

@@ -10,7 +10,9 @@
 - ``client_factory`` 供 integration 测试：建 app 并替换 session_factory /
   name_provider（lifespan 不会重建这两项）。refresh_service /
   session_service 等会被 lifespan 挂载真实实例的 state，由测试在
-  TestClient with 块内覆盖为假件（沿用原模式）。
+  TestClient with 块内覆盖为假件（沿用原模式）。``history.startup_catchup``
+  默认关闭：否则每个 API 测试的 lifespan 都会真的发起一次历史同步 run，
+  污染 history_sync_* 表断言（需要该行为的测试自行打开）。
 - multi-user-auth：``login_as="用户名"`` 走真实登录（UserService 幂等建号
   -> POST /api/auth/login -> Set-Cookie），返回 AuthedClient 包装——
   写请求自动注入 X-CSRF-Token，存量测试的调用形态不变；不传则匿名。
@@ -170,6 +172,7 @@ def client_factory(session_factory, duckdb_url, user_factory):
         from app.main import create_app
 
         config = AppConfig(database=DatabaseConfig(url=duckdb_url))
+        config.history.startup_catchup = False
         app = create_app(config)
         app.state.session_factory = session_factory
         app.state.name_provider = name_provider

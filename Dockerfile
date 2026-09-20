@@ -7,7 +7,8 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md alembic.ini ./
+# 不 COPY README：pyproject.toml 未声明 readme 字段，pip 构建不读它
+COPY pyproject.toml alembic.ini ./
 COPY app ./app
 COPY alembic ./alembic
 

@@ -29,4 +29,6 @@ dist/
 
 # Claude Code 本地个人设置（工作流 commands/skills 随仓库提交）
 .claude/settings.local.json
+# agent 临时 worktree：内含整份仓库副本与自己的 .git，属本地构建产物
+.claude/worktrees/
 *.tmp

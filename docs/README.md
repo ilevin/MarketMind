@@ -7,6 +7,7 @@
 - 持久层：DuckDB（单文件 `data/marketmind.duckdb`，列式分析型数据库）
 - 单体应用：FastAPI + DuckDB + Jinja2 + 原生 JS/CSS，无 Redis / MySQL / Node.js / 前端框架
 - 多用户认证（v0.2.0）：登录后使用，自选 / 指数配置 / 标签按用户隔离，行情与估值数据全局共享
+- A股历史数据（v0.3.0）：Tushare 日线 / 复权因子 / 每日指标 / 资金流 + 证券主档，落 DuckDB 供后续回测与分析；管理员在 `/admin/data` 查看与补齐
 
 ## 环境要求
 
@@ -153,6 +154,20 @@ docker compose down
 docker compose run --rm marketmind python -m app.cli users set-password admin
 docker compose up -d
 ```
+- v0.2.0 → v0.3.0（A 股历史数据）：
+
+```bash
+docker compose stop                                    # 1. 停服（DuckDB 单写者，必须先停）
+cp data/marketmind.duckdb data/marketmind.duckdb.bak   # 2. 备份数据库文件
+docker compose up -d                                   # 3. 容器启动时自动执行 alembic upgrade head
+docker compose logs -f marketmind                     # 4. 确认迁移成功
+```
+
+  迁移 `0003_a_share_historical_data` 可重复执行且只增不删；既有表行数不变。
+  启动后在 `/admin/data` 点击"检查并更新数据"触发首次回填（或等待每日 20:30
+  定时任务）。首次回填 2010 年至今会跨越多次运行，属预期行为，可在同一页面
+  观察进度。回滚 = 还原备份文件 + 回退代码版本。
+
 - 旧 stocksview（SQLite 版）数据**不能**原地升级；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
 - 后续版本的常规升级：构建新镜像替换容器即可（启动时自动增量迁移，迁移内置数据校验）
 
@@ -198,6 +213,7 @@ docker compose up -d
 | ETF/港股/指数行情 | 腾讯 `qt.gtimg.cn` 批量接口 | 港股为延时行情（约 15 分钟），页面明确标注 |
 | A股估值 | Tushare `daily_basic` | 每日收盘后更新一次，需 Token |
 | A股交易日历 | Tushare `trade_cal` | 按年缓存到 DuckDB |
+| A股历史数据 | Tushare `daily` / `adj_factor` / `daily_basic` / `moneyflow` / `stock_basic` / `namechange` / `stock_company` | 后台按交易日同步（v0.3.0），需 Token；见「A 股历史数据」 |
 | 港股交易日历 | Tushare `trade_cal`(HKEX)，不可用时回退周一至周五近似 | 近似规则下港股节假日会尝试刷新（无害），不影响数据正确性 |
 
 所有数据均可能存在延迟，仅供个人参考，不构成投资建议。
@@ -222,18 +238,127 @@ providers:
 
 股票 / ETF 自选支持标签分类（指数不支持）：先在「标签管理」页（`/tags`）创建标签，再到「自选管理」页点击操作列「标签」按钮，在弹层中点击标签添加 / 取消关联（即时保存）。一个自选条目可关联多个标签；被引用的标签不能删除（需先解除全部关联）。行情首页可按标签筛选（全部 / 指定标签 / 无标签），筛选为前端本地过滤，不会增加数据源请求。
 
+## A 股历史数据（v0.3.0）
+
+面向后续回测与分析的历史数据底座：把 Tushare 的 A 股历史数据同步到本地 DuckDB。
+
+### 数据集
+
+| 数据集 | 内容 | 粒度 |
+|---|---|---|
+| `daily` | 日线行情（未复权，含成交量/成交额） | 证券 × 交易日 |
+| `adj_factor` | 复权因子 | 证券 × 交易日 |
+| `daily_basic` | 每日指标（PE/PB/换手率/总市值等） | 证券 × 交易日 |
+| `moneyflow` | 资金流 | 证券 × 交易日 |
+| `stock_basic` | 证券主档（沪深北三市场，含退市，不裁剪到 2010 年起） | 证券 |
+| `trade_cal` | 交易日历（严格模式，SSE/SZSE） | 交易日 |
+| `namechange` | 证券历史名称 | 事件 |
+| `stock_company` | 公司基本信息 | 证券 |
+
+历史起点默认 `2010-01-01`（`history.start_date`）。
+
+### 管理员页面 `/admin/data`
+
+- 顶部整体状态 + 数据起点 + 最新交易日 + 当前任务 + 最后执行
+- 四个日级数据集卡片：状态、水位、期望交易日、落后交易日数、累计行数、最近错误
+- 主档状态表、当前任务进度、最近 20 次执行记录
+- 唯一主操作按钮「检查并更新数据」：手动触发一次补齐，运行中禁用并显示「正在更新...」，
+  每 4 秒自动刷新进度，任务结束后停止轮询
+- 该页不提供补缺口 / 增量同步 / 重同步等模式选择，也不提供历史数据手工编辑入口；
+  缺口补齐由后台按水位自动推进
+
+### 首次回填与限流
+
+- **首次回填 2010 年至今可能跨越多次运行**：Tushare 有积分等级限流，
+  同步按交易日逐个推进，每轮推进到限流或当日可用时间边界为止；重复触发不会并行执行
+- 请求节奏由进程级 gate 统一约束（默认 0.6 秒/请求；`stock_basic` 接口 1.25 秒），
+  对所有 Tushare Provider 生效
+- 各数据集有可用时间 cutoff（北京时间）：`adj_factor` 09:30、`daily` 16:30、
+  `daily_basic` 17:30、`moneyflow` 20:30；未到点记 `WAITING_SOURCE` 不推进、不报错，
+  到点后自动补齐
+- 每日 `history.schedule_time`（默认 20:30 北京时间）自动触发；`history.startup_catchup`
+  控制启动时是否立即补齐一次
+- 同步任务在后台推进，单次全天替换在写事务内原子完成；同步期间不阻塞行情与估值功能
+
+### 数据完整性
+
+- 返回恰 6000 行（Tushare 上限）判为潜在截断：改为逐证券细粒度请求、合并去重后复检，
+  仍可疑则本轮失败且不推进水位
+- 未知证券：刷新一次证券主档后重新映射；仍未知则报错且不推进水位（不创建占位证券）
+- 交易日历严格模式：只认 Tushare 权威日历，缺失即失败，不用工作日推断兜底
+- 进程异常退出后残留的运行记录在下次启动标记为 `INTERRUPTED`，水位不受影响
+
+### 配置
+
+```yaml
+history:
+  enabled: true                       # 总开关；false 时不启动历史同步 Job
+  start_date: "2010-01-01"            # 历史数据起点
+  schedule_time: "20:30"              # 每日调度时间（北京时间）
+  startup_catchup: true               # 启动时自动补齐一次
+  max_attempts: 10                    # 单 dataset×单交易日最多尝试次数
+  backoff_initial_seconds: 5
+  backoff_max_seconds: 300
+  jitter_ratio: 0.2
+  request_min_interval_seconds: 0.6   # Tushare 全局请求间隔
+  stock_basic_min_interval_seconds: 1.25
+  stock_basic_refresh_hours: 24       # 证券主档刷新周期
+  master_refresh_days: 7              # 公司资料/历史名称刷新周期
+  availability:                       # 各数据集可用时间（北京时间）
+    adj_factor: "09:30"
+    daily: "16:30"
+    daily_basic: "17:30"
+    moneyflow: "20:30"
+```
+
+全部字段可省略（取上述默认值）。历史数据同步需要有效 Tushare Token；未配置
+Token 时同步会失败且不推进水位，但**不影响已有行情与估值功能**。失败时 `/admin/data`
+显示的 `last_error_code` 取决于日历是否已缓存：
+
+- 全新库、从未成功拉取过交易日历：`trade_cal` 是第一道硬前置，报
+  `CALENDAR_UNAVAILABLE`（错误文本会写明 Token 未配置），四个日级数据集本轮不执行。
+- 日历已缓存（曾成功同步过）、之后 Token 失效或被移除：前置通过，报
+  `TUSHARE_TOKEN_MISSING`。
+
+### 升级注意
+
+DuckDB 为单文件单写者数据库，**升级前请停服并备份 `data/marketmind.duckdb`**：
+
+```bash
+docker compose stop            # 或停掉 uvicorn 进程
+cp data/marketmind.duckdb data/marketmind.duckdb.bak
+# 更新代码 / 配置后启动，容器启动时自动执行 alembic upgrade head
+```
+
+迁移 `0003_a_share_historical_data` 新增 11 张表（4 事实 + 3 主档 + 4 同步控制）
+与索引，并给 `trading_calendar`
+增加 4 个可空列（`exchange` / `pretrade_date` / `source` / `fetched_at`，纯
+`ADD COLUMN`，既有行留 NULL，旧写路径行为不变）。既有 12 张表的行数迁移前后
+一致（迁移内置校验）。
+
 ## 运行状态
 
 - `GET /health`：应用与数据库健康 + 当前版本号
 - `GET /api/admin/status`：后台任务最近运行状态（最近开始/成功/失败时间、耗时、连续失败次数）与各数据源运行指标（管理员）
 - `/admin/status`：系统状态页面（管理员，服务端渲染上述任务与指标快照）
+- `GET /api/admin/history-data/summary`：历史数据整体状态与各数据集水位（管理员，只读，不触发上游请求）
+- `POST /api/admin/history-data/sync`：手动触发一次补齐（管理员，202 返回 `run_id`；运行中返回 409 并附当前 `run_id`）
+- `GET /api/admin/history-data/runs`、`GET /api/admin/history-data/runs/{run_id}`：执行历史与单次详情（管理员）
+- `/admin/data`：数据管理页面（管理员）
 
 ## 测试执行方法
 
 ```bash
 source .venv/bin/activate
 pytest                       # 全部测试（不需要网络，跑真实临时 DuckDB 文件）
-pytest -m online             # 在线冒烟测试（需要真实网络）
+pytest -m online             # 在线冒烟测试（需要真实网络 + 有效 Tushare Token）
+pytest -m "not online" -q    # 与默认相同，显式排除在线用例
+```
+
+历史数据的本地性能基准（synthetic 6000 行 × 100 交易日，防逐行 ORM / 每行提交退化）：
+
+```bash
+.venv/bin/python scripts/bench/bench_history_write.py
 ```
 
 ## 目录结构
@@ -244,25 +369,27 @@ app/
 ├── config.py          # config.yaml -> Pydantic 配置模型
 ├── version.py         # 应用版本号唯一来源
 ├── db.py              # engine / session / WriteCoordinator（写事务协调）
-├── api/               # quotes / watchlist / index_watchlist / admin / status / tags / auth / admin_users 路由
+├── api/               # quotes / watchlist / index_watchlist / admin / admin_history / status / tags / auth / admin_users 路由
 ├── auth/              # 认证：密码 Argon2id / Session / CSRF / 限速 / FastAPI 依赖
-├── models/            # SQLAlchemy 模型（instrument / watchlist / quote / fundamental / tag / app_user / user_session ...）
+├── models/            # SQLAlchemy 模型（instrument / watchlist / quote / fundamental / tag / app_user / user_session / history_* ...）
 ├── schemas/           # API Pydantic Schema
 ├── providers/
-│   ├── base.py        # Quote/Fundamental 模型与 Provider Protocol
+│   ├── base.py        # Quote/Fundamental/历史数据模型与 Provider Protocol
 │   ├── instrument_names.py
+│   ├── tushare_common.py  # Tushare 请求节奏 gate 与 Client 公共封装
 │   ├── quote/         # akshare（A股股票）/ tencent（其余）行情 Provider + 注册表（含超时注入）
 │   ├── fundamental/   # tushare 估值 Provider
+│   ├── history/       # 历史数据 Provider（tushare：八个数据集 + 注册表）
 │   └── trading_calendar/  # 交易日历（Tushare + DuckDB 缓存）
 ├── observability/     # ProviderMetrics 指标与超时包装层
-├── repositories/      # 数据访问
-├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status / auth / user
+├── repositories/      # 数据访问（含 history_fact / history_master / history_sync）
+├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status / auth / user / history（同步编排）
 ├── cli/               # 管理 CLI：python -m app.cli users set-password/create/promote
-├── jobs/              # 60 秒行情刷新任务、估值刷新任务（均接入 JobStatus）
-├── templates/         # index / watchlist / tags / login / change_password / admin_users / admin_status（Jinja2）
+├── jobs/              # 60 秒行情刷新任务、估值刷新任务、历史同步任务（均接入 JobStatus）
+├── templates/         # index / watchlist / tags / login / change_password / admin_users / admin_status / admin_data（Jinja2）
 └── static/            # 原生 JS / CSS
-alembic/               # 数据库迁移（0001_duckdb_baseline → 0002_multi_user_auth）
+alembic/               # 数据库迁移（0001_duckdb_baseline → 0002_multi_user_auth → 0003_a_share_historical_data）
 alembic.ini
-scripts/               # spike 验证脚本（DuckDB 选型期结论：并发 / ORM / sequence / upsert）
-tests/                 # unit + integration（含迁移测试）
+scripts/               # spike 验证脚本 + bench 性能基准（bench_history_write.py）
+tests/                 # unit + integration（含迁移测试；@pytest.mark.online 需真实 Tushare Token）
 ```

@@ -4,6 +4,66 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
+## [v0.3.0] - 2026-09-18
+
+A 股历史数据同步（OpenSpec 变更 a-share-historical-data）。新增 Tushare 历史数据
+Provider、四张日级事实表与三张证券主档表，后台 Job 按交易日推进并保证单日原子替换；
+管理员在 `/admin/data` 查看进度、手动触发补齐。
+
+### 新增
+
+- 数据源：Tushare 历史接口 Provider（`daily` / `adj_factor` / `daily_basic` /
+  `moneyflow` / `stock_basic` / `trade_cal` / `namechange` / `stock_company`），
+  统一内部标准模型；进程级共享请求 gate（默认 0.6 秒/请求，`stock_basic` 1.25 秒）
+- 数据表：四张日级事实表 `market_daily_bar` / `market_adj_factor` /
+  `market_daily_basic` / `market_moneyflow`（`(instrument_id, trade_date)` 主键，
+  按日期整日替换）；三张主档表 `cn_stock_basic` / `cn_stock_company` /
+  `cn_stock_name_change`（覆盖沪深北三市场，含退市证券，不裁剪到 2010 年起）；
+  状态库 `history_sync_state` / `history_sync_run` / `history_sync_run_dataset` /
+  `history_day_status`
+- 同步编排（`app/services/history/`）：单日原子事务（查旧行数 → 整日 DELETE →
+  批量 INSERT → 更新日状态 → 推进水位 → 提交，全过程在写锁内且不做网络请求）；
+  指数退避重试（默认 5s 起、最大 300s、20% 抖动）；数据集相互独立推进；
+  交易日历严格模式（`source='tushare'` 缺失即失败，不用工作日兜底）；
+  可用时间 cutoff（北京时间 09:30/16:30/17:30/20:30，未到点记 WAITING_SOURCE 不推进）
+- 完整性防护（技术方案 §33/§34/§35）：返回恰 6000 行判为 `TRUNCATION_RISK`，
+  转逐证券细粒度请求后合并去重复检；未知证券刷新一次主档后重映射，
+  仍未知则报 `UNKNOWN_INSTRUMENT` 且不推进水位（不建占位证券）
+- 事实表批量写入经 DuckDB 注册视图 + `INSERT ... SELECT`（技术方案 §74 基准后
+  优化）：6000 行单日替换由约 4.9 s 降至约 1.2 s（本机 synthetic 基准 497 s →
+  124 s）；写入取自 `session.connection()` 的事务内连接，不新开连接，
+  单日原子事务（DELETE + INSERT + 日状态 + 水位）语义不变
+- 失败与恢复：错误码 15 类（`TUSHARE_TOKEN_MISSING` ~ `INTERNAL_ERROR`）；
+  启动恢复把残留 RUNNING 运行标记 `INTERRUPTED`；进程级 single-flight
+- 后台任务 `HistorySyncJob`：每日 `schedule_time`（默认 20:30 北京时间，
+  含周末调用但日历判定不产生虚假交易日）触发，`startup_catchup` 控制启动补齐；
+  进程退出时中断并落盘状态
+- 管理员 API（`/api/admin/history-data/*`）：`GET /summary`（整体状态与各数据集
+  水位，只读缓存日历、不发上游请求）、`POST /sync`（202 + `run_id`，
+  运行中返回 409 并附当前 `run_id`）、`GET /runs`、`GET /runs/{run_id}`；
+  `requested_by_user_id` 由服务端从登录态取得，不接受客户端传入
+- 管理员页面 `/admin/data`：整体状态卡、四个日级数据集卡、主档状态表、
+  当前任务进度、最近 20 次执行记录；运行中每 4 秒轮询、结束自动停止；
+  单一"检查并更新数据"按钮（无补缺口/增量/重同步模式选择，无历史数据手工编辑）
+- 配置 `history.*`（技术方案 §57）：起点 `2010-01-01`、调度时间、重试参数、
+  请求节奏、主档刷新周期、各数据集 cutoff；全部字段可省略
+- 迁移 `0003_a_share_historical_data`：11 张新表 + 索引，旧数据无损
+
+### 变更
+
+- 交易日历 Provider 支持严格模式（`strict=True`）：只认 Tushare 权威日历，
+  缺失时报 `CalendarUnavailableError` 而不是回退工作日推断（历史同步依赖此项，
+  既有估值/会话功能默认行为不变）
+- 运行时依赖新增 `pandas`（Tushare 返回 DataFrame 的字段规整；历史事实表批量写入
+  的 DuckDB 注册视图——`register` 只接受 DataFrame/Arrow/ndarray，不接受 dict）
+
+### 说明
+
+- 首次回填 2010 年至今可能跨越多次运行；限流下每轮推进有限，属预期行为，
+  可在 `/admin/data` 观察进度，重复点击不会重复执行（single-flight）
+- 升级前建议停服备份 `data/marketmind.duckdb`（DuckDB 为单文件单写者）
+- 不新建平行 Provider 框架、不引入 Redis / Celery、不改动 `fundamental_snapshot` 语义
+
 ## [v0.2.0] - 2026-09-14
 
 多用户支持与用户认证（OpenSpec 变更 multi-user-auth）。自选 / 指数配置 / 标签按用户

@@ -16,13 +16,15 @@ from app.config import AppConfig
 
 # 配置类错误：不会随重试自愈，快速失败不睡满 max_attempts 轮（design.md 第 8 节）。
 # Token 缺失/权限拒绝（账户配置问题）、schema 不匹配/字段映射错误（代码或
-# 上游接口变更问题）——均需人工介入，重试无意义。
+# 上游接口变更问题）、别名冲突（同一证券同一天的两种取值互相矛盾，必须人工
+# 用权威来源判定）——均需人工介入，重试无意义。
 CONFIG_ERROR_CODES: frozenset[str] = frozenset(
     {
         "TUSHARE_TOKEN_MISSING",
         "TUSHARE_PERMISSION_DENIED",
         "SCHEMA_MISMATCH",
         "UNKNOWN_INSTRUMENT",
+        "ALIAS_CONFLICT",
     }
 )
 

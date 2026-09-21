@@ -36,6 +36,12 @@ from app.providers.base import (
     StockCompanyRecord,
     StockNameChangeRecord,
 )
+from app.providers.history.tushare_aliases import (
+    TUSHARE_TS_CODE_ALIASES,
+    HistoricalAliasConflictError,
+    canonical_ts_code,
+    normalize_historical_aliases,
+)
 from app.providers.safe_values import safe_float
 from app.providers.tushare_common import (
     DAILY_ROW_CAP,
@@ -46,6 +52,16 @@ from app.providers.tushare_common import (
 )
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "TUSHARE_TS_CODE_ALIASES",
+    "HistoricalAliasConflictError",
+    "TushareHistoricalMarketDataProvider",
+    "TushareHistorySchemaError",
+    "UnknownInstrumentError",
+    "canonical_ts_code",
+    "normalize_historical_aliases",
+]
 
 SOURCE = "tushare"
 
@@ -661,7 +677,13 @@ class TushareHistoricalMarketDataProvider:
         instruments: list[Instrument],
         build: Callable[[dict, dict[str, Instrument], str], object],
     ) -> ProviderBatch:
-        """按 trade_date 全市场请求（主路径）。"""
+        """按 trade_date 全市场请求（主路径）。
+
+        结构检查之后、映射之前把已登记的历史 ts_code 改写为规范代码：上游
+        按"当时的代码"返回历史事实，而主档只有今天的代码，不改写则必然
+        UNKNOWN_INSTRUMENT（见 ``tushare_aliases``）。``raw_rows`` 在改写前
+        取值，监控口径仍是上游真实返回行数。
+        """
         context = f"{endpoint}[{_yyyymmdd(trade_date)}]"
         df = self._transport.call(
             endpoint,
@@ -670,6 +692,9 @@ class TushareHistoricalMarketDataProvider:
         )
         _check_dataframe(df, context=context)
         raw_rows = len(df)
+        df = normalize_historical_aliases(
+            df, endpoint=endpoint, trade_date=trade_date
+        )
         symbol_map = _symbol_map(instruments)
 
         def _build(row: dict, ctx: str):
@@ -700,6 +725,15 @@ class TushareHistoricalMarketDataProvider:
 
         单证券单日至多一行，不存在截断；重复键检测属 Domain 校验
         （DUPLICATE_KEY，Validator 职责），本层不做去重。
+
+        与主路径共用同一别名规范化：逐只请求用的是证券**今天的**代码，但
+        上游对历史日期仍可能回旧代码，不处理则会在补齐路径重新出现身份
+        不一致（主路径已修好、fallback 又破功）。
+
+        已知边界（不在本层解决）：主档同时含新旧两码时，别名改写会把响应
+        代码换成被请求子集之外的规范代码，与主路径已产出的记录形成重复键
+        （DUPLICATE_KEY）。根因是候选集与 Provider 输出用了两套身份口径，
+        须在 Service 层统一（见 openspec design 的 Known Limitation）。
         """
         context = f"{endpoint}[{_yyyymmdd(trade_date)}] per-instrument"
         symbol_map = _symbol_map(instruments)
@@ -715,6 +749,9 @@ class TushareHistoricalMarketDataProvider:
             )
             _check_dataframe(df, context=f"{context} {ts_code}")
             raw_rows += len(df)
+            df = normalize_historical_aliases(
+                df, endpoint=endpoint, trade_date=trade_date
+            )
             records.extend(
                 _normalize_rows(
                     df,

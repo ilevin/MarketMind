@@ -1,6 +1,6 @@
 [project]
 name = "marketmind"
-version = "0.3.0"
+version = "0.3.1"
 description = "以 DuckDB 为本地分析内核的个人证券研究工具（A股/港股，AKShare + Tushare）"
 requires-python = ">=3.11"
 dependencies = [

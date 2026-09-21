@@ -67,13 +67,18 @@ docker compose up -d
 等价的直接运行方式（必须挂载 config.yaml 与 data 目录）：
 
 ```bash
-docker build -t marketmind .
+docker build -t marketmind:v0.3.1 .          # 镜像打版本标签，便于按版本回滚
 docker run -d --name marketmind \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
-  marketmind
+  --restart unless-stopped \
+  marketmind:v0.3.1
 ```
+
+> 镜像请带版本标签（`marketmind:v0.3.1`），不要只依赖 `:latest`：`git checkout`
+> 只影响源码工作区，**不影响已在运行的镜像**；回滚到旧版本需要旧镜像仍然存在，
+> 或按旧提交重新构建。`--restart unless-stopped` 让宿主机重启后容器自动恢复。
 
 访问 <http://localhost:8000>。DuckDB 数据库文件与配置均持久化在宿主机（`./data/marketmind.duckdb`、`./config.yaml`）。
 
@@ -140,7 +145,8 @@ auth:
 - v0.1.0 → v0.2.0（多用户认证）：
 
 ```bash
-cp data/marketmind.duckdb data/marketmind.duckdb.bak   # 1. 备份数据库文件
+cp data/marketmind.duckdb     data/marketmind.duckdb.bak      # 1a. 备份主文件
+cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal  # 1b. WAL 存在时一并备份
 docker compose up -d                                   # 2. 自动执行迁移并启动应用
 docker compose logs -f marketmind                     # 3. 确认迁移成功后，在受控网络访问 /setup
 ```
@@ -158,15 +164,30 @@ docker compose up -d
 
 ```bash
 docker compose stop                                    # 1. 停服（DuckDB 单写者，必须先停）
-cp data/marketmind.duckdb data/marketmind.duckdb.bak   # 2. 备份数据库文件
+cp data/marketmind.duckdb     data/marketmind.duckdb.bak      # 2a. 备份主文件
+cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal  # 2b. WAL 存在时必须一并备份
 docker compose up -d                                   # 3. 容器启动时自动执行 alembic upgrade head
 docker compose logs -f marketmind                     # 4. 确认迁移成功
 ```
+
+> DuckDB 会把最近提交留在 `marketmind.duckdb.wal` 中（本生产库的真实数据几乎
+> 全在 WAL 里）。只备份 `.duckdb` 而丢弃 `.wal`，还原时会打开成近乎空库；
+> `.wal` 与主文件必须成对备份/还原。WAL 会在正常关闭或下次干净启动时合并进
+> 主文件（checkpoint），届时 `.wal` 消失属预期。
 
   迁移 `0003_a_share_historical_data` 可重复执行且只增不删；既有表行数不变。
   启动后在 `/admin/data` 点击"检查并更新数据"触发首次回填（或等待每日 20:30
   定时任务）。首次回填 2010 年至今会跨越多次运行，属预期行为，可在同一页面
   观察进度。回滚 = 还原备份文件 + 回退代码版本。
+
+- v0.3.0 → v0.3.1（历史证券代码别名修复）：**无迁移、无数据格式变更**，
+  构建新镜像替换容器即可。若回填曾因 `UNKNOWN_INSTRUMENT` 卡在 2010 年初
+  （Tushare 历史事实返回已变更的旧代码，如 `000022.SZ`），本次修复后水位即可
+  继续推进；无需还原备份、无需修改数据库。修复前建议先跑一次只读在线验证
+  （`.venv/bin/python scripts/spike/verify_ts_code_alias_online.py`），确认旧
+  代码在当前 Tushare 上的真实返回形态。若页面出现 `ALIAS_CONFLICT`，说明上游
+  对同一证券同一天给出了两套互相矛盾的数据，需人工用交易所公告判定权威数据
+  后再决定是否调整别名表——不要手工改库或跳过该交易日。
 
 - 旧 stocksview（SQLite 版）数据**不能**原地升级；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
 - 后续版本的常规升级：构建新镜像替换容器即可（启动时自动增量迁移，迁移内置数据校验）
@@ -322,11 +343,13 @@ Token 时同步会失败且不推进水位，但**不影响已有行情与估值
 
 ### 升级注意
 
-DuckDB 为单文件单写者数据库，**升级前请停服并备份 `data/marketmind.duckdb`**：
+DuckDB 为单文件单写者数据库，**升级前请停服并成对备份 `data/marketmind.duckdb`
+与 `data/marketmind.duckdb.wal`**（后者存在时）：
 
 ```bash
 docker compose stop            # 或停掉 uvicorn 进程
-cp data/marketmind.duckdb data/marketmind.duckdb.bak
+cp data/marketmind.duckdb     data/marketmind.duckdb.bak
+cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal   # 若存在
 # 更新代码 / 配置后启动，容器启动时自动执行 alembic upgrade head
 ```
 

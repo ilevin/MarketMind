@@ -4,6 +4,48 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
+## [v0.3.1] - 2026-09-20
+
+修复 A 股历史首次回填因 Tushare 历史证券代码变更而无法推进
+（OpenSpec 变更 fix-tushare-ts-code-alias）。
+
+### 修复
+
+- **历史 ts_code 别名规范化**（`app/providers/history/tushare_aliases.py`）：
+  Tushare 历史事实接口返回的是证券**当时的代码**，而 `stock_basic` 只含当前
+  代码。深赤湾A `000022.SZ` 于 2018-12-26 变更为招商港口 `001872.SZ` 后，
+  2010 年的 daily / adj_factor / daily_basic / moneyflow 仍以旧代码返回，
+  映射 `instrument_id` 必然失败——而旧代码在任何 `exchange × list_status`
+  分片都不存在（主档已取全部 15 片），§35.1 的"刷新一次主档"恢复路径结构性
+  无效。线上表现：`daily` / `adj_factor` / `daily_basic` 卡在 2010-01-04，
+  `moneyflow` 卡在 2010-01-05，水位永不推进
+- 修复方式：Provider 边界的已登记别名层（`TUSHARE_TS_CODE_ALIASES`，首条
+  `000022.SZ -> 001872.SZ`），在结构检查之后、`ts_code → instrument_id`
+  映射之前改写；四个日级数据集与主路径 / 逐证券 fallback 两条抓取路径统一
+  生效；`raw_row_count` 仍在改写前取值，监控口径不变
+- 新旧代码并存且业务字段一致时只保留规范代码行（WARNING 含
+  `action=drop_legacy`）；字段冲突时抛 `ALIAS_CONFLICT`（新增错误码，
+  归入配置类错误：首次尝试即终态失败、水位不推进），由人工用权威来源判定，
+  不静默择一
+- 严格保护不变：未登记的未知代码仍 `UNKNOWN_INSTRUMENT`，不按后缀/代码段
+  推断别名，不改写主档三个数据集，不创建占位证券，`DUPLICATE_KEY` 与
+  `known_instrument_ids` 校验不削弱
+- 两步别名链（`A→C` 与 `B→C` 都已登记，同日返回 A 与 B）按组内是否含字面
+  规范行分别选取参考行后比较合并；不处理会退化成 `DUPLICATE_KEY`——既不
+  检测真冲突，又要白等重试
+- 无数据库迁移、无数据格式变更；影响仅限后续抓取
+- 新增 `scripts/spike/verify_ts_code_alias_online.py`：上线前只读在线验证
+  （不打印 Token、不写数据库），确认旧代码在四个 endpoint 上的真实返回形态；
+  规范代码不在主档时给出「停止部署」结论
+
+### 已知限制
+
+- **主档同时含新旧两码时 `daily_basic` 截断补齐会撞 `DUPLICATE_KEY`**：
+  候选集来自 `cn_stock_basic`、Provider 输出经别名改写成规范代码，两侧
+  身份口径不一致。线上实测主档只含新代码，此路径不可达；若在线验证脚本
+  报告旧代码仍在 `stock_basic` 分片中，需先评估 Service 层改动再部署
+  （详见 OpenSpec design 的 Known Limitations）
+
 ## [v0.3.0] - 2026-09-18
 
 A 股历史数据同步（OpenSpec 变更 a-share-historical-data）。新增 Tushare 历史数据

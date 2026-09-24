@@ -1,8 +1,11 @@
-"""RetryPolicy 离线单测（tasks 5.9，技术方案 §29/§69.3）。
+"""RetryPolicy 离线单测（per-stock-history-sync D13，技术方案 §29）。
 
 纯策略对象无 I/O：``sleep`` / ``random_fn`` 全部注入，测试不真实等待。
-覆盖退避序列与上限（§29.1：5/10/20/40/80/160/300/300/300）、抖动区间
+覆盖退避序列与上限（5/10/20/40/... 秒指数退避，封顶 300s）、抖动区间
 （0.8~1.2 由 jitter_ratio 配置）、以及配置类错误的快速失败分类（§29.3）。
+
+max_retries 口径：总尝试次数 = max_retries + 1（默认 max_retries=3，总尝试 4 次）。
+退避序列约 5/10/20 秒（第 1/2/3 次重试前等待）。
 """
 
 from __future__ import annotations
@@ -23,9 +26,52 @@ def make_policy(**config_overrides) -> tuple[RetryPolicy, list[float]]:
     return policy, slept
 
 
+class TestMaxRetriesSemantics:
+    """D13：max_retries 口径——总尝试 = max_retries + 1。"""
+
+    def test_default_max_retries_is_3_total_attempts_4(self) -> None:
+        """默认 max_retries=3，总尝试次数 4 次。"""
+        policy, _ = make_policy()
+        assert policy.max_retries == 3
+        assert policy.max_attempts == 4
+
+    def test_custom_max_retries(self) -> None:
+        policy, _ = make_policy(max_retries=5)
+        assert policy.max_retries == 5
+        assert policy.max_attempts == 6
+
+    def test_zero_retries_means_single_attempt(self) -> None:
+        policy, _ = make_policy(max_retries=0)
+        assert policy.max_retries == 0
+        assert policy.max_attempts == 1
+
+
+class TestMaxAttemptsBackwardCompatibility:
+    """向后兼容：max_attempts 属性可读写，与 max_retries 互相换算。"""
+
+    def test_max_attempts_setter_updates_max_retries(self) -> None:
+        policy, _ = make_policy()
+        policy.max_attempts = 6
+        assert policy.max_attempts == 6
+        assert policy.max_retries == 5
+
+    def test_max_attempts_setter_floor_at_1(self) -> None:
+        """max_attempts=1 时 max_retries 钳制为 0（不能为负）。"""
+        policy, _ = make_policy()
+        policy.max_attempts = 1
+        assert policy.max_attempts == 1
+        assert policy.max_retries == 0
+
+
 class TestDelaySequence:
+    def test_default_three_retries_match_spec_5_10_20(self) -> None:
+        """D13：默认 max_retries=3，退避序列约 5/10/20 秒（无抖动时精确值）。"""
+        policy, _ = make_policy(jitter_ratio=0.0)
+        delays = [policy.delay_seconds(attempt) for attempt in range(1, 4)]
+        assert delays == pytest.approx([5, 10, 20])
+
     def test_exponential_backoff_sequence_matches_spec(self) -> None:
-        """§29.1：min(5 * 2^(n-1), 300)，随机中点时无抖动偏差。"""
+        """min(5 * 2^(n-1), 300)，随机中点时无抖动偏差。"""
         policy, _ = make_policy()
         delays = [policy.delay_seconds(attempt) for attempt in range(1, 10)]
         assert delays == pytest.approx([5, 10, 20, 40, 80, 160, 300, 300, 300])
@@ -69,11 +115,12 @@ class TestSleepInjection:
             policy.sleep_before_retry(attempt)
         assert slept == pytest.approx([5, 10, 20])
 
-    def test_max_attempts_read_from_config(self) -> None:
-        policy, _ = make_policy(max_attempts=3)
+    def test_max_attempts_read_from_config_via_compat(self) -> None:
+        """向后兼容：设置 max_retries 后 max_attempts 属性可用。"""
+        policy, _ = make_policy(max_retries=2)
         assert policy.max_attempts == 3
         default_policy, _ = make_policy()
-        assert default_policy.max_attempts == 10
+        assert default_policy.max_attempts == 4  # 默认 max_retries=3
 
 
 class TestConfigErrorClassification:
@@ -84,6 +131,7 @@ class TestConfigErrorClassification:
             "TUSHARE_PERMISSION_DENIED",
             "SCHEMA_MISMATCH",
             "UNKNOWN_INSTRUMENT",
+            "ALIAS_CONFLICT",
         ):
             assert is_config_error(code) is True
 

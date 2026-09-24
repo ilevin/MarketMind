@@ -44,8 +44,13 @@ history:
   # 启动时发现任一数据集落后目标即自动触发一次补齐
   startup_catchup: true
 
-  # 单 dataset×单交易日最多尝试次数与退避（指数 + 抖动）
-  max_attempts: 10
+  # 单只股票×单数据集单任务的额外重试次数（总尝试次数 = max_retries + 1，默认 4 次）
+  # 退避序列约 5/10/20 秒（指数退避 + 0.8~1.2 抖动，上限 300 秒）
+  max_retries: 3
+  # [deprecated] 旧字段：单 dataset×单交易日最多尝试次数
+  # 兼容保留，将在后续版本移除；仅配置 max_attempts 时自动换算为 max_retries = max_attempts - 1
+  # 若两者同时配置，以 max_retries 为准
+  # max_attempts: 10
   backoff_initial_seconds: 5
   backoff_max_seconds: 300
   jitter_ratio: 0.2

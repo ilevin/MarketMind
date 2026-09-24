@@ -82,7 +82,7 @@ class HistoryAvailabilityConfig(BaseModel):
 
 
 class HistoryConfig(BaseModel):
-    """历史数据同步配置（a-share-historical-data，技术方案 §57）。"""
+    """历史数据同步配置（a-share-historical-data，技术方案 §57；per-stock-history-sync D13）。"""
 
     enabled: bool = True
     start_date: date = date(2010, 1, 1)
@@ -90,7 +90,12 @@ class HistoryConfig(BaseModel):
     schedule_time: str = "20:30"
     startup_catchup: bool = True
 
-    # 单 dataset×单交易日重试（技术方案 §29）
+    # 单只股票×单数据集单任务的额外重试次数（总尝试次数 = max_retries + 1，默认 4 次）
+    # 推荐使用此字段；max_attempts 为旧字段，兼容保留（deprecated）。
+    max_retries: int = Field(default=3, ge=0)
+    # 单 dataset×单交易日最多尝试次数（技术方案 §29）
+    # [deprecated] 建议使用 max_retries 代替；若仅显式配置 max_attempts，
+    # 将自动换算为 max_retries = max_attempts - 1 并记录 WARNING。
     max_attempts: int = Field(default=10, ge=1)
     backoff_initial_seconds: float = Field(default=5, gt=0)
     backoff_max_seconds: float = Field(default=300, gt=0)
@@ -154,6 +159,32 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         logger.warning("配置文件 %s 不存在，使用默认配置", config_path)
 
     config = AppConfig.model_validate(raw or {})
+
+    # D13：max_attempts 兼容换算
+    # 判定显式配置：使用 Pydantic model_fields_set 检测 history 节中哪些字段来自用户输入
+    history_raw = (raw or {}).get("history", {}) or {}
+    has_explicit_max_attempts = "max_attempts" in history_raw
+    has_explicit_max_retries = "max_retries" in history_raw
+
+    if has_explicit_max_attempts and not has_explicit_max_retries:
+        # 仅显式配置了 max_attempts 且未配置 max_retries → 换算并 WARNING
+        config.history.max_retries = max(0, config.history.max_attempts - 1)
+        logger.warning(
+            "配置项 history.max_attempts 已弃用（将在后续版本移除），当前已自动换算为 "
+            "history.max_retries=%d（总尝试次数 = %d，与原 max_attempts 一致）。"
+            "建议直接配置 history.max_retries。",
+            config.history.max_retries,
+            config.history.max_retries + 1,
+        )
+    elif has_explicit_max_attempts and has_explicit_max_retries:
+        # 两者都配置 → max_retries 为准，不警告但日志提示
+        logger.info(
+            "配置项 history.max_retries=%d 与 history.max_attempts=%d 同时存在，"
+            "以 max_retries 为准（总尝试次数 = %d）。max_attempts 将在后续版本移除。",
+            config.history.max_retries,
+            config.history.max_attempts,
+            config.history.max_retries + 1,
+        )
 
     if not config.has_tushare_token:
         # 明确的配置错误提示；不输出 Token 本身

@@ -349,6 +349,10 @@ def make_service(session_factory, frozen_now):
         config = AppConfig()
         config.history.start_date = start_date
         config.history.max_attempts = max_attempts
+        # per-stock-history-sync D13：RetryPolicy 改按 max_retries 口径（总尝试 =
+        # max_retries + 1），同步派生保持本文件"总尝试 N 次"的旧日级断言语义
+        # （本文件将在 tasks 7.1 重写为个股口径）
+        config.history.max_retries = max_attempts - 1
         fake_providers = providers if providers is not None else FakeHistoryProviders()
         fake_calendar = calendar if calendar is not None else FakeCalendarProvider()
         slept: list[float] = []

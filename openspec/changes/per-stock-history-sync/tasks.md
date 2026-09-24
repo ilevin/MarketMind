@@ -22,11 +22,11 @@
 
 ## 4. Repository 与校验层
 
-- [ ] 4.1 `app/repositories/history_fact.py` 新增 `delete_for_instrument_range(dataset, instrument_id, start_date, end_date)` 与单股区间替换提交方法（复用 `_insert_rows_via_staging` 批量写与 chunk）
-- [ ] 4.2 新增 `StockSyncStateRepository`（写锁内 get-or-create、`advance_watermark` 事务内单调不下降校验、按 run 批量补建缺失状态行、last_* 更新、universe 按 watermark 升序 NULLS FIRST + ts_code 升序查询）与 `SyncTaskRepository`（create、finish_success、finish_failed、interrupt_running_for_runs、find_by_id）
-- [ ] 4.3 `app/services/history/validation.py` 的校验入口 `validate_batch` 增加区间模式（新增 date_range 参数：日期 ∈ [start, end] 且不早于 list_date、不晚于 min(end, delist_date)、批内 (instrument_id, trade_date) 唯一；区间模式 0 行合法，单日模式沿用非零行/EMPTY_RESULT 行为），单日模式与既有测试保留；新增区间校验单测（区间外日期拒绝、早于 list_date 拒绝、批内重复拒绝、同股多日行合法、0 行合法）
-- [ ] 4.4 `history_sync_state` 的 record_count/data_min_date/data_max_date 维护改为按单股区间替换 new-old 增减（`HistorySyncStateRepository` 相应方法）
-- [ ] 4.5 `tests/integration/test_history_repositories.py` 扩展：区间替换幂等（同区间重跑无重复行、计数不翻倍）、水位回退拒绝、批量补建唯一性、sync_task 流水不覆盖、universe 处理顺序断言（水位 NULL 先于旧水位先于新水位、同水位按 ts_code 升序）
+- [x] 4.1 `app/repositories/history_fact.py` 新增 `delete_for_instrument_range(dataset, instrument_id, start_date, end_date)` 与单股区间替换提交方法（复用 `_insert_rows_via_staging` 批量写与 chunk）
+- [x] 4.2 新增 `StockSyncStateRepository`（写锁内 get-or-create、`advance_watermark` 事务内单调不下降校验、按 run 批量补建缺失状态行、last_* 更新、universe 按 watermark 升序 NULLS FIRST + ts_code 升序查询）与 `SyncTaskRepository`（create、finish_success、finish_failed、interrupt_running_for_runs、find_by_id）
+- [x] 4.3 `app/services/history/validation.py` 的校验入口 `validate_batch` 增加区间模式（新增 date_range 参数：日期 ∈ [start, end] 且不早于 list_date、不晚于 min(end, delist_date)、批内 (instrument_id, trade_date) 唯一；区间模式 0 行合法，单日模式沿用非零行/EMPTY_RESULT 行为），单日模式与既有测试保留；新增区间校验单测（区间外日期拒绝、早于 list_date 拒绝、批内重复拒绝、同股多日行合法、0 行合法）
+- [x] 4.4 `history_sync_state` 的 record_count/data_min_date/data_max_date 维护改为按单股区间替换 new-old 增减（`HistorySyncStateRepository` 相应方法）
+- [x] 4.5 `tests/integration/test_history_repositories.py` 扩展：区间替换幂等（同区间重跑无重复行、计数不翻倍）、水位回退拒绝、批量补建唯一性、sync_task 流水不覆盖、universe 处理顺序断言（水位 NULL 先于旧水位先于新水位、同水位按 ts_code 升序）
 
 ## 5. 配置与重试语义
 

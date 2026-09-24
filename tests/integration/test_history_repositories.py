@@ -21,6 +21,7 @@ from app.models.history_sync import (
     HistorySyncRun,
     RunDatasetStatus,
     RunStatus,
+    SyncTask,
     TriggerType,
 )
 from app.models.instrument import Instrument
@@ -42,6 +43,8 @@ from app.repositories.history_sync import (
     HistorySyncRunDatasetRepository,
     HistorySyncRunRepository,
     HistorySyncStateRepository,
+    StockSyncStateRepository,
+    SyncTaskRepository,
 )
 from app.services.history import validation as val
 
@@ -1009,3 +1012,347 @@ class TestValidateThenPersistEndToEnd:
                 "daily", batch(bad_records), trade_date=trade_date, known_instrument_ids=known
             )
         assert facts.count_for_date("daily", trade_date) == 0
+
+
+# ---- per-stock-history-sync：单股区间替换 / 个股水位 / 任务流水 ----
+
+
+class TestStockRangeReplace:
+    """HistoryFactRepository 单股区间替换（tasks 4.1，design D14）。"""
+
+    def test_replace_range_idempotent(self, session):
+        """同区间重跑无重复行、old/new 计数正确、其他股与其他区间不受影响。"""
+        repo = HistoryFactRepository(session)
+        instrument = "CN:STOCK:000001"
+        d1, d2, d3 = date(2026, 9, 10), date(2026, 9, 11), date(2026, 9, 12)
+        # 预置：000001 两天 + 000002 同日一天（他股）
+        repo.insert_records(
+            "daily",
+            [
+                daily_record("000001", d1),
+                daily_record("000001", d2),
+                daily_record("000002", d1),
+            ],
+            source="tushare", fetched_at=FETCHED_AT,
+        )
+
+        # 区间 [d1, d2] 替换为修订版（仅 000001）
+        replacement = [daily_record("000001", d1, close=11.0), daily_record("000001", d2, close=11.0)]
+        old, inserted = repo.replace_for_instrument_range(
+            "daily", instrument, d1, d2, replacement,
+            source="tushare", fetched_at=FETCHED_AT,
+        )
+        assert (old, inserted) == (2, 2)
+        assert repo.count_for_instrument_range("daily", instrument, d1, d2) == 2
+        assert repo.count_for_date("daily", d1) == 2, "他股 000002 同日行不受影响"
+
+        # 同区间重跑：幂等，行数不变、计数不翻倍
+        old2, inserted2 = repo.replace_for_instrument_range(
+            "daily", instrument, d1, d2, replacement,
+            source="tushare", fetched_at=FETCHED_AT,
+        )
+        assert (old2, inserted2) == (2, 2)
+        assert repo.count_for_instrument_range("daily", instrument, d1, d2) == 2
+
+        # 区间外（d3）不受影响；空替换清空区间
+        repo.insert_records(
+            "daily", [daily_record("000001", d3)], source="tushare", fetched_at=FETCHED_AT
+        )
+        old3, inserted3 = repo.replace_for_instrument_range(
+            "daily", instrument, d1, d2, [],
+            source="tushare", fetched_at=FETCHED_AT,
+        )
+        assert (old3, inserted3) == (2, 0)
+        assert repo.count_for_instrument_range("daily", instrument, d1, d2) == 0
+        assert repo.count_for_date("daily", d3) == 1, "区间外行保留"
+
+    def test_unknown_dataset_raises_range(self, session):
+        repo = HistoryFactRepository(session)
+        with pytest.raises(ValueError, match="未知的事实数据集"):
+            repo.count_for_instrument_range(
+                "stock_basic", "CN:STOCK:000001", date(2026, 9, 10), date(2026, 9, 12)
+            )
+
+
+class TestStockSyncStateRepository:
+    """个股水位仓储（tasks 4.2，design D1/D2/D7）。"""
+
+    def test_get_or_create_idempotent(self, session):
+        repo = StockSyncStateRepository(session)
+        first = repo.get_or_create("daily", "CN:STOCK:000001", ts_code="000001.SZ")
+        again = repo.get_or_create("daily", "CN:STOCK:000001", ts_code="000001.SZ")
+        assert first is again, "同一 (dataset, instrument_id) 只有一行（写锁内 get-or-create）"
+        assert first.watermark_date is None
+        assert repo.get("daily", "CN:STOCK:000999") is None
+
+    def test_advance_watermark_monotonic(self, session):
+        """水位推进单调不下降：回退抛错（调用方事务回滚，水位保持原值）。"""
+        repo = StockSyncStateRepository(session)
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 10),
+            ts_code="000001.SZ", last_task_id=1, success_at=FETCHED_AT,
+        )
+        # 前进合法
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 12),
+            ts_code="000001.SZ", last_task_id=2, success_at=FETCHED_AT,
+        )
+        state = repo.get("daily", "CN:STOCK:000001")
+        assert state.watermark_date == date(2026, 9, 12)
+        assert state.last_status == "success"
+        assert state.last_task_id == 2
+        assert state.last_error_code is None
+
+        # 回退拒绝
+        with pytest.raises(ValueError, match="回退"):
+            repo.advance_watermark(
+                "daily", "CN:STOCK:000001", date(2026, 9, 11),
+                ts_code="000001.SZ", last_task_id=3, success_at=FETCHED_AT,
+            )
+        assert repo.get("daily", "CN:STOCK:000001").watermark_date == date(2026, 9, 12)
+
+    def test_record_failure_keeps_watermark(self, session):
+        repo = StockSyncStateRepository(session)
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 10),
+            ts_code="000001.SZ", last_task_id=1, success_at=FETCHED_AT,
+        )
+        repo.record_failure(
+            "daily", "CN:STOCK:000001",
+            ts_code="000001.SZ", last_task_id=9,
+            error_code="TUSHARE_TIMEOUT", error="上游超时",
+            attempt_at=FETCHED_AT,
+        )
+        state = repo.get("daily", "CN:STOCK:000001")
+        assert state.watermark_date == date(2026, 9, 10), "失败绝不动水位"
+        assert state.last_status == "failed"
+        assert state.last_error_code == "TUSHARE_TIMEOUT"
+
+    def test_bulk_ensure_missing_keeps_existing(self, session):
+        """批量补建：缺失行补建、已存在行（含水位）原样保留、重复条目幂等。"""
+        repo = StockSyncStateRepository(session)
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 10),
+            ts_code="000001.SZ", last_task_id=1, success_at=FETCHED_AT,
+        )
+        entries = [
+            ("CN:STOCK:000001", "000001.SZ"),  # 已存在
+            ("CN:STOCK:000002", "000002.SZ"),
+            ("CN:STOCK:000002", "000002.SZ"),  # 重复条目
+            ("CN:STOCK:000003", "000003.SZ"),
+        ]
+        created = repo.bulk_ensure_missing("daily", entries)
+        assert created == 2
+        # 既有行水位未被覆盖
+        assert repo.get("daily", "CN:STOCK:000001").watermark_date == date(2026, 9, 10)
+        assert repo.get("daily", "CN:STOCK:000002").watermark_date is None
+        # 幂等：再次补建 0 行
+        assert repo.bulk_ensure_missing("daily", entries) == 0
+
+    def test_universe_ordering(self, session):
+        """处理顺序：水位 NULL 先于旧水位先于新水位，同水位按 ts_code 升序。"""
+        repo = StockSyncStateRepository(session)
+        now = FETCHED_AT
+        for symbol, watermark in (
+            ("000003.SZ", date(2020, 1, 6)),   # 旧水位
+            ("000001.SZ", date(2026, 9, 10)),  # 新水位
+            ("000002.SZ", date(2020, 1, 6)),   # 旧水位（ts_code 较小，排前）
+            ("000005.SZ", None),               # NULL 最旧
+            ("000004.SZ", None),               # NULL（ts_code 较小，排前）
+        ):
+            if watermark is None:
+                repo.get_or_create("daily", f"CN:STOCK:{symbol[:6]}", ts_code=symbol)
+            else:
+                repo.advance_watermark(
+                    "daily", f"CN:STOCK:{symbol[:6]}", watermark,
+                    ts_code=symbol, last_task_id=1, success_at=now,
+                )
+        order = [row.ts_code for row in repo.universe("daily")]
+        assert order == [
+            "000004.SZ", "000005.SZ",           # NULL 先（ts_code 升序）
+            "000002.SZ", "000003.SZ",           # 旧水位（ts_code 升序）
+            "000001.SZ",                        # 新水位最后
+        ]
+
+
+class TestSyncTaskRepository:
+    """个股任务流水仓储（tasks 4.2，design D2/D10）。"""
+
+    def test_create_and_finish_success(self, session):
+        repo = SyncTaskRepository(session)
+        task = repo.create(
+            run_id=RUN_ID, dataset="daily",
+            instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+            start_date=date(2026, 9, 10), end_date=date(2026, 9, 12),
+            started_at=FETCHED_AT,
+        )
+        assert task.id is not None and task.status == "running"
+        repo.finish_success(
+            task.id, retry_count=1, attempt_count=2,
+            records_fetched=3, records_written=3,
+            finished_at=FETCHED_AT, duration_ms=150,
+        )
+        done = repo.find_by_id(task.id)
+        assert done.status == "success"
+        assert (done.retry_count, done.attempt_count) == (1, 2)
+        assert (done.records_fetched, done.records_written) == (3, 3)
+        assert done.duration_ms == 150
+
+    def test_pipeline_not_overwritten(self, session):
+        """任务流水不覆盖：同一股票先 failed 后 success 是两条独立记录。"""
+        repo = SyncTaskRepository(session)
+        t1 = repo.create(
+            run_id=RUN_ID, dataset="daily",
+            instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+            start_date=date(2026, 9, 10), end_date=date(2026, 9, 12),
+            started_at=FETCHED_AT,
+        )
+        repo.finish_failed(
+            t1.id, retry_count=3, attempt_count=4, records_fetched=0,
+            error_code="TUSHARE_TIMEOUT", error_type="transient",
+            error_message="上游超时", finished_at=FETCHED_AT, duration_ms=9000,
+        )
+        t2 = repo.create(
+            run_id=RUN_ID, dataset="daily",
+            instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+            start_date=date(2026, 9, 10), end_date=date(2026, 9, 12),
+            started_at=FETCHED_AT,
+        )
+        assert t1.id != t2.id, "每次启动一条新流水，不覆盖历史"
+        failed = repo.find_by_id(t1.id)
+        assert failed.status == "failed" and failed.error_code == "TUSHARE_TIMEOUT"
+        assert failed.attempt_count == 4 and failed.retry_count == 3
+
+    def test_interrupt_running_for_runs(self, session):
+        repo = SyncTaskRepository(session)
+        for run_id in (RUN_ID, "run-test-0002"):
+            for symbol in ("000001", "000002"):
+                repo.create(
+                    run_id=run_id, dataset="daily",
+                    instrument_id=f"CN:STOCK:{symbol}", ts_code=f"{symbol}.SZ",
+                    start_date=date(2026, 9, 10), end_date=date(2026, 9, 12),
+                    started_at=FETCHED_AT,
+                )
+        finished_at = FETCHED_AT.replace(hour=9)
+        marked = repo.interrupt_running_for_runs([RUN_ID], finished_at=finished_at)
+        assert marked == 2, "只标记指定 run 的 running 任务"
+        statuses = dict(
+            session.execute(select(SyncTask.run_id, SyncTask.status)).all()
+        )
+        assert statuses[RUN_ID] == "interrupted"
+        assert statuses["run-test-0002"] == "running", "其他 run 不受影响"
+        # 空列表：0 行、不报错
+        assert repo.interrupt_running_for_runs([], finished_at=finished_at) == 0
+
+
+class TestApplyStockRangeDelta:
+    """数据集级统计随单股区间替换增减（tasks 4.4，historical-data-storage spec）。"""
+
+    def test_delta_accumulation(self, session):
+        state_repo = HistorySyncStateRepository(session)
+        state_repo.ensure("daily", dataset_kind=DatasetKind.DAILY_CONTIGUOUS, history_start_date=date(2010, 1, 4))
+        state_repo.apply_stock_range_delta(
+            "daily", rows_delta=3,
+            data_min_date=date(2026, 9, 10), data_max_date=date(2026, 9, 12),
+        )
+        state_repo.apply_stock_range_delta(
+            "daily", rows_delta=2,
+            data_min_date=date(2026, 9, 13), data_max_date=date(2026, 9, 14),
+        )
+        state = state_repo.get("daily")
+        assert state.record_count == 5
+        assert (state.data_min_date, state.data_max_date) == (
+            date(2026, 9, 10), date(2026, 9, 14),
+        )
+        # 负增量（上游删数据）收缩计数；min/max 保守不收缩
+        state_repo.apply_stock_range_delta(
+            "daily", rows_delta=-3,
+            data_min_date=None, data_max_date=None,
+        )
+        state = state_repo.get("daily")
+        assert state.record_count == 2
+        assert state.data_max_date == date(2026, 9, 14)
+
+
+class TestValidationDateRange:
+    """validate_batch 区间模式（tasks 4.3，design D6）。"""
+
+    KNOWN = {"CN:STOCK:000001"}
+    D = date(2026, 9, 16)
+
+    def test_multi_day_same_stock_is_legal(self):
+        """同股多日各一行合法（区间批次核心场景）。"""
+        records = [
+            daily_record("000001", self.D - __import__("datetime").timedelta(days=n))
+            for n in range(5)
+        ]
+        val.validate_batch(
+            "daily", batch(records),
+            date_range=(self.D - __import__("datetime").timedelta(days=4), self.D),
+            known_instrument_ids=self.KNOWN,
+        )
+
+    def test_empty_batch_is_legal_in_range_mode(self):
+        """区间模式 0 行合法（停牌/非覆盖/退市末段），不判 EMPTY_RESULT。"""
+        val.validate_batch(
+            "daily", batch([]),
+            date_range=(self.D, self.D), known_instrument_ids=self.KNOWN,
+        )
+
+    def test_out_of_range_date_rejected(self):
+        from datetime import timedelta
+
+        records = [daily_record("000001", self.D - timedelta(days=1))]
+        with pytest.raises(val.TradeDateMismatchError, match="区间"):
+            val.validate_batch(
+                "daily", batch(records),
+                date_range=(self.D, self.D + timedelta(days=2)),
+                known_instrument_ids=self.KNOWN,
+            )
+
+    def test_before_list_date_rejected(self):
+        with pytest.raises(val.TradeDateMismatchError, match="上市日"):
+            val.validate_batch(
+                "daily", batch([daily_record("000001", date(2014, 1, 2))]),
+                date_range=(date(2010, 1, 4), date(2026, 9, 16)),
+                lifecycle=(date(2015, 6, 12), None),
+                known_instrument_ids=self.KNOWN,
+            )
+
+    def test_after_delist_date_rejected(self):
+        with pytest.raises(val.TradeDateMismatchError, match="退市日"):
+            val.validate_batch(
+                "daily", batch([daily_record("000001", date(2020, 9, 1))]),
+                date_range=(date(2010, 1, 4), date(2026, 9, 16)),
+                lifecycle=(date(1991, 4, 3), date(2020, 8, 28)),
+                known_instrument_ids=self.KNOWN,
+            )
+
+    def test_in_range_duplicate_key_rejected(self):
+        """区间模式批内 (instrument_id, trade_date) 重复仍拒绝。"""
+        records = [daily_record("000001", self.D), daily_record("000001", self.D)]
+        with pytest.raises(val.DuplicateKeyError):
+            val.validate_batch(
+                "daily", batch(records),
+                date_range=(self.D, self.D), known_instrument_ids=self.KNOWN,
+            )
+
+    def test_single_day_mode_unchanged(self):
+        """单日模式行为不变：日期必须等于请求日、0 行仍判 EMPTY_RESULT。"""
+        from datetime import timedelta
+
+        with pytest.raises(val.TradeDateMismatchError):
+            val.validate_batch(
+                "daily", batch([daily_record("000001", self.D - timedelta(days=1))]),
+                trade_date=self.D, known_instrument_ids=self.KNOWN,
+            )
+        with pytest.raises(val.EmptyResultError):
+            val.validate_batch(
+                "daily", batch([]), trade_date=self.D, known_instrument_ids=self.KNOWN,
+            )
+
+    def test_master_dataset_rejects_range_mode(self):
+        with pytest.raises(ValueError, match="不支持区间模式"):
+            val.validate_batch(
+                "stock_basic", batch([]), date_range=(self.D, self.D)
+            )

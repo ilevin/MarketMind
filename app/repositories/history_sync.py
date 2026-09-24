@@ -1,22 +1,28 @@
-"""历史同步控制仓储（a-share-historical-data，技术方案 §17~§21、§25）。
+"""历史同步控制仓储（a-share-historical-data §17~§21、§25；per-stock-history-sync D2）。
 
-四张控制表的读写：
-- ``HistorySyncStateRepository``：state 读写与水位推进（§21 严格顺序由
-  Service 保证，本层只落状态）；
-- ``HistoryDayStatusRepository``：day ledger upsert 与 reconcile 扫描；
+控制表的读写：
+- ``HistorySyncStateRepository``：state 读写与数据集级运营字段（个股模式下
+  日级数据集的 record_count 按单股区间 new-old 增减维护）；
+- ``HistoryDayStatusRepository``：day ledger upsert 与 reconcile 扫描（旧日级
+  模型遗留，个股模式停写、历史行保留只读）；
 - ``HistorySyncRunRepository`` / ``HistorySyncRunDatasetRepository``：run 与
-  run×dataset 生命周期，含 stale RUNNING 恢复标记（§19 INTERRUPTED）。
+  run×dataset 生命周期，含 stale RUNNING 恢复标记（§19 INTERRUPTED）与
+  个股口径统计列（processed/success/failed/skipped）；
+- ``StockSyncStateRepository``（v0.4.0）：个股水位表——写锁内 get-or-create、
+  水位单调不下降推进、批量补建、落后优先 universe 查询；
+- ``SyncTaskRepository``（v0.4.0）：个股任务流水——create/终态/中断批量标记。
 
-全部方法在调用方事务内执行（单日原子提交 §22 的步骤 9~11 由 Service 在
-WriteCoordinator 内组合调用）。
+全部方法在调用方事务内执行（单股区间原子提交的事务边界由
+StockSyncExecutor 在 WriteCoordinator 内组合调用）。
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from enum import Enum
+from typing import Iterable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import nulls_first, select, update
 from sqlalchemy.orm import Session
 
 from app.models.history_sync import (
@@ -30,6 +36,12 @@ from app.models.history_sync import (
     HistorySyncState,
     RunDatasetStatus,
     RunStatus,
+    StockSyncState,
+    SyncTask,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_INTERRUPTED,
+    TASK_STATUS_RUNNING,
+    TASK_STATUS_SUCCESS,
     TriggerType,
 )
 
@@ -193,6 +205,41 @@ class HistorySyncStateRepository:
                 updated_at=now,
             )
         )
+
+    def apply_stock_range_delta(
+        self,
+        dataset: DatasetName | str,
+        *,
+        rows_delta: int,
+        data_min_date: date | None,
+        data_max_date: date | None,
+    ) -> None:
+        """单股区间替换后的数据集级统计增减（per-stock-history-sync，historical-data-storage spec）。
+
+        个股模式下日级数据集的 ``record_count`` 按每笔区间替换的
+        ``new_count - old_count`` 累计（可为负——上游删数据时收缩）；
+        ``data_min_date``/``data_max_date`` 保守扩张不收缩（与旧
+        ``complete_day`` 的 min/max 语义一致）。由 StockSyncExecutor 在
+        单股成功提交事务内调用。
+        """
+        state = self.get(dataset)
+        if state is None:
+            raise ValueError(f"history_sync_state 缺少数据集 {dataset}，须先 ensure")
+        state.record_count += rows_delta
+        if data_min_date is not None:
+            state.data_min_date = (
+                data_min_date
+                if state.data_min_date is None
+                else min(state.data_min_date, data_min_date)
+            )
+        if data_max_date is not None:
+            state.data_max_date = (
+                data_max_date
+                if state.data_max_date is None
+                else max(state.data_max_date, data_max_date)
+            )
+        state.updated_at = _utcnow()
+        self.session.flush()
 
     def update_master(
         self,
@@ -410,8 +457,17 @@ class HistorySyncRunDatasetRepository:
         rows: int = 0,
         requests: int = 0,
         retries: int = 0,
+        processed: int = 0,
+        succeeded: int = 0,
+        failed: int = 0,
+        skipped: int = 0,
     ) -> None:
-        """单日成功事务内的增量累计（§22 步骤 11）。"""
+        """单日成功事务内的增量累计（§22 步骤 11）。
+
+        v0.4.0 个股口径：``processed``/``succeeded``/``failed``/``skipped``
+        为 ``processed_count``/``task_success_count``/``task_failed_count``/
+        ``skipped_count`` 的增量（StockSyncExecutor 每股事务内累计）。
+        """
         values: dict = {}
         if dates:
             values["dates_completed"] = HistorySyncRunDataset.dates_completed + dates
@@ -421,6 +477,18 @@ class HistorySyncRunDatasetRepository:
             values["request_count"] = HistorySyncRunDataset.request_count + requests
         if retries:
             values["retry_count"] = HistorySyncRunDataset.retry_count + retries
+        if processed:
+            values["processed_count"] = HistorySyncRunDataset.processed_count + processed
+        if succeeded:
+            values["task_success_count"] = (
+                HistorySyncRunDataset.task_success_count + succeeded
+            )
+        if failed:
+            values["task_failed_count"] = (
+                HistorySyncRunDataset.task_failed_count + failed
+            )
+        if skipped:
+            values["skipped_count"] = HistorySyncRunDataset.skipped_count + skipped
         if not values:
             return
         self.session.execute(
@@ -476,3 +544,273 @@ class HistorySyncRunDatasetRepository:
                 )
             )
         )
+
+
+class StockSyncStateRepository:
+    """个股水位与状态（per-stock-history-sync，design D1/D2）。
+
+    逻辑唯一键 ``(dataset, instrument_id)`` 的唯一性由 WriteCoordinator 写锁
+    内的 get-or-create 保证（表无 UNIQUE 约束，项目 DuckDB 惯例）；
+    ``watermark_date`` 单调不下降由 ``advance_watermark`` 在提交事务内校验。
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(
+        self, dataset: DatasetName | str, instrument_id: str
+    ) -> StockSyncState | None:
+        return self.session.get(StockSyncState, (_key(dataset), instrument_id))
+
+    def get_or_create(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        *,
+        ts_code: str | None,
+    ) -> StockSyncState:
+        """写锁内 get-or-create（唯一性保证的落点，幂等）。"""
+        state = self.get(dataset, instrument_id)
+        if state is None:
+            now = _utcnow()
+            state = StockSyncState(
+                dataset=_key(dataset),
+                instrument_id=instrument_id,
+                ts_code=ts_code,
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(state)
+            self.session.flush()
+        return state
+
+    def bulk_ensure_missing(
+        self,
+        dataset: DatasetName | str,
+        entries: Iterable[tuple[str, str | None]],
+    ) -> int:
+        """按 run 批量补建缺失状态行（design D7/D3：首轮 2.4 万行一次写事务）。
+
+        ``entries`` 为 ``(instrument_id, ts_code)`` 对（Service 从主档快照构造）；
+        已存在的行不动（水位/last_* 保持），仅补建缺失行。返回新建行数。
+        """
+        key = _key(dataset)
+        existing = set(
+            self.session.scalars(
+                select(StockSyncState.instrument_id).where(
+                    StockSyncState.dataset == key
+                )
+            )
+        )
+        now = _utcnow()
+        created = 0
+        pending: list[StockSyncState] = []
+        for instrument_id, ts_code in entries:
+            if instrument_id in existing:
+                continue
+            existing.add(instrument_id)
+            pending.append(
+                StockSyncState(
+                    dataset=key,
+                    instrument_id=instrument_id,
+                    ts_code=ts_code,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            created += 1
+        if pending:
+            self.session.add_all(pending)
+            self.session.flush()
+        return created
+
+    def universe(self, dataset: DatasetName | str) -> list[StockSyncState]:
+        """落后优先处理顺序（自动补偿 spec）：``watermark_date 升序
+        （NULL 视为最旧）→ ts_code 升序``。"""
+        stmt = (
+            select(StockSyncState)
+            .where(StockSyncState.dataset == _key(dataset))
+            .order_by(
+                nulls_first(StockSyncState.watermark_date.asc()),
+                StockSyncState.ts_code.asc(),
+            )
+        )
+        return list(self.session.scalars(stmt))
+
+    def advance_watermark(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        new_watermark: date,
+        *,
+        ts_code: str | None,
+        last_task_id: int | None,
+        success_at: datetime,
+    ) -> None:
+        """成功提交事务内的水位推进（单调不下降校验 + last_* 全套刷新）。
+
+        新水位早于既有水位即抛错——调用方事务整体回滚，水位保持原值
+        （个股独立连续水位线 spec："水位绝不回退" Scenario）。
+        """
+        state = self.get_or_create(dataset, instrument_id, ts_code=ts_code)
+        if (
+            state.watermark_date is not None
+            and new_watermark < state.watermark_date
+        ):
+            raise ValueError(
+                f"stock_sync_state 水位回退被拒绝: dataset={_key(dataset)} "
+                f"instrument_id={instrument_id} "
+                f"{state.watermark_date} -> {new_watermark}"
+            )
+        state.watermark_date = new_watermark
+        state.ts_code = ts_code  # 冗余展示列刷新为当前主档规范代码（OQ3 定稿）
+        state.last_task_id = last_task_id
+        state.last_status = TASK_STATUS_SUCCESS
+        state.last_success_at = success_at
+        state.last_attempt_at = success_at
+        state.last_error_code = None  # 成功后清除失败快照（同 finish_success 语义）
+        state.last_error = None
+        state.updated_at = _utcnow()
+        self.session.flush()
+
+    def record_failure(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        *,
+        ts_code: str | None,
+        last_task_id: int | None,
+        error_code: str | None,
+        error: str | None,
+        attempt_at: datetime,
+    ) -> None:
+        """失败记录（水位绝不动）：last_status=failed 与错误快照。"""
+        state = self.get_or_create(dataset, instrument_id, ts_code=ts_code)
+        state.ts_code = ts_code
+        state.last_task_id = last_task_id
+        state.last_status = TASK_STATUS_FAILED
+        state.last_error_code = error_code
+        state.last_error = error
+        state.last_attempt_at = attempt_at
+        state.updated_at = _utcnow()
+        self.session.flush()
+
+
+class SyncTaskRepository:
+    """个股任务流水（per-stock-history-sync，design D2/D10）。
+
+    每次某数据集某股票实际启动一次同步即新增一行，不覆盖历史
+    （"任务流水不覆盖" Scenario）；``id`` 由 ``seq_sync_task_id`` 生成。
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def create(
+        self,
+        *,
+        run_id: str,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        ts_code: str,
+        start_date: date,
+        end_date: date,
+        started_at: datetime,
+    ) -> SyncTask:
+        task = SyncTask(
+            run_id=run_id,
+            dataset=_key(dataset),
+            instrument_id=instrument_id,
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+            status=TASK_STATUS_RUNNING,
+            started_at=started_at,
+            created_at=started_at,
+        )
+        self.session.add(task)
+        self.session.flush()
+        return task
+
+    def find_by_id(self, task_id: int) -> SyncTask | None:
+        return self.session.get(SyncTask, task_id)
+
+    def finish_success(
+        self,
+        task_id: int,
+        *,
+        retry_count: int,
+        attempt_count: int,
+        records_fetched: int,
+        records_written: int,
+        finished_at: datetime,
+        duration_ms: int | None,
+    ) -> None:
+        task = self.find_by_id(task_id)
+        if task is None:
+            raise ValueError(f"sync_task 不存在: {task_id}")
+        task.status = TASK_STATUS_SUCCESS
+        task.retry_count = retry_count
+        task.attempt_count = attempt_count
+        task.records_fetched = records_fetched
+        task.records_written = records_written
+        task.finished_at = finished_at
+        task.duration_ms = duration_ms
+        self.session.flush()
+
+    def finish_failed(
+        self,
+        task_id: int,
+        *,
+        retry_count: int,
+        attempt_count: int,
+        records_fetched: int,
+        error_code: str | None,
+        error_type: str | None,
+        error_message: str | None,
+        finished_at: datetime,
+        duration_ms: int | None,
+    ) -> None:
+        task = self.find_by_id(task_id)
+        if task is None:
+            raise ValueError(f"sync_task 不存在: {task_id}")
+        task.status = TASK_STATUS_FAILED
+        task.retry_count = retry_count
+        task.attempt_count = attempt_count
+        task.records_fetched = records_fetched
+        task.error_code = error_code
+        task.error_type = error_type
+        task.error_message = error_message
+        task.finished_at = finished_at
+        task.duration_ms = duration_ms
+        self.session.flush()
+
+    def interrupt_running_for_runs(
+        self, run_ids: list[str], *, finished_at: datetime
+    ) -> int:
+        """启动恢复（进程中断与恢复 spec）：把已中断 Run 的 running 任务批量
+        置 interrupted（补 finished_at）。对应水位本就未提交、绝不动。
+        返回标记行数。
+        """
+        if not run_ids:
+            return 0
+        # DuckDB 驱动 update 的 rowcount 返回 -1，先查后改拿到准确行数
+        task_ids = list(
+            self.session.scalars(
+                select(SyncTask.id).where(
+                    SyncTask.run_id.in_(run_ids),
+                    SyncTask.status == TASK_STATUS_RUNNING,
+                )
+            )
+        )
+        if not task_ids:
+            return 0
+        self.session.execute(
+            update(SyncTask)
+            .where(SyncTask.id.in_(task_ids))
+            .values(
+                status=TASK_STATUS_INTERRUPTED,
+                finished_at=finished_at,
+            )
+        )
+        return len(task_ids)

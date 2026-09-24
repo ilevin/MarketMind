@@ -104,11 +104,20 @@ def _check_common(
     expected_trade_date=None,
     require_trade_date: bool = False,
     duplicate_key_fields: Callable | None = None,
+    date_range: tuple | None = None,
+    lifecycle: tuple | None = None,
 ) -> None:
-    """通用 Domain 校验（§35）：截断、非零行、键非空、日期一致、唯一、可映射。"""
+    """通用 Domain 校验（§35）：截断、非零行、键非空、日期一致、唯一、可映射。
+
+    区间模式（per-stock-history-sync design D6）：``date_range=(start, end)``
+    时"日期与请求一致"放宽为"日期 ∈ [start, end] 且不早于 list_date、
+    不晚于 min(end, delist_date)"（``lifecycle=(list_date, delist_date)``，
+    缺项 None 不约束）；区间模式下 0 行合法（个股空结果语义——停牌区间、
+    非覆盖证券、退市末段均为合法空，不判 EMPTY_RESULT）。
+    """
     if batch.truncation_risk:
         raise TruncationRiskError(f"{context}: 返回命中接口行数上限，不能提交")
-    if not allow_empty and not batch.records:
+    if not allow_empty and date_range is None and not batch.records:
         raise EmptyResultError(f"{context}: 返回 0 行")
     seen: set = set()
     for record in batch.records:
@@ -117,7 +126,26 @@ def _check_common(
         if require_trade_date:
             if record.trade_date is None:
                 raise InvalidValueError(f"{context}: trade_date 为空")
-            if expected_trade_date is not None and record.trade_date != expected_trade_date:
+            if date_range is not None:
+                range_start, range_end = date_range
+                if not (range_start <= record.trade_date <= range_end):
+                    raise TradeDateMismatchError(
+                        f"{context}: 记录日期 {record.trade_date} 落在请求区间 "
+                        f"[{range_start}, {range_end}] 之外"
+                    )
+                if lifecycle is not None:
+                    list_date, delist_date = lifecycle
+                    if list_date is not None and record.trade_date < list_date:
+                        raise TradeDateMismatchError(
+                            f"{context}: 记录日期 {record.trade_date} 早于上市日 "
+                            f"{list_date}"
+                        )
+                    if delist_date is not None and record.trade_date > delist_date:
+                        raise TradeDateMismatchError(
+                            f"{context}: 记录日期 {record.trade_date} 晚于退市日 "
+                            f"{delist_date}"
+                        )
+            elif expected_trade_date is not None and record.trade_date != expected_trade_date:
                 raise TradeDateMismatchError(
                     f"{context}: 记录日期 {record.trade_date} 与请求日期 "
                     f"{expected_trade_date} 不一致"
@@ -146,14 +174,23 @@ def _non_negative(value, field: str, context: str) -> None:
 # ---- 日级专项（§36~§39） ----
 
 
+def _day_context(dataset: str, trade_date, date_range: tuple | None) -> str:
+    """日级校验上下文标签：区间模式展示区间、单日模式展示请求日。"""
+    if date_range is not None:
+        return f"{dataset}[{date_range[0]}~{date_range[1]}]"
+    return f"{dataset}[{trade_date}]"
+
+
 def _validate_daily(
     batch: ProviderBatch[DailyBar],
     *,
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,
+    lifecycle=None,
 ) -> None:
-    context = f"daily[{trade_date}]"
+    context = _day_context("daily", trade_date, date_range)
     _check_common(
         batch,
         context=context,
@@ -161,6 +198,8 @@ def _validate_daily(
         known_instrument_ids=known_instrument_ids,
         expected_trade_date=trade_date,
         require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
     )
     for record in batch.records:  # §36 专项
         _non_negative(record.open, "open", context)
@@ -194,8 +233,10 @@ def _validate_adj_factor(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,
+    lifecycle=None,
 ) -> None:
-    context = f"adj_factor[{trade_date}]"
+    context = _day_context("adj_factor", trade_date, date_range)
     _check_common(
         batch,
         context=context,
@@ -203,6 +244,8 @@ def _validate_adj_factor(
         known_instrument_ids=known_instrument_ids,
         expected_trade_date=trade_date,
         require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
     )
     for record in batch.records:  # §37：必须 > 0
         if record.adj_factor <= 0:
@@ -217,8 +260,10 @@ def _validate_daily_basic(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,
+    lifecycle=None,
 ) -> None:
-    context = f"daily_basic[{trade_date}]"
+    context = _day_context("daily_basic", trade_date, date_range)
     _check_common(
         batch,
         context=context,
@@ -226,6 +271,8 @@ def _validate_daily_basic(
         known_instrument_ids=known_instrument_ids,
         expected_trade_date=trade_date,
         require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
     )
     for record in batch.records:  # §38：股本/市值非负；估值允许 NULL
         for field in (
@@ -250,8 +297,10 @@ def _validate_moneyflow(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,
+    lifecycle=None,
 ) -> None:
-    context = f"moneyflow[{trade_date}]"
+    context = _day_context("moneyflow", trade_date, date_range)
     _check_common(
         batch,
         context=context,
@@ -259,6 +308,8 @@ def _validate_moneyflow(
         known_instrument_ids=known_instrument_ids,
         expected_trade_date=trade_date,
         require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
     )
     # §39：buy_*/sell_* 非 NULL 时非负；net_mf_* 允许负；不自行计算替代官方值
     non_negative_fields = (
@@ -281,6 +332,8 @@ def _validate_stock_basic(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,  # 主档数据集不支持区间模式（validate_batch 已拦截）
+    lifecycle=None,
 ) -> None:
     context = "stock_basic"
     _check_common(
@@ -306,6 +359,8 @@ def _validate_stock_company(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,  # 主档数据集不支持区间模式（validate_batch 已拦截）
+    lifecycle=None,
 ) -> None:
     context = "stock_company"
     _check_common(
@@ -323,6 +378,8 @@ def _validate_namechange(
     trade_date,
     known_instrument_ids,
     allow_empty,
+    date_range=None,  # 主档数据集不支持区间模式（validate_batch 已拦截）
+    lifecycle=None,
 ) -> None:
     context = "namechange"
     _check_common(
@@ -344,6 +401,9 @@ _HANDLERS: dict[str, Callable] = {
     "namechange": _validate_namechange,
 }
 
+# 支持区间模式（date_range）的数据集（design D6：仅四个日级事实数据集）
+_DAY_LEVEL_DATASETS = frozenset({"daily", "adj_factor", "daily_basic", "moneyflow"})
+
 
 def validate_batch(
     dataset: DatasetName | str,
@@ -352,8 +412,20 @@ def validate_batch(
     trade_date=None,
     known_instrument_ids: set[str] | None = None,
     allow_empty: bool = False,
+    date_range: tuple | None = None,
+    lifecycle: tuple | None = None,
 ) -> None:
-    """Domain 校验入口：失败抛 HistoryValidationError 子类，通过返回 None。"""
+    """Domain 校验入口：失败抛 HistoryValidationError 子类，通过返回 None。
+
+    区间模式（design D6，个股区间拉取）：``date_range=(start_date, end_date)``
+    检查全部记录日期落在区间内且不早于 list_date、不晚于
+    ``min(end_date, delist_date)``（``lifecycle=(list_date, delist_date)``，
+    缺项 None 不约束）；区间模式 0 行合法（不判 EMPTY_RESULT——个股空结果
+    语义由"个股空结果语义" requirement 定义）。仅四个日级数据集支持区间
+    模式；单日模式（trade_date=）行为不变。
+    """
+    if date_range is not None and _key(dataset) not in _DAY_LEVEL_DATASETS:
+        raise ValueError(f"数据集不支持区间模式校验: {dataset}")
     handler = _HANDLERS.get(_key(dataset))
     if handler is None:
         raise ValueError(f"无校验规则的数据集: {dataset}")
@@ -362,4 +434,6 @@ def validate_batch(
         trade_date=trade_date,
         known_instrument_ids=known_instrument_ids,
         allow_empty=allow_empty,
+        date_range=date_range,
+        lifecycle=lifecycle,
     )

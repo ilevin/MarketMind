@@ -55,6 +55,74 @@ class HistoryFactRepository:
         )
         return int(self.session.scalar(stmt) or 0)
 
+    def count_for_instrument_range(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        """单股区间的现有行数（per-stock-history-sync design D14 的 old_count）。"""
+        table = _table(dataset)
+        stmt: Select = (
+            select(func.count())
+            .select_from(table)
+            .where(
+                table.c.instrument_id == instrument_id,
+                table.c.trade_date >= start_date,
+                table.c.trade_date <= end_date,
+            )
+        )
+        return int(self.session.scalar(stmt) or 0)
+
+    def delete_for_instrument_range(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        """单股区间 DELETE（个股区间替换语义，design D14）。
+
+        吸收上游对历史日期的修订；与水位推进位于同一事务（调用方保证），
+        异常整体回滚时旧数据原样保留。
+        """
+        table = _table(dataset)
+        stmt: Delete = table.delete().where(
+            table.c.instrument_id == instrument_id,
+            table.c.trade_date >= start_date,
+            table.c.trade_date <= end_date,
+        )
+        self.session.execute(stmt)
+
+    def replace_for_instrument_range(
+        self,
+        dataset: DatasetName | str,
+        instrument_id: str,
+        start_date: date,
+        end_date: date,
+        records: Iterable,
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> tuple[int, int]:
+        """单股区间替换提交（design D14）：区间 DELETE + 批量 INSERT。
+
+        返回 ``(old_count, inserted_count)``——调用方（StockSyncExecutor）据此
+        维护 ``history_sync_state.record_count`` 的 new-old 增减。整个方法在
+        调用方的 WriteCoordinator 写锁事务内执行，任何一步失败整体回滚。
+        """
+        old_count = self.count_for_instrument_range(
+            dataset, instrument_id, start_date, end_date
+        )
+        self.delete_for_instrument_range(
+            dataset, instrument_id, start_date, end_date
+        )
+        inserted = self.insert_records(
+            dataset, records, source=source, fetched_at=fetched_at
+        )
+        return old_count, inserted
+
     def max_trade_date(self, dataset: DatasetName | str) -> date | None:
         """事实表当前最大交易日（仅 reconcile 发现矛盾用，§25）。"""
         table = _table(dataset)

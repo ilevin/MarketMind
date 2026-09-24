@@ -22,7 +22,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Iterable
 
-from sqlalchemy import nulls_first, select, update
+from sqlalchemy import nulls_first, select, text, update
 from sqlalchemy.orm import Session
 
 from app.models.history_sync import (
@@ -636,6 +636,48 @@ class StockSyncStateRepository:
             )
         )
         return list(self.session.scalars(stmt))
+
+    def today_status_counts(
+        self,
+        dataset: DatasetName | str,
+        *,
+        today: date | None = None,
+    ) -> dict[str, int]:
+        """按 ``last_status`` 聚合"今天（Asia/Shanghai）完成过尝试"的股票数
+        （design D11，供 summary 与 /stocks 复用）。
+
+        今日归属 = "该股该数据集今天最后一次完成任务的状态"：仅看
+        ``last_attempt_at`` 的上海日期是否为今天，同日先失败后成功只计
+        成功（``last_status`` 是最终状态）。
+
+        实现说明：``last_attempt_at`` 由 ``now_beijing()`` 写入、存储口径
+        即上海本地 naive 时间，故直接 ``CAST(last_attempt_at AS DATE)``
+        取上海日期——**不**做 ``AT TIME ZONE 'Asia/Shanghai'``（naive 经
+        AT TIME ZONE 转成 TIMESTAMPTZ 后 CAST 会按 session 时区渲染，
+        session TimeZone=UTC 时提前 8 小时跨界，多时区部署下反而错误）；
+        ``now()`` 侧返回 TIMESTAMPTZ，须显式 ``AT TIME ZONE
+        'Asia/Shanghai'`` 渲染为上海本地后再取日期，与服务器时区无关。
+        ``today`` 可注入固定日期供测试；仅扫 stock_sync_state 小表。
+        """
+        if today is not None:
+            sql = text(
+                "SELECT last_status, COUNT(*) AS cnt FROM stock_sync_state "
+                "WHERE dataset = :dataset "
+                "AND CAST(last_attempt_at AS DATE) = :today "
+                "GROUP BY last_status"
+            )
+            params: dict = {"dataset": _key(dataset), "today": today}
+        else:
+            sql = text(
+                "SELECT last_status, COUNT(*) AS cnt FROM stock_sync_state "
+                "WHERE dataset = :dataset "
+                "AND CAST(last_attempt_at AS DATE) "
+                "    = CAST(now() AT TIME ZONE 'Asia/Shanghai' AS DATE) "
+                "GROUP BY last_status"
+            )
+            params = {"dataset": _key(dataset)}
+        rows = self.session.execute(sql, params).all()
+        return {status: int(cnt) for status, cnt in rows if status is not None}
 
     def advance_watermark(
         self,

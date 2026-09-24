@@ -39,8 +39,8 @@
 - [x] 6.2 `app/services/history/planner.py` 改造：个股有效区间计算（eff_start = max(history.start_date, list_date)；eff_end 上界 = min(target, delist_date)；区间端点收敛到严格交易日历）；移除仅服务旧日级模型的静态函数（pending_dates/lag_days/reconcile_watermark），`tests/unit/test_history_planner.py` 相应改写
 - [x] 6.3 `app/services/history/sync_service.py` 重构 `run()`：入口签名、主档前置、single-flight、AvailabilityPolicy 不变；日级数据集改为"解析 target → 批量补建缺失 stock_sync_state 行 → universe 按 (watermark ASC NULLS FIRST, ts_code ASC) → 逐股（无工作 skipped_count+1 不建 task；有工作交 Executor；单股异常记录后 continue；系统级异常终止 Run）"；移除 `_sync_day_level_dataset`/`_sync_single_day`/`_fetch_day`/`_daily_basic_fallback`/`reconcile_daily_watermarks`/`reconcile_dataset` 与 `history_day_status` 写入
 - [x] 6.4 `recover_stale_runs` 扩展：把属于已中断 Run 的 running `sync_task` 批量置 interrupted（补 finished_at），绝不推进对应水位
-- [ ] 6.5 Run 语义与进度：SUCCESS 允许个股 failed、PARTIAL 不再产生；run_dataset 新统计列写入、旧水位列冻结置 NULL/0；进程内 progress 快照（当前 dataset/ts_code、已处理/成功/失败/跳过）经 `app.state` 暴露，聚合计数以 DB 为准
-- [ ] 6.6 今日成功/失败统计查询（`stock_sync_state.last_attempt_at AT TIME ZONE 'Asia/Shanghai'` = 当天 AND last_status 聚合，仅扫小表），供 summary 与 /stocks 复用
+- [x] 6.5 Run 语义与进度：SUCCESS 允许个股 failed、PARTIAL 不再产生；run_dataset 新统计列写入、旧水位列冻结置 NULL/0；进程内 progress 快照（当前 dataset/ts_code、已处理/成功/失败/跳过）经 `app.state` 暴露，聚合计数以 DB 为准
+- [x] 6.6 今日成功/失败统计查询（`stock_sync_state.last_attempt_at AT TIME ZONE 'Asia/Shanghai'` = 当天 AND last_status 聚合，仅扫小表），供 summary 与 /stocks 复用
 
 ## 7. 同步行为集成测试（重写既有守护）
 

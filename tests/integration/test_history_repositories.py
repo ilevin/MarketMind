@@ -47,6 +47,7 @@ from app.repositories.history_sync import (
     SyncTaskRepository,
 )
 from app.services.history import validation as val
+from app.services.market_session_service import now_beijing
 
 FETCHED_AT = datetime(2026, 9, 17, 8, 0, tzinfo=timezone.utc)
 RUN_ID = "run-test-0001"
@@ -1173,6 +1174,79 @@ class TestStockSyncStateRepository:
             "000002.SZ", "000003.SZ",           # 旧水位（ts_code 升序）
             "000001.SZ",                        # 新水位最后
         ]
+
+
+class TestTodayStatusCounts:
+    """今日成功/失败统计（tasks 6.6，design D11）。
+
+    "今日"按上海日期归属（last_attempt_at 存储口径即上海本地 naive），
+    聚合口径 = "该股今天最后一次尝试的最终状态"，同日先失败后成功只计
+    成功。多时区部署（session TimeZone=UTC）专项见 tasks 7.6。
+    """
+
+    def test_counts_by_last_status(self, session):
+        """今日 success/failed 各自计数；昨日与无 attempt 的行不计入。"""
+        repo = StockSyncStateRepository(session)
+        today, yesterday = date(2026, 9, 24), date(2026, 9, 23)
+        today_noon = datetime(2026, 9, 24, 12, 0)
+        yesterday_noon = datetime(2026, 9, 23, 12, 0)
+
+        # 今日成功 ×2
+        for symbol in ("000001.SZ", "000002.SZ"):
+            repo.advance_watermark(
+                "daily", f"CN:STOCK:{symbol[:6]}", date(2026, 9, 22),
+                ts_code=symbol, last_task_id=1, success_at=today_noon,
+            )
+        # 今日失败 ×1（record_failure 只写状态不动水位）
+        repo.record_failure(
+            "daily", "CN:STOCK:000003",
+            ts_code="000003.SZ", last_task_id=2,
+            error_code="TUSHARE_TIMEOUT", error="上游超时",
+            attempt_at=today_noon,
+        )
+        # 昨日成功 ×1（不计入今日）
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000004", date(2026, 9, 22),
+            ts_code="000004.SZ", last_task_id=3, success_at=yesterday_noon,
+        )
+        # 从未尝试 ×1（不计入）
+        repo.get_or_create("daily", "CN:STOCK:000005", ts_code="000005.SZ")
+        # 其他数据集的同日成功不计入本数据集
+        repo.advance_watermark(
+            "adj_factor", "CN:STOCK:000001", date(2026, 9, 22),
+            ts_code="000001.SZ", last_task_id=4, success_at=today_noon,
+        )
+
+        counts = repo.today_status_counts("daily", today=today)
+        assert counts == {"success": 2, "failed": 1}
+
+    def test_same_day_fail_then_success_counts_as_success(self, session):
+        """同日先失败后成功：last_status 为最终状态，只计成功（§24 口径）。"""
+        repo = StockSyncStateRepository(session)
+        today = date(2026, 9, 24)
+        repo.record_failure(
+            "daily", "CN:STOCK:000001",
+            ts_code="000001.SZ", last_task_id=1,
+            error_code="TUSHARE_TIMEOUT", error="上游超时",
+            attempt_at=datetime(2026, 9, 24, 9, 0),
+        )
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 22),
+            ts_code="000001.SZ", last_task_id=2,
+            success_at=datetime(2026, 9, 24, 9, 10),
+        )
+        assert repo.today_status_counts("daily", today=today) == {"success": 1}
+
+    def test_now_path_counts_beijing_today(self, session):
+        """不注入 today：now() 侧 AT TIME ZONE 'Asia/Shanghai' 取上海今天。"""
+        repo = StockSyncStateRepository(session)
+        # now_beijing() 即上海当前本地时间，必然计入"上海今天"
+        repo.advance_watermark(
+            "daily", "CN:STOCK:000001", date(2026, 9, 22),
+            ts_code="000001.SZ", last_task_id=1, success_at=now_beijing(),
+        )
+        counts = repo.today_status_counts("daily")
+        assert counts.get("success") == 1
 
 
 class TestSyncTaskRepository:

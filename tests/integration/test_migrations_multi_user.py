@@ -26,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_REVISION = "0001_duckdb_baseline"
 HEAD_REVISION = "0002_multi_user_auth"
-CURRENT_HEAD = "0003_a_share_historical_data"
+CURRENT_HEAD = "0004_per_stock_history_sync"
 LEGACY_USERNAME = "admin"
 PLACEHOLDER_HASH = "!unloginable-placeholder"
 

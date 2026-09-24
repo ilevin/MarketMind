@@ -27,7 +27,7 @@ from alembic.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# head（0003）应创建的全部 23 张业务表（不含 alembic_version 系统表）
+# head（0004）应创建的全部 25 张业务表（不含 alembic_version 系统表）
 EXPECTED_TABLES = {
     "instrument",
     "watchlist",
@@ -53,8 +53,11 @@ EXPECTED_TABLES = {
     "history_day_status",
     "history_sync_run",
     "history_sync_run_dataset",
+    # --- per-stock-history-sync（0004） ---
+    "stock_sync_state",
+    "sync_task",
 }
-HEAD_REVISION = "0003_a_share_historical_data"
+HEAD_REVISION = "0004_per_stock_history_sync"
 
 
 def _alembic_config(db_path: Path) -> Config:
@@ -103,7 +106,7 @@ def test_empty_db_upgrade_head_creates_all_tables(tmp_path):
             "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
         )).fetchall()
         seq_names = {s[0] for s in seqs}
-        assert {"seq_tag_id", "seq_user_id"} <= seq_names
+        assert {"seq_tag_id", "seq_user_id", "seq_sync_task_id"} <= seq_names
     finally:
         engine.dispose()
 
@@ -148,7 +151,7 @@ def test_downgrade_base_removes_all_tables_and_sequence(tmp_path):
         seqs = engine.connect().execute(sa.text(
             "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
         )).fetchall()
-        assert {"seq_tag_id", "seq_user_id"} & {s[0] for s in seqs} == set()
+        assert {"seq_tag_id", "seq_user_id", "seq_sync_task_id"} & {s[0] for s in seqs} == set()
     finally:
         engine.dispose()
 
@@ -284,8 +287,10 @@ def test_alembic_head_matches_models_schema(tmp_path):
         ("alembic_version", "version_num", "NO", None, "VARCHAR"),
         ("app_user", "user_id", "NO", "nextval('seq_user_id')", "BIGINT"),
         ("tag", "tag_id", "NO", "nextval('seq_tag_id')", "BIGINT"),
+        ("sync_task", "id", "NO", "nextval('seq_sync_task_id')", "BIGINT"),
     }
     assert models_only == {
         ("app_user", "user_id", "NO", None, "BIGINT"),
         ("tag", "tag_id", "NO", None, "BIGINT"),
+        ("sync_task", "id", "NO", None, "BIGINT"),
     }

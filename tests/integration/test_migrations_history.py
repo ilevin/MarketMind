@@ -341,3 +341,371 @@ def test_sync_state_defaults_applied(tmp_path):
         assert rd == (0, 0, 0, 0)
     finally:
         engine.dispose()
+
+
+# ============================================================
+# 0004_per_stock_history_sync 迁移测试（db-migration spec）
+# ============================================================
+
+V031_BASE_REVISION = "0003_a_share_historical_data"
+V040_HEAD_REVISION = "0004_per_stock_history_sync"
+
+V040_NEW_TABLES = ("stock_sync_state", "sync_task")
+
+RUN_DATASET_NEW_COLUMNS = (
+    "processed_count",
+    "task_success_count",
+    "task_failed_count",
+    "skipped_count",
+)
+
+
+def _seed_v031_data(db_path: Path) -> dict[str, int]:
+    """在 0003 schema 上灌入 v0.3.1 历史数据（事实表 + 同步状态）。
+
+    返回各表行数基准，供升级后比对。
+    """
+    command.upgrade(_alembic_config(db_path), V031_BASE_REVISION)
+    engine = sa.create_engine(f"duckdb:////{db_path}")
+    try:
+        with engine.begin() as conn:
+            # 主档：两只股票
+            conn.execute(sa.text(
+                "INSERT INTO instrument (instrument_id, symbol, name, market, asset_type, "
+                "currency, is_active, created_at, updated_at) VALUES "
+                "('CN:STOCK:600519', '600519', '贵州茅台', 'CN', 'STOCK', 'CNY', true, now(), now()), "
+                "('CN:STOCK:000001', '000001', '平安银行', 'CN', 'STOCK', 'CNY', true, now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO cn_stock_basic (instrument_id, ts_code, symbol, name, "
+                "list_date, source_last_seen_at, source, fetched_at) VALUES "
+                "('CN:STOCK:600519', '600519.SH', '600519', '贵州茅台', '2001-08-27', now(), 'tushare', now()), "
+                "('CN:STOCK:000001', '000001.SZ', '000001', '平安银行', '1991-04-03', now(), 'tushare', now())"
+            ))
+            # 事实表：daily 两行（两只股票各一天）
+            conn.execute(sa.text(
+                "INSERT INTO market_daily_bar (instrument_id, ts_code, trade_date, "
+                "open, high, low, close, vol, amount, source, fetched_at) VALUES "
+                "('CN:STOCK:600519', '600519.SH', '2026-09-10', 1700.0, 1720.0, 1690.0, 1710.0, 1000.0, 1700000.0, 'tushare', now()), "
+                "('CN:STOCK:000001', '000001.SZ', '2026-09-10', 10.0, 10.5, 9.9, 10.2, 5000.0, 51000.0, 'tushare', now())"
+            ))
+            # 同步状态
+            conn.execute(sa.text(
+                "INSERT INTO history_sync_state (dataset, dataset_kind, status, "
+                "history_start_date, latest_complete_trade_date, record_count, "
+                "data_min_date, data_max_date, last_success_at, updated_at) VALUES "
+                "('daily', 'DAILY_CONTIGUOUS', 'CAUGHT_UP', '2020-01-01', '2026-09-10', 2, "
+                "'2026-09-10', '2026-09-10', now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO history_day_status (dataset, trade_date, status, row_count, "
+                "fetched_at, completed_at, completed_by_run_id) VALUES "
+                "('daily', '2026-09-10', 'COMPLETE', 2, now(), now(), 'run-001')"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO history_sync_run (run_id, trigger_type, status, started_at, created_at) "
+                "VALUES ('run-001', 'SCHEDULED', 'SUCCESS', now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO history_sync_run_dataset (run_id, dataset, status, "
+                "start_watermark, target_trade_date, end_watermark, dates_completed, "
+                "rows_written, request_count, retry_count, started_at, finished_at) VALUES "
+                "('run-001', 'daily', 'SUCCESS', NULL, '2026-09-10', '2026-09-10', 1, "
+                "2, 1, 0, now(), now())"
+            ))
+        tables = [
+            "cn_stock_basic", "market_daily_bar",
+            "history_sync_state", "history_day_status",
+            "history_sync_run", "history_sync_run_dataset",
+            "instrument",
+        ]
+        with engine.connect() as conn:
+            return {t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one() for t in tables}
+    finally:
+        engine.dispose()
+
+
+def test_0004_upgrade_from_v031_preserves_data(tmp_path):
+    """v0.3.1 库升级 0004：既有数据无损、新表为空、run_dataset 新列为 0、旧水位冻结。"""
+    db = tmp_path / "v031.duckdb"
+    baseline = _seed_v031_data(db)
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        # 既有表行数不变
+        with engine.connect() as conn:
+            for table, expected in baseline.items():
+                actual = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+                assert actual == expected, f"{table} 行数变化: {expected} -> {actual}"
+
+        # 旧水位字段保持迁移前值
+        with engine.connect() as conn:
+            row = conn.execute(sa.text(
+                "SELECT latest_complete_trade_date, record_count FROM history_sync_state "
+                "WHERE dataset = 'daily'"
+            )).one()
+        assert row[0] == date(2026, 9, 10)
+        assert row[1] == 2
+
+        # 新表存在且为空
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+        assert set(V040_NEW_TABLES) <= tables
+        for table in V040_NEW_TABLES:
+            with engine.connect() as conn:
+                count = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            assert count == 0, f"{table} 初始应为空"
+
+        # run_dataset 新列存在且全部为 0
+        rd_cols = _columns(engine, "history_sync_run_dataset")
+        for col in RUN_DATASET_NEW_COLUMNS:
+            assert col in rd_cols, f"run_dataset 缺列: {col}"
+        with engine.connect() as conn:
+            row = conn.execute(sa.text(
+                "SELECT processed_count, task_success_count, task_failed_count, skipped_count "
+                "FROM history_sync_run_dataset WHERE run_id = 'run-001' AND dataset = 'daily'"
+            )).one()
+        assert row == (0, 0, 0, 0)
+    finally:
+        engine.dispose()
+
+
+def test_0004_fresh_db_full_chain(tmp_path):
+    """全新库 upgrade head：0001→0004 全链执行，新表与 sequence 全部建立。"""
+    db = tmp_path / "fresh.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+            seqs = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
+                ))
+            }
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+        assert set(V040_NEW_TABLES) <= tables
+        assert "seq_sync_task_id" in seqs
+        assert version == V040_HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_0004_new_tables_have_no_unique_fk_index(tmp_path):
+    """新表无 UNIQUE/FK/二级索引（均有主键 / NOT NULL 约束，主键 = 逻辑唯一键）。
+
+    与项目惯例一致：同步控制表均有物理主键（state/run_dataset/day_status
+    都有 PK），但无额外 UNIQUE 约束、无 FK、无二级索引（design D2）。
+    """
+    db = tmp_path / "shape.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        # stock_sync_state：复合主键 (dataset, instrument_id)，无 FK、无 UNIQUE、无二级索引
+        state_constraints = _constraints(engine, "stock_sync_state")
+        assert "PRIMARY KEY" in state_constraints
+        assert "FOREIGN KEY" not in state_constraints
+        assert "UNIQUE" not in state_constraints
+
+        # sync_task：主键 id，无 FK、无 UNIQUE、无二级索引
+        task_constraints = _constraints(engine, "sync_task")
+        assert "PRIMARY KEY" in task_constraints
+        assert "FOREIGN KEY" not in task_constraints
+        assert "UNIQUE" not in task_constraints
+
+        # stock_sync_state 列齐全
+        state_cols = _columns(engine, "stock_sync_state")
+        expected_state_cols = {
+            "dataset", "instrument_id", "ts_code", "watermark_date", "last_task_id",
+            "last_status", "last_error_code", "last_error", "last_success_at",
+            "last_attempt_at", "created_at", "updated_at",
+        }
+        assert set(state_cols) == expected_state_cols, (
+            f"stock_sync_state 列差异: 缺 {expected_state_cols - set(state_cols)} "
+            f"多 {set(state_cols) - expected_state_cols}"
+        )
+
+        # sync_task 列齐全
+        task_cols = _columns(engine, "sync_task")
+        expected_task_cols = {
+            "id", "run_id", "dataset", "instrument_id", "ts_code",
+            "start_date", "end_date", "status", "retry_count", "attempt_count",
+            "records_fetched", "records_written", "error_code", "error_type",
+            "error_message", "started_at", "finished_at", "duration_ms", "created_at",
+        }
+        assert set(task_cols) == expected_task_cols, (
+            f"sync_task 列差异: 缺 {expected_task_cols - set(task_cols)} "
+            f"多 {set(task_cols) - expected_task_cols}"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_0004_idempotent_replay(tmp_path):
+    """0004 迁移可重复执行：对已迁移库再 upgrade head 不报错、数据不变。"""
+    db = tmp_path / "idem.duckdb"
+    baseline = _seed_v031_data(db)
+    command.upgrade(_alembic_config(db), "head")
+
+    # 记录首次迁移后的状态
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            pre_version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+            pre_counts = {
+                t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
+                for t in list(baseline.keys()) + list(V040_NEW_TABLES)
+            }
+    finally:
+        engine.dispose()
+
+    # 第二次 upgrade head（应幂等）
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            post_version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+            post_counts = {
+                t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
+                for t in list(baseline.keys()) + list(V040_NEW_TABLES)
+            }
+        assert post_version == pre_version
+        assert post_counts == pre_counts
+    finally:
+        engine.dispose()
+
+
+def test_0004_downgrade_rollback_clean(tmp_path):
+    """0004 downgrade：新表/列/sequence 全部消失，v0.3.1 数据无损。"""
+    db = tmp_path / "down.duckdb"
+    baseline = _seed_v031_data(db)
+    command.upgrade(_alembic_config(db), "head")
+    command.downgrade(_alembic_config(db), V031_BASE_REVISION)
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+            seqs = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT sequence_name FROM duckdb_sequences() WHERE schema_name = 'main'"
+                ))
+            }
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+        assert not (set(V040_NEW_TABLES) & tables), f"降级后残留新表: {set(V040_NEW_TABLES) & tables}"
+        assert "seq_sync_task_id" not in seqs, "降级后 sequence 残留"
+        assert version == V031_BASE_REVISION
+
+        # run_dataset 新列消失
+        rd_cols = _columns(engine, "history_sync_run_dataset")
+        for col in RUN_DATASET_NEW_COLUMNS:
+            assert col not in rd_cols, f"降级后 run_dataset 残留列: {col}"
+
+        # v0.3.1 数据无损
+        with engine.connect() as conn:
+            for table, expected in baseline.items():
+                actual = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+                assert actual == expected, f"降级后 {table} 行数变化: {expected} -> {actual}"
+    finally:
+        engine.dispose()
+
+
+def test_0004_diagnostics_do_not_modify_data(tmp_path, caplog):
+    """诊断统计为只读 SELECT：迁移后既有数据不变、新表仍为空（不写入 stock_sync_state）。"""
+    import logging
+
+    db = tmp_path / "diag.duckdb"
+    baseline = _seed_v031_data(db)
+
+    with caplog.at_level(logging.INFO, logger="alembic.runtime.migration"):
+        command.upgrade(_alembic_config(db), "head")
+
+    # 迁移日志包含诊断输出
+    log_text = caplog.text
+    assert "[0004]" in log_text or "0004" in log_text, "迁移日志应包含 0004 诊断标记"
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        # 既有数据不变
+        with engine.connect() as conn:
+            for table, expected in baseline.items():
+                actual = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+                assert actual == expected
+        # 不写入 stock_sync_state 行（关键约束：D3）
+        with engine.connect() as conn:
+            count = conn.execute(sa.text("SELECT COUNT(*) FROM stock_sync_state")).scalar_one()
+        assert count == 0, "迁移不应写入任何 stock_sync_state 行"
+    finally:
+        engine.dispose()
+
+
+def test_0004_sync_task_id_uses_sequence(tmp_path):
+    """sync_task.id 由 seq_sync_task_id sequence 生成（INSERT 不提供 id 时自动取号）。"""
+    db = tmp_path / "seq.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO sync_task (run_id, dataset, instrument_id, ts_code, "
+                "start_date, end_date, status, started_at, created_at) VALUES "
+                "('r1', 'daily', 'CN:STOCK:600519', '600519.SH', "
+                "'2026-09-01', '2026-09-10', 'running', now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO sync_task (run_id, dataset, instrument_id, ts_code, "
+                "start_date, end_date, status, started_at, created_at) VALUES "
+                "('r1', 'daily', 'CN:STOCK:000001', '000001.SZ', "
+                "'2026-09-01', '2026-09-10', 'running', now(), now())"
+            ))
+        with engine.connect() as conn:
+            ids = [r[0] for r in conn.execute(sa.text("SELECT id FROM sync_task ORDER BY id"))]
+        assert ids == [1, 2], f"sequence 应从 1 开始递增，实际: {ids}"
+    finally:
+        engine.dispose()
+
+
+def test_0004_run_dataset_new_columns_default_zero(tmp_path):
+    """run_dataset 新列默认值为 0（最小插入时不提供新列亦为 0）。"""
+    db = tmp_path / "rdcol.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO history_sync_run (run_id, trigger_type, status, started_at, created_at) "
+                "VALUES ('r-new', 'MANUAL', 'RUNNING', now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO history_sync_run_dataset (run_id, dataset, status, started_at) "
+                "VALUES ('r-new', 'daily', 'RUNNING', now())"
+            ))
+        with engine.connect() as conn:
+            row = conn.execute(sa.text(
+                "SELECT processed_count, task_success_count, task_failed_count, skipped_count "
+                "FROM history_sync_run_dataset WHERE run_id = 'r-new' AND dataset = 'daily'"
+            )).one()
+        assert row == (0, 0, 0, 0)
+    finally:
+        engine.dispose()

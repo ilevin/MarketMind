@@ -20,6 +20,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Integer,
+    Sequence,
     String,
     Text,
     text,
@@ -199,5 +200,104 @@ class HistorySyncRunDataset(Base):
     last_error_code: Mapped[str | None] = mapped_column(String(64))
     last_error: Mapped[str | None] = mapped_column(Text)
 
+    # —— 个股同步模式统计列（v0.4.0，processed/success/failed/skipped）
+    processed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    task_success_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    task_failed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    skipped_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# —— 任务状态常量（sync_task.status 与 stock_sync_state.last_status 共用子集） ——
+TASK_STATUS_RUNNING = "running"
+TASK_STATUS_SUCCESS = "success"
+TASK_STATUS_FAILED = "failed"
+TASK_STATUS_INTERRUPTED = "interrupted"
+
+
+class StockSyncState(Base):
+    """个股水位与状态（per-stock-history-sync，design D1/D2）。
+
+    逻辑唯一键 ``(dataset, instrument_id)``，不设数据库 UNIQUE 约束
+    （项目全库惯例，唯一性由写锁内 get-or-create 保证）；
+    无 FK、无二级索引。初始水位统一为 NULL，首轮 run 按 universe 批量补建。
+    """
+
+    __tablename__ = "stock_sync_state"
+
+    dataset: Mapped[str] = mapped_column(String(32), primary_key=True)
+    instrument_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+    # 冗余展示列：成功同步时刷新为当前主档规范代码
+    ts_code: Mapped[str | None] = mapped_column(String(16))
+
+    watermark_date: Mapped[date | None] = mapped_column(Date)
+    last_task_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_status: Mapped[str | None] = mapped_column(String(16))  # success / failed
+
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SyncTask(Base):
+    """单股单数据集同步任务流水（per-stock-history-sync，design D2）。
+
+    每次启动一只股票的同步创建一行，包含首次执行与全部重试的汇总；
+    ``attempt_count`` 为总尝试次数（1 + retry_count），终态为 success/failed/interrupted。
+    无 UNIQUE 约束、无 FK、无二级索引；id 由显式 sequence ``seq_sync_task_id`` 生成。
+    """
+
+    __tablename__ = "sync_task"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, Sequence("seq_sync_task_id"), primary_key=True
+    )
+
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset: Mapped[str] = mapped_column(String(32), nullable=False)
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    ts_code: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+
+    records_fetched: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    records_written: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_type: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

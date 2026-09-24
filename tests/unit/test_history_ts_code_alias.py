@@ -424,14 +424,17 @@ class TestConflictComparisonTolerance:
             normalize_historical_aliases(df, endpoint="daily", trade_date=TRADE_DAY)
 
     def test_trade_date_difference_conflicts(self):
-        df = pd.DataFrame(
-            [
-                daily_row(LEGACY_TS_CODE, trade_date="20100104"),
-                daily_row(CANONICAL_TS_CODE, trade_date="20100105"),
-            ]
-        )
-        with pytest.raises(HistoricalAliasConflictError):
-            normalize_historical_aliases(df, endpoint="daily", trade_date=TRADE_DAY)
+        """trade_date 不同的两行比较时判为不一致。
+
+        注意：D5 之后分组键扩展为 (canonical_ts_code, trade_date)，
+        不同日期的行不再进入同一并存检测组。此测试直接验证底层比较函数
+        对日期差异的识别能力（分组键变更不削弱 _rows_equal 的正确性）。
+        """
+        from app.providers.history.tushare_aliases import _rows_equal
+
+        left = daily_row(LEGACY_TS_CODE, trade_date="20100104")
+        right = daily_row(CANONICAL_TS_CODE, trade_date="20100105")
+        assert _rows_equal(left, right) is False, "trade_date 不同应判为不一致"
 
 
 # ================================================================
@@ -670,3 +673,169 @@ class TestStrictProtectionsRetained:
         # 主档原样交付，由 Service 按 list_status 处置（不在此处改写代码）
         assert [r.ts_code for r in batch.records] == [LEGACY_TS_CODE]
         assert [r.instrument_id for r in batch.records] == ["CN:STOCK:000022"]
+
+
+# ================================================================
+# 五、区间批次别名规范化（design D5：分组键扩展到 (canonical_ts_code, trade_date)）
+# ================================================================
+
+
+RANGE_START = date(2010, 1, 4)
+RANGE_END = date(2010, 1, 8)
+
+
+def _range_daily_rows(ts_code: str, start: date, end: date, **overrides) -> list[dict]:
+    """生成 start~end 工作日的 daily 行列表（区间测试辅助）。"""
+    from datetime import timedelta
+    rows = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            row = daily_row(
+                ts_code,
+                trade_date=d.strftime("%Y%m%d"),
+                close=12.0 + (d - start).days,
+            )
+            row.update(overrides)
+            rows.append(row)
+        d += timedelta(days=1)
+    return rows
+
+
+class TestRangeBatchAliasNormalization:
+    """design D5：区间批次下别名层行为正确性。
+
+    分组键从 ``canonical_ts_code`` 扩展为 ``(canonical_ts_code, trade_date)``：
+    - 单日输入行为等价（既有测试全绿 = 等价性证明）；
+    - 区间输入：同股多日不再误判为并存、同一交易日新旧并存仍正确检测。
+    """
+
+    def test_range_all_canonical_no_false_conflict(self):
+        """同股多日全部是规范代码 → 全部正常，不误判为别名并存。"""
+        rows = _range_daily_rows(CANONICAL_TS_CODE, RANGE_START, RANGE_END)
+        df = pd.DataFrame(rows)
+        out = normalize_historical_aliases(
+            df, endpoint="daily", trade_date=RANGE_START
+        )
+        assert len(out) == len(rows)  # 5 个工作日，全部保留
+        assert set(out["ts_code"]) == {CANONICAL_TS_CODE}
+
+    def test_range_all_legacy_rewritten_to_canonical(self):
+        """区间全部返回旧代码 → 全部改写为规范代码，行数不变。"""
+        rows = _range_daily_rows(LEGACY_TS_CODE, RANGE_START, RANGE_END)
+        df = pd.DataFrame(rows)
+        out = normalize_historical_aliases(
+            df, endpoint="daily", trade_date=RANGE_START
+        )
+        assert len(out) == len(rows)
+        assert set(out["ts_code"]) == {CANONICAL_TS_CODE}
+        assert len(set(out["trade_date"])) == len(rows)  # 日期都保留
+
+    def test_range_one_day_legacy_and_canonical_identical_deduped(self):
+        """区间内某日新旧并存且字段一致 → 该日去重，其他日不变。"""
+        rows = _range_daily_rows(CANONICAL_TS_CODE, RANGE_START, RANGE_END)
+        # 中间一天（第3个工作日：2010-01-06）再加一行旧代码（字段完全一致）
+        mid_day = RANGE_START.replace(day=6)
+        rows.append(daily_row(
+            LEGACY_TS_CODE,
+            trade_date=mid_day.strftime("%Y%m%d"),
+            close=12.0 + (mid_day - RANGE_START).days,
+        ))
+        df = pd.DataFrame(rows)
+        out = normalize_historical_aliases(
+            df, endpoint="daily", trade_date=RANGE_START
+        )
+        assert len(out) == 5  # 去重后仍是 5 天
+        assert len(set(out["trade_date"])) == 5
+        assert set(out["ts_code"]) == {CANONICAL_TS_CODE}
+
+    def test_range_one_day_legacy_and_canonical_conflict_raises(self):
+        """区间内某日新旧并存且字段冲突 → ALIAS_CONFLICT，含具体日期。"""
+        rows = _range_daily_rows(CANONICAL_TS_CODE, RANGE_START, RANGE_END)
+        mid_day = RANGE_START.replace(day=6)  # 2010-01-06
+        # 同一天旧代码行，close 值不同
+        rows.append(daily_row(
+            LEGACY_TS_CODE,
+            trade_date=mid_day.strftime("%Y%m%d"),
+            close=999.0,  # 冲突
+        ))
+        df = pd.DataFrame(rows)
+        with pytest.raises(HistoricalAliasConflictError) as exc_info:
+            normalize_historical_aliases(df, endpoint="daily", trade_date=RANGE_START)
+        assert exc_info.value.error_code == "ALIAS_CONFLICT"
+        message = str(exc_info.value)
+        # 错误信息包含冲突日（而非参数传入的 trade_date）
+        assert "20100106" in message
+        assert LEGACY_TS_CODE in message
+        assert CANONICAL_TS_CODE in message
+
+    def test_range_multiple_days_legacy_and_canonical_all_deduped(self):
+        """区间内多天都有新旧并存（一致） → 每天各自去重。"""
+        rows = _range_daily_rows(CANONICAL_TS_CODE, RANGE_START, RANGE_END)
+        # 每天都加一行旧代码（完全一致）
+        for d_date_str in [
+            r["trade_date"] for r in _range_daily_rows(
+                CANONICAL_TS_CODE, RANGE_START, RANGE_END
+            )
+        ]:
+            from datetime import datetime
+            d_date = datetime.strptime(d_date_str, "%Y%m%d").date()
+            rows.append(daily_row(
+                LEGACY_TS_CODE,
+                trade_date=d_date_str,
+                close=12.0 + (d_date - RANGE_START).days,
+            ))
+        df = pd.DataFrame(rows)
+        out = normalize_historical_aliases(
+            df, endpoint="daily", trade_date=RANGE_START
+        )
+        assert len(out) == 5  # 每天去重后剩 1 行，共 5 天
+        assert set(out["ts_code"]) == {CANONICAL_TS_CODE}
+
+    def test_range_same_legacy_code_twice_per_day_left_for_duplicate_key(self):
+        """区间内某天同一旧代码两行 → 改写但保留两行，交给 DUPLICATE_KEY。"""
+        rows = _range_daily_rows(LEGACY_TS_CODE, RANGE_START, RANGE_END)
+        # 第 1 天再加一行旧代码（同代码同日）
+        rows.append(daily_row(
+            LEGACY_TS_CODE,
+            trade_date=RANGE_START.strftime("%Y%m%d"),
+            close=12.0,  # 与第一天相同
+        ))
+        df = pd.DataFrame(rows)
+        out = normalize_historical_aliases(
+            df, endpoint="daily", trade_date=RANGE_START
+        )
+        assert len(out) == len(rows)  # 全部保留（不做去重）
+        assert set(out["ts_code"]) == {CANONICAL_TS_CODE}  # 都被改写
+
+    def test_range_raw_row_count_before_normalization(self):
+        """Provider 层 raw_row_count 口径：别名规范化之前的上游行数。"""
+        client = FakeTushareClient()
+        rows = _range_daily_rows(CANONICAL_TS_CODE, RANGE_START, RANGE_END)
+        # 加 1 天旧代码（一致），上游共 6 行
+        mid_day = RANGE_START.replace(day=6)
+        rows.append(daily_row(
+            LEGACY_TS_CODE,
+            trade_date=mid_day.strftime("%Y%m%d"),
+            close=12.0 + (mid_day - RANGE_START).days,
+        ))
+        client.add("daily", pd.DataFrame(rows))
+        from app.providers.history.tushare import (
+            TushareHistoricalMarketDataProvider,
+        )
+        batch = _provider(client).get_history_by_stock(
+            "daily", ZHAOSHANG, RANGE_START, RANGE_END
+        )
+        assert batch.raw_row_count == 6  # 规范化前
+        assert len(batch.records) == 5  # 规范化后去重
+
+    def test_range_unknown_instrument_still_rejected(self):
+        """区间批次中未登记别名的未知代码 → 仍是 UNKNOWN_INSTRUMENT。"""
+        client = FakeTushareClient()
+        rows = _range_daily_rows("999999.SZ", RANGE_START, RANGE_END)
+        client.add("daily", pd.DataFrame(rows))
+        with pytest.raises(UnknownInstrumentError) as exc_info:
+            _provider(client).get_history_by_stock(
+                "daily", ZHAOSHANG, RANGE_START, RANGE_END
+            )
+        assert exc_info.value.error_code == "UNKNOWN_INSTRUMENT"

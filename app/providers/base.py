@@ -289,3 +289,19 @@ class HistoricalMarketDataProvider(Protocol):
     def get_moneyflow_for_instruments(
         self, trade_date: date, instruments: list[Instrument]
     ) -> ProviderBatch[MoneyFlow]: ...
+
+    def get_history_by_stock(
+        self,
+        dataset: str,
+        instrument: Instrument,
+        start_date: date,
+        end_date: date,
+    ) -> ProviderBatch:
+        """按单只股票区间拉取历史事实（个股级同步主路径，design D4）。
+
+        ``dataset`` 取值同数据集名（daily/adj_factor/daily_basic/moneyflow）；
+        ``instrument`` 由 Service 在 run 开始时读主档快照传入（Provider 不
+        自行访问数据库）；返回行经别名规范化与 instrument 映射，结构与
+        按 trade_date 方法一致。
+        """
+        ...

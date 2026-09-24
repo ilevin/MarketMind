@@ -654,3 +654,239 @@ def test_registry_metrics_registry_injection():
     assert registry.metrics is metrics
     registry.get_daily(TRADE_DAY, [MAOTAI])
     assert metrics.get("tushare_history_daily").success_count == 1
+
+
+# ---- 个股区间拉取（get_history_by_stock，design D4） ----
+
+
+RANGE_START = date(2010, 1, 4)
+RANGE_END = date(2010, 1, 8)
+ZHAOSHANG = Instrument(
+    instrument_id="CN:STOCK:001872", symbol="001872", name="招商港口",
+    market="CN", asset_type="STOCK", currency="CNY", exchange="SZSE",
+)
+LEGACY_TS_CODE = "000022.SZ"
+
+
+def _daily_range_rows(ts_code: str, start: date, end: date, **overrides) -> list[dict]:
+    """生成从 start 到 end 每个交易日一行的 daily 数据（简单按日递推）。"""
+    from datetime import timedelta
+    rows = []
+    d = start
+    while d <= end:
+        # 简单跳过周末（真实交易日历由 Service 控制，Provider 只透传区间）
+        if d.weekday() < 5:
+            row = _daily_row(
+                ts_code=ts_code,
+                trade_date=d.strftime("%Y%m%d"),
+                close=10.0 + (d - start).days,
+            )
+            row.update(overrides)
+            rows.append(row)
+        d += timedelta(days=1)
+    return rows
+
+
+def test_get_history_by_stock_daily_passes_range_params():
+    """区间参数正确透传：ts_code/start_date/end_date/fields 四要素。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame(_daily_range_rows("600519.SH", RANGE_START, RANGE_END)))
+    batch = _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+
+    (params,) = client.calls_for("daily")
+    assert params["ts_code"] == "600519.SH"
+    assert params["start_date"] == "20100104"
+    assert params["end_date"] == "20100108"
+    assert params["fields"] == ",".join(DAILY_FIELDS)
+    # 确认只有一次请求（区间形态，不逐日拆分）
+    assert len(client.calls_for("daily")) == 1
+    assert batch.source == "tushare"
+    assert batch.raw_row_count == len(batch.records)  # 无别名时行号一致
+    assert all(r.instrument_id == "CN:STOCK:600519" for r in batch.records)
+
+
+def test_get_history_by_stock_multi_day_records():
+    """多日区间返回多行，每行日期不同。"""
+    client = FakeTushareClient()
+    rows = _daily_range_rows("600519.SH", RANGE_START, RANGE_END)
+    client.add("daily", pd.DataFrame(rows))
+    batch = _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+
+    assert len(batch.records) == 5  # 5 个工作日
+    dates = sorted(r.trade_date for r in batch.records)
+    assert dates[0] == RANGE_START
+    assert dates[-1] == RANGE_END
+    assert len(set(dates)) == len(dates)  # 日期不重复
+
+
+def test_get_history_by_stock_empty_response():
+    """空结果（停牌区间、退市股等）返回空批次，不抛异常。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame())
+    batch = _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    assert batch.records == []
+    assert batch.raw_row_count == 0
+    assert batch.truncation_risk is False
+
+
+def test_get_history_by_stock_legacy_ts_code_response():
+    """上游返回旧代码时，经别名规范化后落到规范 instrument。"""
+    client = FakeTushareClient()
+    rows = _daily_range_rows(LEGACY_TS_CODE, RANGE_START, RANGE_END)
+    client.add("daily", pd.DataFrame(rows))
+    batch = _provider(client).get_history_by_stock("daily", ZHAOSHANG, RANGE_START, RANGE_END)
+
+    assert len(batch.records) == 5
+    assert all(r.instrument_id == "CN:STOCK:001872" for r in batch.records)
+    assert all(r.ts_code == "001872.SZ" for r in batch.records)
+    # raw_row_count 是别名规范化前的上游行数
+    assert batch.raw_row_count == 5
+
+
+def test_get_history_by_stock_legacy_and_canonical_same_day_dedup():
+    """区间内某日新旧代码并存且一致 → 该日去重，raw_row_count 仍计两行。"""
+    client = FakeTushareClient()
+    rows = _daily_range_rows("001872.SZ", RANGE_START, RANGE_END)
+    # 找 2010-01-06 的规范代码行，复制一份并把 ts_code 改成旧代码
+    canonical_row_0106 = next(
+        r for r in rows if r["trade_date"] == "20100106"
+    ).copy()
+    canonical_row_0106["ts_code"] = LEGACY_TS_CODE
+    rows.append(canonical_row_0106)
+    client.add("daily", pd.DataFrame(rows))
+    batch = _provider(client).get_history_by_stock("daily", ZHAOSHANG, RANGE_START, RANGE_END)
+
+    assert len(batch.records) == 5  # 去重后仍是 5 天
+    assert batch.raw_row_count == 6  # 上游实际返回 6 行
+
+
+def test_get_history_by_stock_truncation_risk_at_cap():
+    """达到行数上限时 truncation_risk=True。"""
+    client = FakeTushareClient()
+    # 生成 6000 行（达到 DAILY_ROW_CAP）
+    from datetime import timedelta
+    rows = []
+    d = RANGE_START
+    for i in range(6000):
+        rows.append(_daily_row(
+            ts_code="600519.SH",
+            trade_date=d.strftime("%Y%m%d"),
+            close=100.0 + i,
+        ))
+        d += timedelta(days=1)
+    client.add("daily", pd.DataFrame(rows))
+    batch = _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    assert batch.truncation_risk is True
+    assert batch.raw_row_count == 6000
+
+
+def test_get_history_by_stock_unknown_instrument_raises():
+    """未知代码返回仍然 UNKNOWN_INSTRUMENT。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame([_daily_row(ts_code="999999.SH")]))
+    with pytest.raises(UnknownInstrumentError) as exc_info:
+        _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    assert exc_info.value.error_code == "UNKNOWN_INSTRUMENT"
+
+
+def test_get_history_by_stock_schema_mismatch_raises():
+    """缺失必需列抛 SCHEMA_MISMATCH。"""
+    client = FakeTushareClient()
+    df = pd.DataFrame([_daily_row()]).drop(columns=["trade_date"])
+    client.add("daily", df)
+    with pytest.raises(TushareHistorySchemaError) as exc_info:
+        _provider(client).get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    assert exc_info.value.error_code == "SCHEMA_MISMATCH"
+
+
+def test_get_history_by_stock_unsupported_dataset_raises():
+    """不支持的数据集抛 ValueError。"""
+    client = FakeTushareClient()
+    with pytest.raises(ValueError, match="不支持的数据集"):
+        _provider(client).get_history_by_stock("stock_basic", MAOTAI, RANGE_START, RANGE_END)
+
+
+def test_get_history_by_stock_respects_request_gate():
+    """请求经过 gate 限流（与其他方法共享同一 gate）。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame([_daily_row()]))
+    gate = TushareRequestGate(0.001)  # 极小间隔，确保被调用
+    cfg = AppConfig(tushare=TushareConfig(token="fake-token"))
+    transport = TushareTransport(
+        cfg, gate=gate, client_factory=lambda c: client
+    )
+    provider = TushareHistoricalMarketDataProvider(cfg, transport=transport)
+    # 发两次请求，gate 应生效（不抛异常即代表 gate 正常工作）
+    provider.get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    provider.get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    assert len(client.calls_for("daily")) == 2
+
+
+def test_get_history_by_stock_timeout_propagates():
+    """请求超时向上传播并分类。"""
+    def raise_timeout(**params):
+        raise TimeoutError("network timeout")
+
+    client = FakeTushareClient()
+    client.add("daily", raise_timeout)
+    cfg = AppConfig(tushare=TushareConfig(token="fake-token"))
+    registry = HistoryProviderRegistry(cfg, provider=_provider(client))
+    with pytest.raises(TimeoutError):
+        registry.get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+    metrics = registry.metrics.get("tushare_history_daily")
+    assert metrics.timeout_count == 1
+    assert metrics.success_count == 0
+
+
+def test_get_history_by_stock_metrics_into_existing_dataset_key():
+    """个股路径计入现有 tushare_history_{dataset} 键，与日级路径共享。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame([_daily_row()]))
+    cfg = AppConfig(tushare=TushareConfig(token="fake-token"))
+    registry = HistoryProviderRegistry(cfg, provider=_provider(client))
+
+    # 先走一次日级路径
+    registry.get_daily(TRADE_DAY, [MAOTAI])
+    # 再走一次个股区间路径
+    registry.get_history_by_stock("daily", MAOTAI, RANGE_START, RANGE_END)
+
+    metrics = registry.metrics.get("tushare_history_daily")
+    assert metrics.request_count == 2  # 同一 key 累计
+    assert metrics.success_count == 2
+    # 其他数据集不受影响
+    assert registry.metrics.get("tushare_history_adj_factor").request_count == 0
+
+
+def test_get_history_by_stock_all_four_datasets():
+    """四个日级数据集都支持区间拉取。"""
+    client = FakeTushareClient()
+    client.add("daily", pd.DataFrame([_daily_row(ts_code="600519.SH")]))
+    client.add(
+        "adj_factor",
+        pd.DataFrame([{"ts_code": "600519.SH", "trade_date": "20100104", "adj_factor": 1.0}]),
+    )
+    client.add(
+        "daily_basic",
+        pd.DataFrame([{"ts_code": "600519.SH", "trade_date": "20100104", "close": 10.0}]),
+    )
+    client.add(
+        "moneyflow",
+        pd.DataFrame([{
+            "ts_code": "600519.SH", "trade_date": "20100104",
+            "buy_sm_vol": 1, "buy_sm_amount": 1.0,
+            "sell_sm_vol": 1, "sell_sm_amount": 1.0,
+            "buy_md_vol": 1, "buy_md_amount": 1.0,
+            "sell_md_vol": 1, "sell_md_amount": 1.0,
+            "buy_lg_vol": 1, "buy_lg_amount": 1.0,
+            "sell_lg_vol": 1, "sell_lg_amount": 1.0,
+            "buy_elg_vol": 1, "buy_elg_amount": 1.0,
+            "sell_elg_vol": 1, "sell_elg_amount": 1.0,
+            "net_mf_vol": 0, "net_mf_amount": 0.0,
+        }]),
+    )
+    provider = _provider(client)
+    for dataset in ("daily", "adj_factor", "daily_basic", "moneyflow"):
+        batch = provider.get_history_by_stock(dataset, MAOTAI, RANGE_START, RANGE_END)
+        assert len(batch.records) == 1
+        assert batch.records[0].instrument_id == "CN:STOCK:600519"
+        assert batch.raw_row_count == 1

@@ -214,12 +214,17 @@ def normalize_historical_aliases(df, *, endpoint: str, trade_date: date):
     canonical_values = [canonical_ts_code(str(code)) for code in out["ts_code"]]
     out["ts_code"] = canonical_values
 
-    groups: dict[str, list[int]] = {}
+    # 分组键 = (canonical_ts_code, trade_date)，支持区间批次（design D5）：
+    # 单日输入下所有行 trade_date 相同，行为与原 canonical_ts_code 单键等价；
+    # 区间输入下同股多日分属不同组，不会被误判为别名并存。
+    groups: dict[tuple[str, str], list[int]] = {}
     for position, code in enumerate(canonical_values):
-        groups.setdefault(code, []).append(position)
+        row_date = str(rows[position].get("trade_date", ""))
+        key = (code, row_date)
+        groups.setdefault(key, []).append(position)
 
     drop_positions: set[int] = set()
-    for code, positions in groups.items():
+    for (code, group_date), positions in groups.items():
         if len(positions) < 2:
             continue
         original_codes = {str(rows[position].get("ts_code")) for position in positions}
@@ -245,10 +250,12 @@ def normalize_historical_aliases(df, *, endpoint: str, trade_date: date):
         else:
             # 组内全是同一个旧代码 -> 与别名无关的重复，交给 DUPLICATE_KEY
             continue
+        # 显示日期优先用分组内的实际日期（区间批次里冲突发生在具体某日）
+        display_date = group_date if group_date else f"{trade_date:%Y%m%d}"
         for position in droppable:
             if not _rows_equal(reference, rows[position]):
                 raise HistoricalAliasConflictError(
-                    f"{endpoint}[{trade_date:%Y%m%d}]: 旧代码 "
+                    f"{endpoint}[{display_date}]: 旧代码 "
                     f"{rows[position].get('ts_code')} 与 {code} 同属一只证券但字段冲突"
                     f"（{_describe_differences(reference, rows[position])}）"
                 )
@@ -256,7 +263,7 @@ def normalize_historical_aliases(df, *, endpoint: str, trade_date: date):
             logger.warning(
                 "历史事实含旧代码且与新代码重复，丢弃旧代码行 "
                 "action=drop_legacy endpoint=%s trade_date=%s legacy=%s canonical=%s",
-                endpoint, trade_date, rows[position].get("ts_code"), code,
+                endpoint, display_date, rows[position].get("ts_code"), code,
             )
 
     if not drop_positions:

@@ -182,3 +182,26 @@ class HistoryProviderRegistry:
         self, trade_date: date, instruments: list[Instrument]
     ) -> ProviderBatch[MoneyFlow]:
         return self._call("get_moneyflow_for_instruments", trade_date, instruments)
+
+    def get_history_by_stock(
+        self,
+        dataset: str,
+        instrument: Instrument,
+        start_date: date,
+        end_date: date,
+    ) -> ProviderBatch:
+        """个股区间拉取：metrics 键复用 ``tushare_history_{dataset}``（design D4）。
+
+        与其他方法不同，这里的 metrics key 不由方法名静态决定，而是
+        由 ``dataset`` 参数动态决定——使个股路径与日级路径共享同一套
+        统计口径，无第二套统计实现。
+        """
+        return call_with_metrics(
+            self._metrics,
+            f"{self._source}_history_{dataset}",
+            self._provider.get_history_by_stock,
+            dataset,
+            instrument,
+            start_date,
+            end_date,
+        )

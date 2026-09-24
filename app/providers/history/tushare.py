@@ -432,6 +432,35 @@ def _build_moneyflow_row(
     )
 
 
+# 数据集 -> 区间拉取用的 endpoint / fields / required / 行构建器
+_STOCK_RANGE_DATASETS: dict[str, dict] = {
+    "daily": {
+        "endpoint": "daily",
+        "fields": DAILY_FIELDS,
+        "required": DAILY_REQUIRED,
+        "build": _build_daily_row,
+    },
+    "adj_factor": {
+        "endpoint": "adj_factor",
+        "fields": ADJ_FACTOR_FIELDS,
+        "required": ADJ_FACTOR_REQUIRED,
+        "build": _build_adj_factor_row,
+    },
+    "daily_basic": {
+        "endpoint": "daily_basic",
+        "fields": DAILY_BASIC_FIELDS,
+        "required": DAILY_BASIC_REQUIRED,
+        "build": _build_daily_basic_row,
+    },
+    "moneyflow": {
+        "endpoint": "moneyflow",
+        "fields": MONEYFLOW_FIELDS,
+        "required": MONEYFLOW_REQUIRED,
+        "build": _build_moneyflow_row,
+    },
+}
+
+
 class TushareHistoricalMarketDataProvider:
     """``HistoricalMarketDataProvider`` 的 Tushare 实现（§31.3）。"""
 
@@ -663,6 +692,91 @@ class TushareHistoricalMarketDataProvider:
             trade_date=trade_date,
             instruments=instruments,
             build=_build_moneyflow_row,
+        )
+
+    # ---- 个股区间拉取（design D4） ----
+
+    def get_history_by_stock(
+        self,
+        dataset: str,
+        instrument: Instrument,
+        start_date: date,
+        end_date: date,
+    ) -> ProviderBatch:
+        """按单只股票区间拉取历史事实（个股级同步主路径）。
+
+        一次请求覆盖完整区间，**不**逐日拆分；``ts_code`` 由传入 Instrument
+        的主档当前代码构造（不按代码首位推断交易所）。返回行经别名
+        规范化与 instrument 映射，结构与按 trade_date 方法一致。
+
+        ``raw_row_count`` 取别名规范化前的上游行数；
+        ``truncation_risk`` 按 ``raw_rows >= DAILY_ROW_CAP`` 判定（异常
+        放大返回的防护，单股 16 年约 4000 行正常不触发）。
+        """
+        spec = _STOCK_RANGE_DATASETS.get(dataset)
+        if spec is None:
+            raise ValueError(
+                f"get_history_by_stock 不支持的数据集: {dataset}"
+                f"（可选: {sorted(_STOCK_RANGE_DATASETS)}）"
+            )
+        return self._fetch_by_stock(
+            endpoint=spec["endpoint"],
+            fields=spec["fields"],
+            required=spec["required"],
+            instrument=instrument,
+            start_date=start_date,
+            end_date=end_date,
+            build=spec["build"],
+        )
+
+    def _fetch_by_stock(
+        self,
+        *,
+        endpoint: str,
+        fields: tuple[str, ...],
+        required: tuple[str, ...],
+        instrument: Instrument,
+        start_date: date,
+        end_date: date,
+        build: Callable[[dict, dict[str, Instrument], str], object],
+    ) -> ProviderBatch:
+        """个股区间请求内部实现：一次请求、别名规范化、instrument 映射。
+
+        与 ``_fetch_day_level`` 同构——只是请求参数从 ``trade_date=``
+        换成 ``ts_code= + start_date= + end_date=``，返回行结构与别名
+        规范化路径完全一致。
+        """
+        ts_code = _ts_code_of_instrument(instrument)
+        context = f"{endpoint}[{ts_code} {_yyyymmdd(start_date)}~{_yyyymmdd(end_date)}]"
+        df = self._transport.call(
+            endpoint,
+            ts_code=ts_code,
+            start_date=_yyyymmdd(start_date),
+            end_date=_yyyymmdd(end_date),
+            fields=_fields_param(fields),
+        )
+        _check_dataframe(df, context=context)
+        raw_rows = len(df)
+        # 别名规范化：用区间起始日作 trade_date 参数（仅用于日志/异常文本），
+        # 真实分组按行内 trade_date 值（tushare_aliases.py D5）。
+        df = normalize_historical_aliases(
+            df, endpoint=endpoint, trade_date=start_date
+        )
+        # 区间模式下只有一只股票，symbol_map 用单元素映射
+        symbol_map = {instrument.symbol: instrument}
+
+        def _build(row: dict, ctx: str):
+            return build(row, symbol_map, ctx)
+
+        records = _normalize_rows(df, required=required, context=context, build=_build)
+        truncation = raw_rows >= DAILY_ROW_CAP
+        if truncation:
+            logger.warning("%s 返回 %d 行达到接口上限，标记截断风险", context, raw_rows)
+        return ProviderBatch(
+            records=records,
+            source=SOURCE,
+            raw_row_count=raw_rows,
+            truncation_risk=truncation,
         )
 
     # ---- 内部：日级请求两条路径 ----

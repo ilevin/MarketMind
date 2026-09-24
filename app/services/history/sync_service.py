@@ -1,17 +1,20 @@
-"""历史同步统一编排（a-share-historical-data，design.md D17~D18，
-spec.md"统一入口与触发方式"/"任务互斥"/"进程中断与恢复"/"单日原子提交与
-幂等"/"失败日期绝不跳过"/"主档前置与刷新周期"/"水位一致性对账"/
-"空结果与等待数据源"）。
+"""历史同步统一编排（per-stock-history-sync，design D7/D9/D10，
+spec.md"统一入口与触发方式"/"进程中断与恢复"/"个股失败隔离与缺口不跳过"/
+"单股区间原子提交与幂等"/"股票生命周期边界"）。
 
 ``HistorySyncService.run`` 为唯一业务入口：
 
     recover_stale_runs -> ensure_master_prerequisites（trade_cal/stock_basic
-    硬前置；company/namechange 非阻塞） -> reconcile_daily_watermarks ->
-    四个日级数据集顺序执行（互不阻塞） -> finalize_run
+    硬前置；company/namechange 非阻塞） -> 四个日级数据集顺序执行
+    （universe 逐股：planner 算有效区间 → 无工作 skipped；有工作交
+    StockSyncExecutor → 单股失败 continue） -> finalize_run
 
 Job 层（进程级 single-flight、cancellation Event 构造、asyncio.to_thread）
 不在本文件职责内——本 Service 只接受可选的 ``threading.Event`` 并在检查点
 读取，不管理其生命周期。
+
+``StockSyncProgress`` 为进程内进度快照对象（design D10）：高频变化的
+"当前 ts_code"不逐股写库，聚合计数以 DB 为准；后续任务挂到 app.state。
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ import re
 import threading
 import time
 import uuid
-from datetime import date, timedelta
+from dataclasses import dataclass, field
+from datetime import date
 from typing import Callable
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -46,20 +50,17 @@ from app.providers.trading_calendar.provider import (
 from app.repositories.history_fact import HistoryFactRepository
 from app.repositories.history_master import HistoryMasterRepository
 from app.repositories.history_sync import (
-    HistoryDayStatusRepository,
     HistorySyncRunDatasetRepository,
     HistorySyncRunRepository,
     HistorySyncStateRepository,
+    StockSyncStateRepository,
+    SyncTaskRepository,
 )
 from app.repositories.trading_calendar import TradingCalendarRepository
 from app.services.history.availability import AvailabilityPolicy
 from app.services.history.planner import HistorySyncPlanner
 from app.services.history.retry import RetryPolicy, is_config_error
-from app.services.history.validation import (
-    HistoryValidationError,
-    TruncationRiskError,
-    validate_batch,
-)
+from app.services.history.stock_executor import StockSyncExecutor, TaskOutcome
 from app.services.market_session_service import now_beijing
 
 logger = logging.getLogger(__name__)
@@ -71,14 +72,6 @@ DAY_LEVEL_DATASETS: tuple[DatasetName, ...] = (
     DatasetName.DAILY_BASIC,
     DatasetName.MONEYFLOW,
 )
-
-# 每数据集 Provider 方法名（主路径 / 截断 fallback），§33 截断风险处理用
-_FETCH_METHODS: dict[DatasetName, tuple[str, str]] = {
-    DatasetName.DAILY: ("get_daily", "get_daily_for_instruments"),
-    DatasetName.ADJ_FACTOR: ("get_adj_factors", "get_adj_factors"),
-    DatasetName.DAILY_BASIC: ("get_daily_basic", "get_daily_basic_for_instruments"),
-    DatasetName.MONEYFLOW: ("get_moneyflow", "get_moneyflow_for_instruments"),
-}
 
 CN_MARKET = "CN"
 
@@ -128,7 +121,6 @@ def _safe_error_text(exc: BaseException, *, limit: int = 500) -> str:
 # 任何一个漏掉都会穿透重试循环，把整轮 run 拖成非终态（§27/§29）。
 SYNC_ERRORS: tuple[type[BaseException], ...] = (
     TushareError,
-    HistoryValidationError,
     CalendarUnavailableError,
     TimeoutError,
 )
@@ -146,6 +138,53 @@ def _error_code_of(exc: BaseException) -> str:
     if isinstance(exc, TimeoutError):
         return "TUSHARE_TIMEOUT"
     return "INTERNAL_ERROR"
+
+
+@dataclass
+class StockSyncProgress:
+    """进程内实时进度快照（design D10）。
+
+    高频变化的"当前 ts_code"不逐股写库；聚合计数以 DB 为准，progress
+    仅用于 API 实时展示。由 Service 在 run 期间更新，后续任务挂到
+    app.state。
+
+    字段：
+        current_dataset: 当前处理的数据集（None = 未开始或已结束）
+        current_ts_code: 当前处理的股票代码（None = 处理中但无该股信息）
+        processed: 已处理股票数（成功 + 失败）
+        succeeded: 成功股票数
+        failed: 失败股票数
+        skipped: 跳过（无工作）股票数
+    """
+
+    current_dataset: str | None = None
+    current_ts_code: str | None = None
+    processed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+    def reset(self) -> None:
+        """数据集切换时重置计数。"""
+        self.current_dataset = None
+        self.current_ts_code = None
+        self.processed = 0
+        self.succeeded = 0
+        self.failed = 0
+        self.skipped = 0
+
+    def record_outcome(self, outcome: TaskOutcome) -> None:
+        """根据 TaskOutcome 更新计数。"""
+        from app.models.history_sync import TASK_STATUS_SUCCESS, TASK_STATUS_FAILED
+
+        self.processed += 1
+        if outcome.status == TASK_STATUS_SUCCESS:
+            self.succeeded += 1
+        elif outcome.status == TASK_STATUS_FAILED:
+            self.failed += 1
+
+    def record_skip(self) -> None:
+        self.skipped += 1
 
 
 class HistorySyncService:
@@ -167,6 +206,14 @@ class HistorySyncService:
         self.calendar_provider = calendar_provider
         self.availability = AvailabilityPolicy(config)
         self.retry_policy = RetryPolicy(config, sleep=sleep, random_fn=random_fn)
+        self.stock_executor = StockSyncExecutor(
+            config=config,
+            session_factory=session_factory,
+            providers=history_providers,
+            retry_policy=self.retry_policy,
+        )
+        # 进程内进度快照（design D10：实时展示用，DB 为权威计数）
+        self.progress = StockSyncProgress()
 
     # ---- 唯一入口 ----
 
@@ -212,24 +259,12 @@ class HistorySyncService:
             if not master_ok:
                 return run_id
 
-            try:
-                self.reconcile_daily_watermarks()
-            except SYNC_ERRORS as exc:
-                # 日历不可用等：对账是"保守回退"的前置，做不了就不能推进
-                # （宁可本轮不推进，也不在"水位可能不一致"的前提下写数据）。
-                logger.error(
-                    "水位对账失败，本轮不推进日级数据集 run_id=%s error_code=%s: %s",
-                    run_id, _error_code_of(exc), _safe_error_text(exc),
-                )
-                aborted = True
-                return run_id
-
             for dataset in DAY_LEVEL_DATASETS:
                 if cancellation_event is not None and cancellation_event.is_set():
                     outcomes[dataset] = "CANCELLED"
                     continue
                 try:
-                    outcomes[dataset] = self._sync_day_level_dataset(
+                    outcomes[dataset] = self._sync_stock_dataset(
                         run_id, dataset, cancellation_event=cancellation_event
                     )
                 except Exception as exc:  # 非预期异常：记录并继续其他数据集
@@ -246,6 +281,9 @@ class HistorySyncService:
                 master_ok=master_ok,
                 aborted=aborted,
             )
+            # 结束时清空 progress 当前状态
+            self.progress.current_dataset = None
+            self.progress.current_ts_code = None
         return run_id
 
     def _record_unexpected_failure(
@@ -277,12 +315,17 @@ class HistorySyncService:
         except Exception:  # pragma: no cover - 兜底路径自身失败只记录，不再传播
             logger.exception("记录非预期异常失败 dataset=%s run_id=%s", dataset.value, run_id)
 
-    # ---- 启动恢复（§19）----
+    # ---- 启动恢复（§19，design D9）----
 
     def recover_stale_runs(self, *, exclude_run_id: str | None = None) -> None:
         """遗留 RUNNING run 标 INTERRUPTED；SYNCING/RETRYING/CHECKING 的
         state 恢复为 LAGGING/CAUGHT_UP（依据水位，不依据"曾经 RUNNING"猜测
-        某日已完成）。"""
+        某日已完成）；遗留 running 状态的 sync_task 批量置 interrupted。
+
+        per-stock-history-sync D9 扩展：把属于已中断 Run 的 running 状态
+        sync_task 批量置 interrupted（补 finished_at）。**绝不推进对应水位**
+        （task 未提交，水位本就未动）。全部动作在同一写锁事务内。
+        """
         now = now_beijing()
         with write_coordinator.write():
             with self.session_factory() as session:
@@ -290,11 +333,24 @@ class HistorySyncService:
                 stale_runs = [
                     r for r in run_repo.find_stale_running() if r.run_id != exclude_run_id
                 ]
+                stale_run_ids = [r.run_id for r in stale_runs]
                 for stale in stale_runs:
                     run_repo.mark_interrupted(stale.run_id, finished_at=now)
                     logger.warning(
                         "恢复遗留 RUNNING 任务为 INTERRUPTED: run_id=%s", stale.run_id
                     )
+
+                # D9：遗留 running 的 sync_task 批量置 interrupted
+                if stale_run_ids:
+                    task_repo = SyncTaskRepository(session)
+                    interrupted_count = task_repo.interrupt_running_for_runs(
+                        stale_run_ids, finished_at=now
+                    )
+                    if interrupted_count:
+                        logger.warning(
+                            "恢复遗留 running sync_task 为 interrupted: count=%d run_ids=%s",
+                            interrupted_count, stale_run_ids,
+                        )
 
                 state_repo = HistorySyncStateRepository(session)
                 for state in state_repo.all_states():
@@ -383,21 +439,6 @@ class HistorySyncService:
             if age_hours < self.config.history.stock_basic_refresh_hours:
                 return True
         return self._refresh_stock_basic(run_id, context="stock_basic 前置")
-
-    def _reload_instruments(self, instruments: list | None) -> tuple[list | None, set | None]:
-        """刷新后重读主档并就地更新调用方列表（§35.1 的"重新映射"）。
-
-        就地更新而非返回新列表：同一数据集的后续交易日复用刷新后的主档，
-        否则每个未推进的交易日都会再刷新一次主档（§35.1 只要求"刷新一次"）。
-        """
-        with self.session_factory() as session:
-            refreshed = HistoryMasterRepository(session).list_cn_stock_instruments()
-        if instruments is not None:
-            instruments[:] = refreshed
-        known_ids = (
-            {inst.instrument_id for inst in instruments} if instruments else None
-        )
-        return instruments, known_ids
 
     def _refresh_stock_basic(self, run_id: str, *, context: str) -> bool:
         """无条件刷新 stock_basic 并落库（§35.1 未知证券恢复亦复用本方法，
@@ -670,227 +711,225 @@ class HistorySyncService:
         )
         return [rec.trade_date for rec in records if rec.is_open]
 
-    # ---- 水位一致性对账（§25）----
-
-    def reconcile_daily_watermarks(self) -> None:
-        """每次任务开始对四数据集轻量 reconcile：发现不一致时保守回退水位到
-        第一个缺失 COMPLETE 日的前一交易日（下轮据此重同步）。"""
-        today = now_beijing().date()
-        open_days = self._strict_open_days(today)
+    def _set_state_error(
+        self, dataset: DatasetName, *, error_code: str, error: str, status: DatasetStatus
+    ) -> None:
         with write_coordinator.write():
             with self.session_factory() as session:
-                state_repo = HistorySyncStateRepository(session)
-                day_repo = HistoryDayStatusRepository(session)
-                fact_repo = HistoryFactRepository(session)
-                for dataset in DAY_LEVEL_DATASETS:
-                    state = state_repo.ensure(
-                        dataset,
-                        dataset_kind=DatasetKind.DAILY_CONTIGUOUS,
-                        history_start_date=self.config.history.start_date,
-                    )
-                    watermark = state.latest_complete_trade_date
-                    if watermark is None:
-                        continue
-                    expected_days = [d for d in open_days if d <= watermark]
-                    completed = day_repo.completed_dates(
-                        dataset, start=self.config.history.start_date, end=watermark
-                    )
-                    reconciled = HistorySyncPlanner.reconcile_watermark(
-                        watermark=watermark,
-                        expected_days=expected_days,
-                        completed_dates=completed,
-                    )
-                    if reconciled != watermark:
-                        logger.warning(
-                            "水位对账发现缺口，回退 %s 水位: %s -> %s",
-                            dataset, watermark, reconciled,
-                        )
-                        state.latest_complete_trade_date = reconciled
-                        # 不回写 data_max_date：该字段是"事实表最大交易日"，
-                        # 事实行仍在，回退水位不代表数据被删（§45）。
-                    # 事实表 MAX 与水位矛盾只用于发现异常、告警，绝不据此
-                    # 推进水位（spec"水位一致性对账"）。
-                    max_fact = fact_repo.max_trade_date(dataset)
-                    if max_fact is not None and max_fact > watermark:
-                        logger.warning(
-                            "对账发现事实表日期晚于水位（仅告警，不推进水位） "
-                            "dataset=%s watermark=%s max_fact_date=%s",
-                            dataset.value, watermark, max_fact,
-                        )
-                    elif max_fact is None or max_fact < watermark:
-                        # 反向矛盾（§25 第 4 项）：水位声称已完成的日期在事实表
-                        # 中不存在。正常路径不可能出现——推水位与写事实在同一
-                        # 事务（D5/D6），且 COMPLETE 日必 >=1 行（空结果为
-                        # EMPTY_RESULT/WAITING_SOURCE，均不推进水位）。出现即
-                        # 说明事实行被越过应用删除，ledger 却仍称完整；仅告警，
-                        # 不据此回退水位（回退需 ledger 缺口证据，见上）。
-                        logger.warning(
-                            "对账发现水位晚于事实表（仅告警，不回退水位） "
-                            "dataset=%s watermark=%s max_fact_date=%s",
-                            dataset.value, watermark, max_fact,
-                        )
+                HistorySyncStateRepository(session).finish_error(
+                    dataset, error_code=error_code, error=error, status=status
+                )
                 session.commit()
 
-    def reconcile_dataset(self, dataset: DatasetName | str) -> date | None:
-        """内部诊断能力（§25）：单数据集 reconcile，返回回退后水位（不落库）。"""
-        today = now_beijing().date()
-        open_days = self._strict_open_days(today)
-        with self.session_factory() as session:
-            state = HistorySyncStateRepository(session).get(dataset)
-            watermark = state.latest_complete_trade_date if state else None
-            if watermark is None:
-                return None
-            expected_days = [d for d in open_days if d <= watermark]
-            completed = HistoryDayStatusRepository(session).completed_dates(
-                dataset, start=self.config.history.start_date, end=watermark
-            )
-        return HistorySyncPlanner.reconcile_watermark(
-            watermark=watermark, expected_days=expected_days, completed_dates=completed
-        )
+    # ---- 日级数据集：个股串行循环（design D7）----
 
-    # ---- 日级数据集主循环（§21~§29）----
-
-    def _sync_day_level_dataset(
+    def _sync_stock_dataset(
         self,
         run_id: str,
         dataset: DatasetName,
         *,
         cancellation_event: threading.Event | None,
     ) -> str:
-        """返回该数据集本轮结果：SUCCESS / FAILED / NOOP。"""
+        """个股模式数据集主循环；返回 SUCCESS / NOOP / CANCELLED。
+
+        流程（design D7）：
+          1. 解析 target（AvailabilityPolicy）
+          2. 批量补建缺失 stock_sync_state 行（一次写事务）
+          3. 取 universe（watermark ASC NULLS FIRST + ts_code ASC 排序）
+          4. 逐股：planner 算有效区间 → 无工作 skipped；有工作交 Executor
+          5. 单股失败 continue 下一股；系统级异常上抛
+
+        run_dataset 语义（design D10）：
+          - 旧水位列（start_watermark/target_trade_date/end_watermark 等）
+            冻结置 NULL，新列（processed/success/failed/skipped）承载统计；
+          - status: 有工作 → SUCCESS（允许存在个股 failed）；
+            无工作 → NOOP。
+        """
         now = now_beijing()
         open_days = self._strict_open_days(now.date())
         target = self.availability.latest_expected_trade_date(
             dataset, now=now, strict_open_days=open_days
         )
 
-        # ensure 必须与本次提交一起落库：否则新行随会话关闭回滚，后续
-        # complete_day/begin_attempt 会因 state 行不存在而失败（首次同步路径）。
+        # 取主档全量快照（含生命周期）——一次查询，供全数据集复用
+        with self.session_factory() as session:
+            instruments = HistoryMasterRepository(session).list_cn_stock_instruments()
+            lifecycle_map = HistoryMasterRepository(session).get_cn_stock_lifecycle_map()
+
+        # 构造 universe 入口列表（instrument_id, ts_code, list_date, delist_date）
+        universe_entries: list[tuple[str, str, date | None, date | None]] = []
+        for inst in instruments:
+            lc = lifecycle_map.get(inst.instrument_id)
+            if lc is None:
+                # 主档中没有 cn_stock_basic 记录的证券（理论上不应发生，
+                # 防御性跳过）
+                continue
+            ts_code, list_date, delist_date = lc
+            universe_entries.append((inst.instrument_id, ts_code, list_date, delist_date))
+
+        # 批量补建缺失 stock_sync_state 行（design D3/D7：一次写事务）
+        self._bulk_ensure_stock_states(
+            dataset,
+            [(iid, ts_code) for iid, ts_code, _, _ in universe_entries],
+        )
+
+        # 取排序后的 universe（落后最久优先：watermark ASC NULLS FIRST + ts_code ASC）
+        with self.session_factory() as session:
+            stock_states = StockSyncStateRepository(session).universe(dataset)
+
+        # 确保 history_sync_state 行存在（数据集级运营字段用）
         with write_coordinator.write():
             with self.session_factory() as session:
                 state_repo = HistorySyncStateRepository(session)
-                state = state_repo.ensure(
+                state_repo.ensure(
                     dataset,
                     dataset_kind=DatasetKind.DAILY_CONTIGUOUS,
                     history_start_date=self.config.history.start_date,
                 )
-                watermark = state.latest_complete_trade_date
-                pending = (
-                    []
-                    if target is None
-                    else HistorySyncPlanner.pending_dates(
-                        watermark=watermark,
-                        target=target,
-                        history_start_date=self.config.history.start_date,
-                        open_days=open_days,
-                    )
-                )
                 if target is not None:
                     state_repo.set_expected(dataset, target)
-                    if pending:
-                        state_repo.mark_started(dataset, status=DatasetStatus.SYNCING)
-                    else:
-                        # 无事可做即已追平：不得停在非终态 CHECKING（否则页面
-                        # 长期显示"检查中"，且只能靠下次启动恢复才转正）。
-                        state_repo.finish_success(
-                            dataset, status=DatasetStatus.CAUGHT_UP
-                        )
                 session.commit()
 
-        if target is None or not pending:
-            self._finish_run_dataset(
-                run_id, dataset, status=RunDatasetStatus.NOOP,
-                start_watermark=watermark, target=target, end_watermark=watermark,
-            )
+        # 重置进度
+        self.progress.reset()
+        self.progress.current_dataset = dataset.value
+
+        if target is None:
+            # 目标不可用：整个数据集无事可做（全部 skipped）
+            skipped = len(stock_states)
+            self.progress.skipped = skipped
+            self._flush_skipped_count(run_id, dataset, skipped)
+            self._finish_stock_run_dataset(run_id, dataset, status=RunDatasetStatus.NOOP)
             return "NOOP"
 
-        self._start_run_dataset(run_id, dataset, start_watermark=watermark, target=target)
+        # 启动 run_dataset（旧水位列冻结置 NULL）
+        self._start_stock_run_dataset(run_id, dataset, target)
 
-        with self.session_factory() as session:
-            instruments = HistoryMasterRepository(session).list_cn_stock_instruments()
+        # 构造 instrument_id -> Instrument 映射，便于按 universe 顺序查找
+        inst_by_id = {inst.instrument_id: inst for inst in instruments}
 
-        for trade_date in pending:
+        has_work = False
+        any_failed = False
+
+        for stock_state in stock_states:
+            inst = inst_by_id.get(stock_state.instrument_id)
+            if inst is None:
+                # universe 中存在但主档无对应 instrument（理论上不应发生）
+                continue
             if cancellation_event is not None and cancellation_event.is_set():
                 logger.info(
-                    "%s 收到停机信号，已完成的交易日进度已保存，本轮不再推进 "
-                    "run_id=%s watermark=%s",
-                    dataset.value, run_id, self._current_watermark(dataset),
+                    "%s 收到停机信号，已完成进度已保存，本轮不再推进 "
+                    "run_id=%s processed=%d succeeded=%d failed=%d skipped=%d",
+                    dataset.value, run_id,
+                    self.progress.processed, self.progress.succeeded,
+                    self.progress.failed, self.progress.skipped,
                 )
-                self._finish_run_dataset(
-                    run_id, dataset, status=RunDatasetStatus.NOOP,
-                    start_watermark=watermark, target=target,
-                    end_watermark=self._current_watermark(dataset),
-                )
+                # 数据集级状态派生：有失败 → LAGGING，否则 → CAUGHT_UP
+                self._flush_skipped_count(run_id, dataset, self.progress.skipped)
+                self._refresh_dataset_state(dataset, has_work=has_work, any_failed=any_failed)
+                self._finish_stock_run_dataset(run_id, dataset, status=RunDatasetStatus.NOOP)
                 return "CANCELLED"
 
-            outcome = self._sync_single_day(
-                run_id, dataset, trade_date, instruments, cancellation_event=cancellation_event
+            lc = lifecycle_map.get(inst.instrument_id)
+            if lc is None:
+                continue
+            ts_code, list_date, delist_date = lc
+
+            watermark = stock_state.watermark_date
+
+            # 计算有效区间
+            sync_range = HistorySyncPlanner.stock_effective_range(
+                watermark=watermark,
+                target=target,
+                history_start_date=self.config.history.start_date,
+                list_date=list_date,
+                delist_date=delist_date,
+                open_days=open_days,
             )
-            if outcome == "WAITING_SOURCE":
-                # 非错误：本轮不推进，下次任务从该日继续（§34.2），不算数据集失败
-                self._finish_run_dataset(
-                    run_id, dataset, status=RunDatasetStatus.NOOP,
-                    start_watermark=watermark, target=target,
-                    end_watermark=self._current_watermark(dataset),
-                )
-                return "NOOP"
-            if outcome == "CANCELLED":
-                self._finish_run_dataset(
-                    run_id, dataset, status=RunDatasetStatus.NOOP,
-                    start_watermark=watermark, target=target,
-                    end_watermark=self._current_watermark(dataset),
-                )
-                return "CANCELLED"
-            if outcome != "SUCCESS":
-                self._finish_run_dataset(
-                    run_id, dataset, status=RunDatasetStatus.FAILED,
-                    start_watermark=watermark, target=target,
-                    end_watermark=self._current_watermark(dataset),
-                    failed_trade_date=trade_date,
-                )
-                return "FAILED"
 
-        with write_coordinator.write():
-            with self.session_factory() as session:
-                HistorySyncStateRepository(session).finish_success(
-                    dataset, status=DatasetStatus.CAUGHT_UP
-                )
-                session.commit()
+            if sync_range.is_empty:
+                # 无工作：skipped 计数（不建 task、不发请求）
+                self.progress.record_skip()
+                continue
 
-        self._finish_run_dataset(
-            run_id, dataset, status=RunDatasetStatus.SUCCESS,
-            start_watermark=watermark, target=target,
-            end_watermark=self._current_watermark(dataset),
+            has_work = True
+            self.progress.current_ts_code = ts_code
+
+            try:
+                outcome = self.stock_executor.execute(
+                    run_id=run_id,
+                    dataset=dataset,
+                    instrument=inst,
+                    ts_code=ts_code,
+                    start_date=sync_range.start_date,
+                    end_date=sync_range.end_date,
+                    list_date=list_date,
+                    delist_date=delist_date,
+                    cancellation_event=cancellation_event,
+                )
+                self.progress.record_outcome(outcome)
+                if outcome.status == "failed":
+                    any_failed = True
+            except Exception as exc:
+                # 未预期异常（如数据库崩溃、框架级错误）：上抛终止数据集
+                # 区分 SQLAlchemyError 等系统级异常
+                logger.exception(
+                    "个股同步出现系统级异常，终止该数据集 run_id=%s dataset=%s ts_code=%s",
+                    run_id, dataset.value, ts_code,
+                )
+                raise
+
+        if not has_work:
+            # 全部股票无工作 → NOOP
+            self._flush_skipped_count(run_id, dataset, self.progress.skipped)
+            self._refresh_dataset_state(dataset, has_work=False, any_failed=False)
+            self._finish_stock_run_dataset(run_id, dataset, status=RunDatasetStatus.NOOP)
+            return "NOOP"
+
+        # 有工作 → SUCCESS（允许存在个股 failed，Run 语义 D10）
+        self._flush_skipped_count(run_id, dataset, self.progress.skipped)
+        self._refresh_dataset_state(dataset, has_work=True, any_failed=any_failed)
+        self._finish_stock_run_dataset(
+            run_id, dataset,
+            status=RunDatasetStatus.SUCCESS,
+            has_failures=any_failed,
         )
         return "SUCCESS"
 
-    def _current_watermark(self, dataset: DatasetName) -> date | None:
-        with self.session_factory() as session:
-            state = HistorySyncStateRepository(session).get(dataset)
-            return state.latest_complete_trade_date if state else None
-
-    def _start_run_dataset(
-        self, run_id: str, dataset: DatasetName, *, start_watermark: date | None, target: date
+    def _bulk_ensure_stock_states(
+        self,
+        dataset: DatasetName,
+        entries: list[tuple[str, str | None]],
     ) -> None:
+        """批量补建缺失 stock_sync_state 行（design D7：一次写事务）。"""
+        with write_coordinator.write():
+            with self.session_factory() as session:
+                StockSyncStateRepository(session).bulk_ensure_missing(dataset, entries)
+                session.commit()
+
+    def _start_stock_run_dataset(
+        self, run_id: str, dataset: DatasetName, target: date | None
+    ) -> None:
+        """启动 run_dataset（个股模式：旧水位列冻结置 NULL）。"""
         with write_coordinator.write():
             with self.session_factory() as session:
                 HistorySyncRunDatasetRepository(session).start(
-                    run_id, dataset, start_watermark=start_watermark,
-                    target_trade_date=target, started_at=now_beijing(),
+                    run_id, dataset,
+                    start_watermark=None,  # 冻结兼容列
+                    target_trade_date=None,  # 冻结兼容列
+                    started_at=now_beijing(),
                 )
                 session.commit()
 
-    def _finish_run_dataset(
+    def _finish_stock_run_dataset(
         self,
         run_id: str,
         dataset: DatasetName,
         *,
         status: RunDatasetStatus,
-        start_watermark: date | None,
-        target: date,
-        end_watermark: date | None,
-        failed_trade_date: date | None = None,
+        has_failures: bool = False,
     ) -> None:
+        """结束 run_dataset（个股模式：旧水位列冻结，last_error 取自数据集级 state）。"""
         last_error_code = last_error = None
         if status == RunDatasetStatus.FAILED:
             with self.session_factory() as session:
@@ -904,383 +943,69 @@ class HistorySyncService:
                 run_repo = HistorySyncRunDatasetRepository(session)
                 if run_repo.get(run_id, dataset) is None:
                     run_repo.start(
-                        run_id, dataset, start_watermark=start_watermark,
-                        target_trade_date=target, started_at=now_beijing(),
+                        run_id, dataset, start_watermark=None,
+                        target_trade_date=None, started_at=now_beijing(),
                     )
                 run_repo.finish(
                     run_id, dataset, status=status, finished_at=now_beijing(),
-                    end_watermark=end_watermark, failed_trade_date=failed_trade_date,
-                    last_error_code=last_error_code, last_error=last_error,
+                    end_watermark=None,  # 冻结兼容列
+                    failed_trade_date=None,  # 冻结兼容列
+                    last_error_code=last_error_code,
+                    last_error=last_error,
                 )
                 session.commit()
 
-    # ---- 单日：抓取 + 校验 + 重试编排 + 原子提交（§22/§29/§34）----
-
-    def _sync_single_day(
-        self,
-        run_id: str,
-        dataset: DatasetName,
-        trade_date: date,
-        instruments: list | None,
-        *,
-        cancellation_event: threading.Event | None,
-    ) -> str:
-        """返回 SUCCESS / FAILED / WAITING_SOURCE / CANCELLED。
-
-        单 dataset×单交易日最多 ``max_attempts`` 次；退避见 RetryPolicy。
-        配置类错误快速失败（§29.3）。空结果为 0 行时：接近发布时间按
-        WAITING_SOURCE（本轮不推进、不算失败，§34.2），否则按 EMPTY_RESULT
-        进入重试直至失败（§34.1）。停机信号在每次重试 sleep 前后检查
-        （§49），命中则返回 CANCELLED（当前事务已完成）。
-        """
-        known_ids = (
-            {inst.instrument_id for inst in instruments} if instruments else None
-        )
-        remap_attempted = False
-        max_attempts = self.retry_policy.max_attempts
-        for attempt in range(1, max_attempts + 1):
-            self._mark_attempt_started(run_id, dataset, trade_date, attempt)
-            started = time.monotonic()
-            try:
-                batch, request_count = self._fetch_day(dataset, trade_date, instruments)
-            except SYNC_ERRORS as exc:
-                # Provider 边界的 UNKNOWN_INSTRUMENT（normalize 阶段 ts_code
-                # 无法映射主档）与校验层的是同一个错误码，必须走同一条 §35.1
-                # 恢复路径；否则它会作为"配置类错误"在第 1 次尝试就终态失败。
-                if (
-                    _error_code_of(exc) == "UNKNOWN_INSTRUMENT"
-                    and not remap_attempted
-                ):
-                    remap_attempted = True
-                    logger.warning(
-                        "出现未知证券（请求阶段），刷新 stock_basic 后重试 "
-                        "dataset=%s trade_date=%s run_id=%s: %s",
-                        dataset.value, trade_date, run_id, _safe_error_text(exc),
-                    )
-                    if self._refresh_stock_basic(run_id, context="未知证券恢复"):
-                        instruments, known_ids = self._reload_instruments(
-                            instruments
-                        )
-                        if attempt < max_attempts:
-                            continue
-                        # 已是最后一次尝试：主档刷新成功但已无余量重试，必须
-                        # 落到下面的终态失败分支。否则循环自然结束，state 停在
-                        # RETRYING/SYNCING 且无错误码（§35.1 要求记录未知证券）。
-                request_count = 1
-                outcome = self._handle_attempt_failure(
-                    run_id, dataset, trade_date, attempt,
-                    error_code=_error_code_of(exc), error=_safe_error_text(exc),
-                    requests=request_count,
-                    elapsed_ms=_elapsed_ms(started),
-                    cancellation_event=cancellation_event,
-                )
-                if outcome is not None:
-                    return outcome
-                continue
-
-            try:
-                is_waiting = (
-                    len(batch.records) == 0
-                    and self._is_near_publish_time(dataset, trade_date)
-                )
-                validate_batch(
-                    dataset, batch, trade_date=trade_date,
-                    known_instrument_ids=known_ids,
-                    allow_empty=is_waiting,
-                )
-            except HistoryValidationError as exc:
-                if (
-                    exc.error_code == "UNKNOWN_INSTRUMENT"
-                    and not remap_attempted
-                ):
-                    # §35.1：先刷新一次 stock_basic 并重新映射，仍未知才判定
-                    # 失败（该交易日不推进水位）。只做一次，避免与重试叠加。
-                    remap_attempted = True
-                    logger.warning(
-                        "出现未知证券，刷新 stock_basic 后重试 dataset=%s "
-                        "trade_date=%s run_id=%s: %s",
-                        dataset.value, trade_date, run_id, _safe_error_text(exc),
-                    )
-                    if self._refresh_stock_basic(run_id, context="未知证券恢复"):
-                        instruments, known_ids = self._reload_instruments(
-                            instruments
-                        )
-                        # 同请求阶段分支：最后一次尝试不再 continue，落到终态失败
-                        if attempt < max_attempts:
-                            continue
-                outcome = self._handle_attempt_failure(
-                    run_id, dataset, trade_date, attempt,
-                    error_code=_error_code_of(exc), error=_safe_error_text(exc),
-                    requests=request_count,
-                    elapsed_ms=_elapsed_ms(started),
-                    cancellation_event=cancellation_event,
-                )
-                if outcome is not None:
-                    return outcome
-                continue
-
-            elapsed_ms = _elapsed_ms(started)
-            if is_waiting:
-                logger.info(
-                    "数据集等待数据源 dataset=%s trade_date=%s attempt=%d "
-                    "row_count=0 elapsed_ms=%d run_id=%s",
-                    dataset.value, trade_date, attempt, elapsed_ms, run_id,
-                )
-                self._set_state_error(
-                    dataset, error_code="WAITING_SOURCE",
-                    error=f"{trade_date} 接近发布时间空结果，等待数据源",
-                    status=DatasetStatus.WAITING_SOURCE,
-                )
-                return "WAITING_SOURCE"
-
-            try:
-                self._commit_single_day(
-                    run_id, dataset, trade_date, batch,
-                    attempt=attempt, requests=request_count,
-                )
-            except SQLAlchemyError as exc:
-                # §8：DB 事务失败可有限重试，但以"单日 max_attempts 次"为上层
-                # 边界（不与 WriteCoordinator 自带重试嵌套成无界）。事务已整体
-                # 回滚，旧事实/水位/ledger 均未推进，下一轮从头重放。
-                outcome = self._handle_attempt_failure(
-                    run_id, dataset, trade_date, attempt,
-                    error_code="DATABASE_ERROR", error=_safe_error_text(exc),
-                    requests=0,
-                    elapsed_ms=_elapsed_ms(started),
-                    cancellation_event=cancellation_event,
-                )
-                if outcome is not None:
-                    return outcome
-                continue
-            logger.info(
-                "数据集单日完成 dataset=%s trade_date=%s attempt=%d row_count=%d "
-                "elapsed_ms=%d run_id=%s",
-                dataset.value, trade_date, attempt, len(batch.records),
-                _elapsed_ms(started), run_id,
-            )
-            return "SUCCESS"
-
-        return "FAILED"
-
-    def _mark_attempt_started(
-        self, run_id: str, dataset: DatasetName, trade_date: date, attempt: int
-    ) -> None:
-        """记录当前日与尝试次数（§29）；attempt>1 时状态为 RETRYING。
-
-        ``retry_count`` 计"首次之外的尝试次数"，在第 2 次及以后的尝试**开始时**
-        累加：这样第 3 次才成功的那次重试同样被计入（若只在失败时累加，成功
-        的那次重试会漏计）。请求数仍在各次尝试结束时按实际发出次数累加。
-        """
-        with write_coordinator.write():
-            with self.session_factory() as session:
-                HistorySyncStateRepository(session).begin_attempt(
-                    dataset, trade_date, attempt,
-                    status=DatasetStatus.RETRYING if attempt > 1 else DatasetStatus.SYNCING,
-                )
-                if attempt > 1:
-                    run_repo = HistorySyncRunDatasetRepository(session)
-                    if run_repo.get(run_id, dataset) is not None:
-                        run_repo.add_counts(run_id, dataset, retries=1)
-                session.commit()
-
-    def _handle_attempt_failure(
-        self,
-        run_id: str,
-        dataset: DatasetName,
-        trade_date: date,
-        attempt: int,
-        *,
-        error_code: str,
-        error: str,
-        requests: int,
-        elapsed_ms: int,
-        cancellation_event: threading.Event | None,
-    ) -> str | None:
-        """一次尝试失败的统一处理；返回终态（"FAILED"/"CANCELLED"）或 None
-        表示可继续重试（调用方 sleep 后进入下一轮）。"""
-        self._record_attempt_counts(run_id, dataset, requests=requests)
-        logger.warning(
-            "数据集单日尝试失败 dataset=%s trade_date=%s attempt=%d "
-            "error_code=%s elapsed_ms=%d run_id=%s: %s",
-            dataset.value, trade_date, attempt, error_code, elapsed_ms, run_id, error,
-        )
-        is_terminal = is_config_error(error_code) or attempt >= self.retry_policy.max_attempts
-        if is_terminal:
-            logger.error(
-                "数据集单日判定失败 dataset=%s trade_date=%s attempt=%d "
-                "error_code=%s reason=%s run_id=%s（停止该数据集本轮推进，"
-                "水位保持在上一成功交易日）",
-                dataset.value, trade_date, attempt, error_code,
-                "配置类错误" if is_config_error(error_code) else "已达最大重试次数",
-                run_id,
-            )
-            self._set_state_error(
-                dataset, error_code=error_code, error=error, status=DatasetStatus.FAILED,
-            )
-            return "FAILED"
-
-        if cancellation_event is not None and cancellation_event.is_set():
-            return "CANCELLED"
-        self.retry_policy.sleep_before_retry(attempt)
-        if cancellation_event is not None and cancellation_event.is_set():
-            return "CANCELLED"
-        return None
-
-    def _set_state_error(
-        self, dataset: DatasetName, *, error_code: str, error: str, status: DatasetStatus
-    ) -> None:
-        with write_coordinator.write():
-            with self.session_factory() as session:
-                HistorySyncStateRepository(session).finish_error(
-                    dataset, error_code=error_code, error=error, status=status
-                )
-                session.commit()
-
-    def _record_attempt_counts(
-        self, run_id: str, dataset: DatasetName, *, requests: int, retries: int = 0
-    ) -> None:
-        """累计请求/重试次数（§20 的 request_count / retry_count）。
-
-        数据集未在本轮开始时已 start（或本轮 run_dataset 尚未建立）时忽略。
-        """
+    def _flush_skipped_count(self, run_id: str, dataset: DatasetName, count: int) -> None:
+        """数据集结束时一次性写入 skipped 计数（避免每股一个小事务）。"""
+        if count <= 0:
+            return
         with write_coordinator.write():
             with self.session_factory() as session:
                 run_repo = HistorySyncRunDatasetRepository(session)
                 if run_repo.get(run_id, dataset) is not None:
-                    run_repo.add_counts(run_id, dataset, requests=requests, retries=retries)
+                    run_repo.add_counts(run_id, dataset, skipped=count)
                 session.commit()
 
-    def _is_near_publish_time(self, dataset: DatasetName, trade_date: date) -> bool:
-        """接近发布时间的判定（§34.1/§34.2）：仅当该交易日就是当前北京日期
-        时才可能是"数据源尚未生成"；明显早于当前日期的空结果一律按
-        EMPTY_RESULT 处理。"""
-        return trade_date == now_beijing().date()
-
-    def _fetch_day(
-        self, dataset: DatasetName, trade_date: date, instruments: list
-    ) -> tuple[ProviderBatch, int]:
-        """主路径请求；命中截断风险时走 fallback（§33.2）。
-
-        返回 ``(batch, request_count)``；fallback 会额外计一次请求。
-        """
-        primary_method, fallback_method = _FETCH_METHODS[dataset]
-        batch: ProviderBatch = getattr(self.providers, primary_method)(
-            trade_date, instruments
-        )
-        if not batch.truncation_risk:
-            return batch, 1
-        logger.warning(
-            "数据集命中截断风险，回退 fallback 请求 dataset=%s trade_date=%s",
-            dataset.value, trade_date,
-        )
-        if dataset is DatasetName.DAILY_BASIC:
-            fallback_batch = self._daily_basic_fallback(trade_date, instruments, batch)
-        else:
-            fallback_batch = getattr(self.providers, fallback_method)(
-                trade_date, instruments
-            )
-        if fallback_batch.truncation_risk:
-            raise TruncationRiskError(
-                f"{dataset.value} {trade_date} 截断风险，fallback 请求仍不完整"
-            )
-        return fallback_batch, 2
-
-    def _daily_basic_fallback(
-        self, trade_date: date, instruments: list, primary: ProviderBatch
-    ) -> ProviderBatch:
-        """daily_basic 截断补齐：只逐只查询 ``候选集 - 已返回代码``（§33.2）。
-
-        daily_basic 不支持多代码参数（逗号分隔静默返回空，已在线验证），故
-        不复用其他接口的 multi-code fallback。候选集按当日上市/退市状态从
-        ``cn_stock_basic`` 生成；每个缺失证券都必须得到"有记录"或"明确空
-        结果"——任一请求异常直接向上抛（不吞、不跳过），由重试编排判定该
-        交易日不 COMPLETE、水位不推进。
-
-        候选集与主档 instruments 不一致（如主档尚缺该证券）会让
-        Provider 抛 UNKNOWN_INSTRUMENT，同样走"该日不 COMPLETE"。
-        """
-        with self.session_factory() as session:
-            candidates = HistoryMasterRepository(session).list_ts_codes_tradable_on(
-                trade_date
-            )
-        returned = {record.ts_code for record in primary.records}
-        missing = sorted(set(candidates) - returned)
-        if not missing:
-            logger.info(
-                "daily_basic 截断但候选集已全部返回，无需补齐 trade_date=%s candidates=%d",
-                trade_date, len(candidates),
-            )
-        else:
-            logger.warning(
-                "daily_basic 截断补齐：逐只查询缺失证券 trade_date=%s 候选=%d 已返回=%d 缺失=%d",
-                trade_date, len(candidates), len(returned), len(missing),
-            )
-        supplemental: ProviderBatch = self.providers.get_daily_basic_for_instruments(
-            trade_date, instruments, missing_ts_codes=missing
-        )
-        merged = list(primary.records) + list(supplemental.records)
-        # 复检：单证券单日至多一行，逐只查询不存在再被上限截断；候选集内每个
-        # 缺失证券都已得到"有记录"或"明确空结果"（空结果同样合法——停牌等
-        # 自然缺失），因此合并结果不再是"可能被截断"的批次。
-        return ProviderBatch(
-            records=merged,
-            source=primary.source,
-            raw_row_count=primary.raw_row_count + supplemental.raw_row_count,
-            truncation_risk=False,
-        )
-
-    def _commit_single_day(
-        self,
-        run_id: str,
-        dataset: DatasetName,
-        trade_date: date,
-        batch: ProviderBatch,
-        *,
-        attempt: int,
-        requests: int = 1,
+    def _refresh_dataset_state(
+        self, dataset: DatasetName, *, has_work: bool, any_failed: bool
     ) -> None:
-        """单日原子提交（§22）：old_count -> DELETE -> INSERT -> day_status ->
-        state（水位/record_count/min-max）-> run_dataset，单事务，失败整体
-        回滚。请求与校验已在锁外完成。
+        """数据集段结束时刷新 history_sync_state 运营字段。
 
-        ``record_count`` 增量口径为 ``new_count - old_count``（§22 步骤 10、
-        §45）：整日替换语义下重复运行同一日期不得让计数翻倍。
+        个股模式下状态派生（design D10 / spec"同步执行记录"）：
+          - 有落后股票 → LAGGING
+          - 全部追平 → CAUGHT_UP
+          - 本轮系统级失败 → FAILED（由调用方 _record_unexpected_failure 处理）
+        last_success_at / last_error_code / last_error 在段结束时刷新。
         """
-        fetched_at = now_beijing()
         with write_coordinator.write():
             with self.session_factory() as session:
-                fact_repo = HistoryFactRepository(session)
-                old_count = fact_repo.count_for_date(dataset, trade_date)
-                fact_repo.delete_for_date(dataset, trade_date)
-                new_count = fact_repo.insert_records(
-                    dataset, batch.records, source=self.providers.source, fetched_at=fetched_at,
-                )
-
-                HistoryDayStatusRepository(session).upsert_complete(
-                    dataset, trade_date, row_count=new_count, run_id=run_id,
-                    fetched_at=fetched_at,
-                )
-
                 state_repo = HistorySyncStateRepository(session)
-                state_repo.complete_day(
-                    dataset, trade_date, rows_delta=new_count - old_count,
-                    status=DatasetStatus.SYNCING,
-                )
+                state = state_repo.get(dataset)
+                if state is None:
+                    return
+                if any_failed:
+                    status = DatasetStatus.LAGGING
+                elif has_work:
+                    # 本轮有工作且全部成功：是否追平取决于水位 vs target
+                    # 简化：有工作 + 无失败 → CAUGHT_UP（严格来说应再检查，
+                    # 但个股模式下本轮处理过的股票水位已推进到 eff_end，
+                    # 若全部成功且 target 是最新，则整体 CAUGHT_UP）
+                    status = DatasetStatus.CAUGHT_UP
+                else:
+                    # 无工作：保持原状态或置 CAUGHT_UP
+                    status = DatasetStatus.CAUGHT_UP
 
-                run_repo = HistorySyncRunDatasetRepository(session)
-                if run_repo.get(run_id, dataset) is not None:
-                    run_repo.add_counts(
-                        run_id, dataset, dates=1, rows=new_count, requests=requests
-                    )
-
+                if any_failed:
+                    # 有个股失败：数据集级状态置 LAGGING（不设 last_error——
+                    # 个股失败详情在 stock_sync_state，数据集级只反映整体
+                    # 落后状态）。last_success_at 不刷新（本轮有失败）。
+                    state.status = status.value
+                    state.updated_at = now_beijing()
+                else:
+                    state_repo.finish_success(dataset, status=status)
                 session.commit()
-        logger.debug(
-            "单日提交 run_id=%s dataset=%s trade_date=%s attempt=%d "
-            "row_count=%d old_count=%d",
-            run_id, dataset.value, trade_date, attempt, new_count, old_count,
-        )
 
-    # ---- run 收尾（§19：SUCCESS/PARTIAL/FAILED/NOOP）----
+    # ---- run 收尾（design D10：SUCCESS/FAILED/INTERRUPTED/NOOP）----
 
     def _finalize_run(
         self,
@@ -1296,7 +1021,7 @@ class HistorySyncService:
         elif aborted and not dataset_outcomes:
             # 对账等前置阶段失败后中止：没有数据集结果≠无事可做，不得记 NOOP
             status = RunStatus.FAILED
-            error_summary = "水位对账失败，本轮未推进日级数据集"
+            error_summary = "前置阶段失败，本轮未推进日级数据集"
         else:
             outcomes = set(dataset_outcomes.values())
             if "CANCELLED" in outcomes:
@@ -1306,13 +1031,15 @@ class HistorySyncService:
             elif outcomes <= {"NOOP"}:
                 status = RunStatus.NOOP
                 error_summary = None
-            elif "FAILED" in outcomes and "SUCCESS" not in outcomes:
+            elif "FAILED" in outcomes:
+                # D10：FAILED 仅表示系统级错误。只要有数据集系统级失败，
+                # Run 就标 FAILED（个股 task failed 不影响数据集级 outcome，
+                # 数据集级 FAILED 仅产生于系统级异常路径）。
+                # PARTIAL 枚举保留但不再产生（D10 明确）。
                 status = RunStatus.FAILED
                 error_summary = self._error_summary(dataset_outcomes)
-            elif "FAILED" in outcomes:
-                status = RunStatus.PARTIAL
-                error_summary = self._error_summary(dataset_outcomes)
             else:
+                # 全为 SUCCESS/NOOP：SUCCESS（允许存在个股 task failed，D10）
                 status = RunStatus.SUCCESS
                 error_summary = None
 
@@ -1374,3 +1101,6 @@ class HistorySyncService:
         failed = [str(ds) for ds, outcome in dataset_outcomes.items() if outcome == "FAILED"]
         return f"失败数据集: {', '.join(failed)}" if failed else "部分数据集未完成"
 
+
+# 底部 import：避免循环依赖（timedelta 仅 _namechange_window_refresh 使用）
+from datetime import timedelta  # noqa: E402

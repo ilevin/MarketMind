@@ -268,6 +268,25 @@ class HistoryMasterRepository:
             )
         )
 
+    def get_cn_stock_lifecycle_map(self) -> dict[str, tuple[str, date | None, date | None]]:
+        """instrument_id -> (ts_code, list_date, delist_date) 映射（per-stock-history-sync）。
+
+        一次性查询全部 A 股的生命周期信息，Service 用于个股有效区间计算
+        与 executor 的 lifecycle 校验。含退市股（历史数据同步需要）。
+        """
+        rows = self.session.execute(
+            select(
+                CnStockBasic.instrument_id,
+                CnStockBasic.ts_code,
+                CnStockBasic.list_date,
+                CnStockBasic.delist_date,
+            )
+        ).all()
+        return {
+            inst_id: (ts_code, list_date, delist_date)
+            for inst_id, ts_code, list_date, delist_date in rows
+        }
+
     def list_ts_codes_tradable_on(self, trade_date: date) -> list[str]:
         """在该交易日可能产生行情的 ts_code 集合（含退市，按 ts_code 排序）。
 

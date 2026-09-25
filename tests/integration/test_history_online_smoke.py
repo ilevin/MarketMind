@@ -215,3 +215,128 @@ def test_namechange_known_stock_key_uniqueness(transport):
         "同一 (ts_code, name, start_date) 存在多条不同事件——"
         "需按 design.md 预案把规范键扩展为含 end_date/ann_date 的五字段"
     )
+
+
+# ---- 个股区间拉取（per-stock-history-sync tasks 10.1；样本与
+#       scripts/spike/verify_stock_range_fetch_online.py 一致） ----
+
+RANGE_NORMAL = "000001.SZ"  # 平安银行：1991 上市，16 年同步区间稳定存在
+RANGE_LEGACY = "000022.SZ"  # 深赤湾A → 2018-12-26 变更为 001872.SZ（招商港口）
+RANGE_START = date(2010, 1, 4)  # v0.3.0 起历史数据起点（严格交易日）
+RANGE_END = date(2026, 1, 1)
+
+
+@pytest.fixture(scope="module")
+def delisted_sample(transport) -> tuple[str, date]:
+    """在线选一只退市样本股（SSE、delist_date 在 2015~2025 之间）。
+
+    与 spike 脚本同一选样逻辑；选不到时 skip（不影响其余冒烟）。
+    """
+    df = transport.call(
+        "stock_basic",
+        exchange="SSE",
+        list_status="D",
+        fields=",".join(STOCK_BASIC_FIELDS),
+    )
+    rows = [
+        (str(r["ts_code"]), _parse_yyyymmdd(str(r["delist_date"])))
+        for r in df.to_dict("records")
+        if r.get("delist_date") and "2015" <= str(r["delist_date"])[:4] <= "2025"
+    ]
+    if not rows:
+        pytest.skip("SSE 退市样本（2015~2025 delist_date）不可得")
+    return max(rows, key=lambda pair: pair[1])
+
+
+def _range_call(transport, endpoint, ts_code, start, end):
+    return transport.call(
+        endpoint,
+        ts_code=ts_code,
+        start_date=start.strftime("%Y%m%d"),
+        end_date=end.strftime("%Y%m%d"),
+        fields=",".join(
+            {
+                "daily": DAILY_FIELDS,
+                "adj_factor": ADJ_FACTOR_FIELDS,
+                "daily_basic": DAILY_BASIC_FIELDS,
+                "moneyflow": MONEYFLOW_FIELDS,
+            }[endpoint]
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["daily", "adj_factor", "daily_basic", "moneyflow"]
+)
+def test_stock_range_full_history_normal(transport, endpoint):
+    """正常股 16 年全区间：无截断、日期落区间内、ts_code 单一。
+
+    行数上限语义（OQ2）：16 年约 3900 个交易日，单次区间请求应显著
+    低于 6000 上限——若逼近上限说明上游区间行为与设计假设不符。
+    """
+    df = _range_call(transport, endpoint, RANGE_NORMAL, RANGE_START, RANGE_END)
+    rows = df.to_dict("records")
+    assert len(rows) > 0, f"{endpoint} 16 年区间不应为空"
+    assert len(rows) < DAILY_ROW_CAP, (
+        f"{endpoint} 16 年区间 {len(rows)} 行逼近上限 {DAILY_ROW_CAP}"
+        "——个股区间拉取存在截断风险"
+    )
+    dates = [_parse_yyyymmdd(str(r["trade_date"])) for r in rows]
+    assert all(RANGE_START <= d <= RANGE_END for d in dates), "区间外日期"
+    assert {str(r["ts_code"]) for r in rows} == {RANGE_NORMAL}, "正常股应单一 ts_code"
+    print(
+        f"[观察] {endpoint} {RANGE_NORMAL} 16 年区间 {len(rows)} 行"
+        f"（距 {DAILY_ROW_CAP} 上限 {DAILY_ROW_CAP - len(rows)}）、"
+        f"日期 {min(dates)}..{max(dates)}、"
+        f"行序{'升' if dates == sorted(dates) else '非升序'}"
+    )
+
+
+def test_stock_range_legacy_code_alias(transport):
+    """旧代码股区间：返回旧码/新码/混合均可，但别名组内应一致。"""
+    df = _range_call(transport, "daily", RANGE_LEGACY, RANGE_START, RANGE_END)
+    rows = df.to_dict("records")
+    assert len(rows) > 0
+    codes = {str(r["ts_code"]) for r in rows}
+    assert codes <= {RANGE_LEGACY, "001872.SZ"}, (
+        f"旧代码股区间返回了组外代码: {codes}"
+    )
+    dates = [_parse_yyyymmdd(str(r["trade_date"])) for r in rows]
+    print(
+        f"[观察] daily {RANGE_LEGACY} 16 年区间 {len(rows)} 行、"
+        f"ts_code 集合 {sorted(codes)}、日期 {min(dates)}..{max(dates)}"
+    )
+
+
+def test_stock_range_suspended_window_empty(transport):
+    """停牌/休市窗口（2021 春节）：空结果无异常返回（OQ1 证据）。"""
+    df = _range_call(
+        transport, "daily", RANGE_NORMAL,
+        date(2021, 2, 11), date(2021, 2, 17),
+    )
+    assert len(df) == 0, "春节休市窗口应为 0 行（个股空结果语义）"
+    print("[观察] daily 春节休市窗口 0 行、无异常（合法空结果）")
+
+
+def test_stock_range_delisted_tail_and_after(transport, delisted_sample):
+    """退市股末段有数据、退市日后合法为空（生命周期边界，design D8）。"""
+    ts_code, delist_date = delisted_sample
+    tail_start = delist_date - timedelta(days=30)
+
+    df_tail = _range_call(transport, "daily", ts_code, tail_start, delist_date)
+    print(
+        f"[观察] daily 退市股 {ts_code} 末段 [{tail_start}..{delist_date}] "
+        f"{len(df_tail)} 行"
+    )
+    if len(df_tail):
+        dates = [_parse_yyyymmdd(str(r["trade_date"])) for r in df_tail.to_dict("records")]
+        assert max(dates) <= delist_date, "退市日后不应有数据"
+
+    df_after = _range_call(
+        transport, "daily", ts_code,
+        delist_date + timedelta(days=1), delist_date + timedelta(days=30),
+    )
+    assert len(df_after) == 0, "退市日后区间应为 0 行（合法空结果）"
+    print(
+        f"[观察] daily 退市股 {ts_code} 退市日后区间 0 行、无异常"
+    )

@@ -259,7 +259,7 @@ providers:
 
 股票 / ETF 自选支持标签分类（指数不支持）：先在「标签管理」页（`/tags`）创建标签，再到「自选管理」页点击操作列「标签」按钮，在弹层中点击标签添加 / 取消关联（即时保存）。一个自选条目可关联多个标签；被引用的标签不能删除（需先解除全部关联）。行情首页可按标签筛选（全部 / 指定标签 / 无标签），筛选为前端本地过滤，不会增加数据源请求。
 
-## A 股历史数据（v0.3.0）
+## A 股历史数据（v0.3.0 引入，v0.4.0 架构升级）
 
 面向后续回测与分析的历史数据底座：把 Tushare 的 A 股历史数据同步到本地 DuckDB。
 
@@ -278,20 +278,41 @@ providers:
 
 历史起点默认 `2010-01-01`（`history.start_date`）。
 
-### 管理员页面 `/admin/data`
+### 同步模型（v0.4.0 个股水位）
+
+v0.4.0 起改为**个股水位模型**：每只股票独立维护 `(dataset, instrument_id)` 水位，替代旧日级模型。核心特性：
+
+- **失败隔离**：单股失败不阻塞其他股票推进，下轮自动从缺口继续
+- **自动补偿**：已追平股票零请求；失败股下轮按原水位重新同步
+- **生命周期边界**：个股从 `list_date`（上市日）起同步，至 `delist_date`（退市日）止
+- **两层任务流水**：Run（整体同步批次）→ SyncTask（单股单数据集任务）；Run 允许个股 failed 但整体 SUCCESS
+- **股级重试**：单股最多 `max_retries+1` 次尝试（默认 4 次），配置类错误（Token 缺失、UNKNOWN_INSTRUMENT、ALIAS_CONFLICT）首次尝试即终态失败
+- **空结果语义**：停牌窗口返回 0 行无异常 → 推进水位 `records_fetched=0`
+
+### 管理员页面
+
+#### `/admin/data`（数据总览）
 
 - 顶部整体状态 + 数据起点 + 最新交易日 + 当前任务 + 最后执行
-- 四个日级数据集卡片：状态、水位、期望交易日、落后交易日数、累计行数、最近错误
-- 主档状态表、当前任务进度、最近 20 次执行记录
+- 四个日级数据集卡片：**个股口径统计**（证券数、已追平数、落后数、今日成功/失败数、完整度百分比）、累计行数、最近错误
+- 主档状态表、当前任务进度（数据集/股票/已处理/成功/失败/跳过）、最近 20 次执行记录
 - 唯一主操作按钮「检查并更新数据」：手动触发一次补齐，运行中禁用并显示「正在更新...」，
   每 4 秒自动刷新进度，任务结束后停止轮询
-- 该页不提供补缺口 / 增量同步 / 重同步等模式选择，也不提供历史数据手工编辑入口；
-  缺口补齐由后台按水位自动推进
+- 新增「个股历史」导航入口（v0.4.0）
+
+#### `/admin/data/stocks`（个股列表，v0.4.0 新增）
+
+- 数据集切换 chip、状态筛选（全部/成功/失败）、搜索（名称/代码）
+- 100 条分页表格：显示股票名称、代码、水位日期、最后尝试、状态
+- 失败行点击查看详情 modal（错误码、错误消息、尝试次数）
 
 ### 首次回填与限流
 
-- **首次回填 2010 年至今可能跨越多次运行**：Tushare 有积分等级限流，
-  同步按交易日逐个推进，每轮推进到限流或当日可用时间边界为止；重复触发不会并行执行
+- **首次回填 2010 年至今预计 8-12 小时，分多轮自动完成**（v0.4.0 个股水位模型）：
+  - 升级后首次运行自动批量创建约 24k 行 `stock_sync_state`（watermark 初始为 NULL），完成率 = 0%
+  - 每轮按 `(watermark ASC NULLS FIRST, ts_code ASC)` 顺序逐股推进，直至全部追平
+  - 数据总览页面实时显示完成率从 0% 逐股上升，属正常
+  - Tushare 有积分等级限流，同步推进到限流或当日可用时间边界为止；重复触发不会并行执行
 - 请求节奏由进程级 gate 统一约束（默认 0.6 秒/请求；`stock_basic` 接口 1.25 秒），
   对所有 Tushare Provider 生效
 - 各数据集有可用时间 cutoff（北京时间）：`adj_factor` 09:30、`daily` 16:30、
@@ -299,7 +320,7 @@ providers:
   到点后自动补齐
 - 每日 `history.schedule_time`（默认 20:30 北京时间）自动触发；`history.startup_catchup`
   控制启动时是否立即补齐一次
-- 同步任务在后台推进，单次全天替换在写事务内原子完成；同步期间不阻塞行情与估值功能
+- 同步任务在后台推进，单股区间替换在写事务内原子完成；同步期间不阻塞行情与估值功能
 
 ### 数据完整性
 
@@ -317,7 +338,7 @@ history:
   start_date: "2010-01-01"            # 历史数据起点
   schedule_time: "20:30"              # 每日调度时间（北京时间）
   startup_catchup: true               # 启动时自动补齐一次
-  max_attempts: 10                    # 单 dataset×单交易日最多尝试次数
+  max_retries: 3                      # 单股单数据集最多重试次数（v0.4.0，共 max_retries+1 次尝试，默认 4 次）
   backoff_initial_seconds: 5
   backoff_max_seconds: 300
   jitter_ratio: 0.2
@@ -341,6 +362,10 @@ Token 时同步会失败且不推进水位，但**不影响已有行情与估值
 - 日历已缓存（曾成功同步过）、之后 Token 失效或被移除：前置通过，报
   `TUSHARE_TOKEN_MISSING`。
 
+**配置兼容性说明（v0.4.0）**：
+- `max_retries`（v0.4.0 新增，默认 3）：单股单数据集最多重试次数，共 `max_retries+1` 次尝试（默认 4 次）
+- `max_attempts`（v0.3.x 旧字段，已废弃）：如果 `config.yaml` 中仍含 `max_attempts`，应用会自动转换为 `max_retries = max_attempts - 1`，并记录 WARNING 日志建议更新配置
+
 ### 升级注意
 
 DuckDB 为单文件单写者数据库，**升级前请停服并成对备份 `data/marketmind.duckdb`
@@ -353,21 +378,36 @@ cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal   # 若存在
 # 更新代码 / 配置后启动，容器启动时自动执行 alembic upgrade head
 ```
 
-迁移 `0003_a_share_historical_data` 新增 11 张表（4 事实 + 3 主档 + 4 同步控制）
+**v0.3.x → v0.4.0 升级注意事项**：
+
+- **架构变更**：历史数据同步从日级水位改为个股水位，Migration 0004 不可逆
+- **首轮回填**：升级后首次运行自动批量创建约 24k 行 `stock_sync_state`（watermark 初始为 NULL），完成率 = 0%；全量回填预计 8-12 小时，分多轮自动完成
+- **数据总览完成率从 0% 逐股上升属正常**：旧日级水位不会迁移到个股水位，所有股票从 NULL 重新同步；数据已回填的股票会快速推进（空结果直接推进水位）
+- **回滚限制**：Migration 0004 执行后无法回滚到 v0.3.x，回滚需恢复备份；v0.3.1 不支持运行于 0004 库
+- **配置更新**：建议将 `config.yaml` 中的 `max_attempts` 改为 `max_retries`（自动转换兼容，但会记录 WARNING）
+
+迁移 `0003_a_share_historical_data`（v0.3.0）新增 11 张表（4 事实 + 3 主档 + 4 同步控制）
 与索引，并给 `trading_calendar`
 增加 4 个可空列（`exchange` / `pretrade_date` / `source` / `fetched_at`，纯
 `ADD COLUMN`，既有行留 NULL，旧写路径行为不变）。既有 12 张表的行数迁移前后
 一致（迁移内置校验）。
+
+迁移 `0004_per_stock_history_sync`（v0.4.0）新增 2 张表（`stock_sync_state` / `sync_task`），
+扩展 `history_sync_run` / `history_sync_run_dataset` 列（旧水位列保留但冻结），
+保留 `history_day_status` 表（不再写入，供后续分析对比）。
 
 ## 运行状态
 
 - `GET /health`：应用与数据库健康 + 当前版本号
 - `GET /api/admin/status`：后台任务最近运行状态（最近开始/成功/失败时间、耗时、连续失败次数）与各数据源运行指标（管理员）
 - `/admin/status`：系统状态页面（管理员，服务端渲染上述任务与指标快照）
-- `GET /api/admin/history-data/summary`：历史数据整体状态与各数据集水位（管理员，只读，不触发上游请求）
+- `GET /api/admin/history-data/summary`：历史数据整体状态与各数据集个股口径统计（管理员，只读，不触发上游请求）
+- `GET /api/admin/history-data/stocks`：个股列表（管理员，分页/筛选/搜索，v0.4.0 新增）
+- `GET /api/admin/history-data/tasks/{task_id}`：单个任务详情（管理员，v0.4.0 新增）
 - `POST /api/admin/history-data/sync`：手动触发一次补齐（管理员，202 返回 `run_id`；运行中返回 409 并附当前 `run_id`）
 - `GET /api/admin/history-data/runs`、`GET /api/admin/history-data/runs/{run_id}`：执行历史与单次详情（管理员）
 - `/admin/data`：数据管理页面（管理员）
+- `/admin/data/stocks`：个股列表页面（管理员，v0.4.0 新增）
 
 ## 测试执行方法
 
@@ -378,10 +418,13 @@ pytest -m online             # 在线冒烟测试（需要真实网络 + 有效 
 pytest -m "not online" -q    # 与默认相同，显式排除在线用例
 ```
 
-历史数据的本地性能基准（synthetic 6000 行 × 100 交易日，防逐行 ORM / 每行提交退化）：
+历史数据的本地性能基准（synthetic，防逐行 ORM / 每行提交退化）：
 
 ```bash
 .venv/bin/python scripts/bench/bench_history_write.py
+# 场景 1：整日替换（120 万行，v0.3.x 机制对照）
+# 场景 2：个股区间替换（8 万行，v0.4.0 生产路径，真实 StockSyncExecutor）
+# 断言：提交次数固定、SQL 语句数 << 行数、批量写入 ≥ 5× 逐行基线
 ```
 
 ## 目录结构

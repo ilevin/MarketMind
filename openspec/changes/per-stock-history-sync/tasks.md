@@ -44,26 +44,27 @@
 
 ## 7. 同步行为集成测试（重写既有守护）
 
-- [ ] 7.1 重写 `tests/integration/test_history_sync_service.py` 为个股口径：个股水位推进与单调不下降、失败隔离（单股重试耗尽失败不影响其他股、Run SUCCESS、task_failed_count=1）、自动补偿（失败股下轮自动从缺口继续并追平）、已追平股票零请求、全部追平时 run.status=NOOP（不写事实、不创建 task）、生命周期边界（中途上市从 list_date 起、退市股同步至 delist_date、delist < start 的退市股 skipped 不建任务）、系统级异常场景（注入数据库错误 → Run FAILED、未提交股票水位不动、已成功股票进度保留）
-- [ ] 7.2 空结果语义集成测试（停牌区间 0 行无异常 → 推进水位 records_fetched=0、退市末段/moneyflow 非覆盖合法为空、请求异常进入重试路径）
-- [ ] 7.3 别名与未知代码集成测试（旧代码股区间回填落规范码并推进水位；ALIAS_CONFLICT 只失败该股不阻塞数据集；UNKNOWN_INSTRUMENT 拒绝不建占位证券）
-- [ ] 7.4 中断恢复集成测试（进程中断后 running task → interrupted、水位不动、下轮按原水位重同步；优雅停机完成当前股事务后停止；`test_history_sync_job_lifespan.py` 相应更新）
-- [ ] 7.5 幂等与重复运行集成测试（同区间重跑事实行数不变、record_count 不翻倍、任务流水新增而水位不变）
-- [ ] 7.6 今日统计多时区单测（UTC 服务器时区下北京时间跨日归属正确；同日先失败后成功只计成功）
+- [x] 7.1 重写 `tests/integration/test_history_sync_service.py` 为个股口径：个股水位推进与单调不下降、失败隔离（单股重试耗尽失败不影响其他股、Run SUCCESS、task_failed_count=1）、自动补偿（失败股下轮自动从缺口继续并追平）、已追平股票零请求、全部追平时 run.status=NOOP（不写事实、不创建 task）、生命周期边界（中途上市从 list_date 起、退市股同步至 delist_date、delist < start 的退市股 skipped 不建任务）、系统级异常场景（注入数据库错误 → Run FAILED、未提交股票水位不动、已成功股票进度保留）
+- [x] 7.2 空结果语义集成测试（停牌区间 0 行无异常 → 推进水位 records_fetched=0、退市末段/moneyflow 非覆盖合法为空、请求异常进入重试路径）
+- [x] 7.3 别名与未知代码集成测试（旧代码股区间回填落规范码并推进水位；ALIAS_CONFLICT 只失败该股不阻塞数据集；UNKNOWN_INSTRUMENT 拒绝不建占位证券）
+- [x] 7.4 中断恢复集成测试（进程中断后 running task → interrupted、水位不动、下轮按原水位重同步；优雅停机完成当前股事务后停止；`test_history_sync_job_lifespan.py` 相应更新）
+- [x] 7.5 幂等与重复运行集成测试（同区间重跑事实行数不变、record_count 不翻倍、任务流水新增而水位不变）
+- [x] 7.6 今日统计多时区单测（UTC 服务器时区下北京时间跨日归属正确；同日先失败后成功只计成功）
 
 ## 8. 管理 API 与前端
 
-- [ ] 8.1 `app/schemas/history_admin.py` 与 `app/api/admin_history.py`：summary 升级个股口径（stock_count/up_to_date_count/lagging_count/today_success_count/today_failed_count/completion_rate；旧水位字段保留输出冻结值；overall_status 按 RUNNING→ERROR(系统级)→LAGGING(有个股缺口)→HEALTHY），顺手修复 requested_by_user_id int→str 类型瑕疵
-- [ ] 8.2 新增 `GET /api/admin/history-data/stocks`（dataset 必填仅四日级数据集、status=all|success|failed、q 名称/代码 LIKE、服务端分页固定 100、默认排序 last_status='failed' 优先 → watermark ASC NULLS FIRST → ts_code ASC、响应含统计块与分页元信息，SQL 内 JOIN 完成）
-- [ ] 8.3 新增 `GET /api/admin/history-data/tasks/{task_id}`（按 id 直查 + JOIN 主档补名称、404、只读）
-- [ ] 8.4 `app/templates/admin_data.html` 数据集卡片改个股口径（含今日成功/失败、完整度）、当前任务进度改（数据集/股票/已处理/成功/失败/跳过）、新增"个股历史"导航入口；最近 20 次执行记录的各数据集统计改用新列（processed/success/failed/skipped）展示，`/runs` 与 `/runs/{run_id}` 响应补充新统计列与运行中实时进度（旧水位列为冻结兼容输出）
-- [ ] 8.5 新增 `app/templates/admin_data_stocks.html` 与 `app/static/app.js` 个股页逻辑（数据集切换 chip、状态筛选、搜索、100 条分页控件"上一页/下一页/共 N 条"、失败行只读详情 modal 经 esc() 转义、复用现有 badge/table/modal 样式与 api() 工具、运行中轮询沿用）
-- [ ] 8.6 `tests/integration/test_admin_history_api.py` 与 `tests/integration/test_admin_data_page.py` 更新扩展（summary 新字段口径、overall_status 分支断言——个股失败 → LAGGING 非 ERROR、全追平 → HEALTHY、active run → RUNNING、系统级失败 → ERROR、/stocks 分页筛选排序与 422、/tasks 详情与 404、/runs/{run_id} 新统计列与旧水位兼容字段断言、权限矩阵 403/401 与 CSRF、个股页渲染与导航）
+- [x] 8.1 `app/schemas/history_admin.py` 与 `app/api/admin_history.py`：summary 升级个股口径（stock_count/up_to_date_count/lagging_count/today_success_count/today_failed_count/completion_rate；旧水位字段保留输出冻结值；overall_status 按 RUNNING→ERROR(系统级)→LAGGING(有个股缺口)→HEALTHY），顺手修复 requested_by_user_id int→str 类型瑕疵
+- [x] 8.2 新增 `GET /api/admin/history-data/stocks`（dataset 必填仅四日级数据集、status=all|success|failed、q 名称/代码 LIKE、服务端分页固定 100、默认排序 last_status='failed' 优先 → watermark ASC NULLS FIRST → ts_code ASC、响应含统计块与分页元信息，SQL 内 JOIN 完成）
+- [x] 8.3 新增 `GET /api/admin/history-data/tasks/{task_id}`（按 id 直查 + JOIN 主档补名称、404、只读）
+- [x] 8.4 `app/templates/admin_data.html` 数据集卡片改个股口径（含今日成功/失败、完整度）、当前任务进度改（数据集/股票/已处理/成功/失败/跳过）、新增"个股历史"导航入口；最近 20 次执行记录的各数据集统计改用新列（processed/success/failed/skipped）展示，`/runs` 与 `/runs/{run_id}` 响应补充新统计列与运行中实时进度（旧水位列为冻结兼容输出）
+- [x] 8.5 新增 `app/templates/admin_data_stocks.html` 与 `app/static/app.js` 个股页逻辑（数据集切换 chip、状态筛选、搜索、100 条分页控件"上一页/下一页/共 N 条"、失败行只读详情 modal 经 esc() 转义、复用现有 badge/table/modal 样式与 api() 工具、运行中轮询沿用）
+- [x] 8.6 `tests/integration/test_admin_history_api.py` 与 `tests/integration/test_admin_data_page.py` 更新扩展（summary 新字段口径、overall_status 分支断言——个股失败 → LAGGING 非 ERROR、全追平 → HEALTHY、active run → RUNNING、系统级失败 → ERROR、/stocks 分页筛选排序与 422、/tasks 详情与 404、/runs/{run_id} 新统计列与旧水位兼容字段断言、权限矩阵 403/401 与 CSRF、个股页渲染与导航）
 
 ## 9. 性能基准与全量回归
 
-- [ ] 9.1 `scripts/bench/bench_history_write.py` 增加个股区间场景（单股约 4000 行 × 多股连续提交），断言每股提交语句数与事务数不随股数/行数逐行放大
-- [ ] 9.2 全量离线回归：`.venv/bin/python -m pytest -m "not online" -q` 全绿（含受影响既有测试的改写：migrations、admin API/页面、sync service、job lifespan、repositories、retry、planner）
+- [x] 9.1 `scripts/bench/bench_history_write.py` 增加个股区间场景（单股约 4000 行 × 多股连续提交），断言每股提交语句数与事务数不随股数/行数逐行放大
+- [x] 9.2 全量离线回归：`.venv/bin/python -m pytest -m "not online" -q` 全绿（含受影响既有测试的改写：migrations、admin API/页面、sync service、job lifespan、repositories、retry、planner）
+- [x] 9.3 性能基准文档化（`docs/testing/v0.4.0-performance-benchmark.md`：两场景结果、加速比分析、回归阈值建议、生产环境预估）
 
 ## 10. 在线冒烟、文档与发布
 

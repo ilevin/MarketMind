@@ -4,6 +4,85 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
+## [v0.4.0] - 2026-09-23
+
+架构升级：历史数据同步从**日级水位**改为**个股水位**，实现失败隔离与自动补偿
+（OpenSpec 变更 per-stock-history-sync）。
+
+### 核心变更
+
+- **个股水位模型**：每只股票独立维护 `(dataset, instrument_id)` 水位（`stock_sync_state` 表 24k 行量级），替代旧日级模型（`history_day_status` 表 5000×交易日量级）；单股失败不阻塞其他股票推进，下轮自动从缺口继续
+- **两层任务流水**：`Run`（整体同步批次，枚举 SUCCESS/NOOP/FAILED/INTERRUPTED）→ `SyncTask`（单股单数据集任务，枚举 success/failed/skipped/interrupted）；Run 允许个股 failed 但整体 SUCCESS（旧 PARTIAL 状态不再产生）
+- **失败隔离**：单股重试耗尽（默认 4 次 attempt）仅失败该股，不终止 Run；配置类错误（Token 缺失、UNKNOWN_INSTRUMENT、ALIAS_CONFLICT）首次尝试即终态失败
+- **自动补偿**：已追平股票零请求；失败股下轮按原水位重新同步；全部追平时 Run 状态=NOOP（不写事实表、不创建任务）
+- **生命周期边界**：个股从 `list_date`（上市日）起同步，至 `delist_date`（退市日）止；`delist_date < history.start_date` 的退市股跳过不建任务
+- **空结果语义**：停牌窗口返回 0 行无异常 → 推进水位 `records_fetched=0`；退市末段、moneyflow 非覆盖合法为空
+- **中断恢复扩展**：`recover_stale_runs` 批量中断属于已中断 Run 的 running `sync_task`（补 `finished_at`），水位不推进
+
+### API 与前端
+
+- **管理 API 升级**（`/api/admin/history-data/`）：
+  - `summary` 改为个股口径统计：`stock_count`（证券数）、`up_to_date_count`（已追平数）、`lagging_count`（落后数）、`today_success_count`（今日成功数）、`today_failed_count`（今日失败数）、`completion_rate`（完成率）
+  - `overall_status` 逻辑：RUNNING（活跃运行中）→ ERROR（系统级失败）→ LAGGING（有个股缺口）→ HEALTHY（全部追平）
+  - `runs/{run_id}` 响应新增统计列：`processed_count`（已处理）、`task_success_count`（成功）、`task_failed_count`（失败）、`skipped_count`（跳过），旧水位列保留输出冻结值（兼容性）
+  - 新增 `GET /stocks`：个股列表页接口，dataset 必填（仅四日级数据集）、status 筛选（all/success/failed）、q 搜索（名称/代码 LIKE）、服务端分页固定 100 条、默认排序（失败优先 → watermark ASC NULLS FIRST → ts_code ASC）
+  - 新增 `GET /tasks/{task_id}`：任务详情接口，按 id 直查 + JOIN 主档补名称，404 响应
+- **前端新增个股页面**（`/admin/data/stocks`）：
+  - 数据集切换 chip、状态筛选下拉框、搜索输入框
+  - 100 条分页表格，失败行点击弹出只读详情 modal（错误消息经 `esc()` 转义，防 XSS）
+  - 数据总览卡片显示今日成功/失败、完整度百分比
+  - 当前任务进度显示：数据集/股票/已处理/成功/失败/跳过
+- **今日统计多时区支持**：UTC 服务器时区下北京时间跨日归属正确（`last_attempt_at` naive 直接 CAST 为 DATE，不触发时区转换；`now() AT TIME ZONE 'Asia/Shanghai'` 获取当前北京日期）
+
+### 内部实现
+
+- **核心组件**：
+  - `StockSyncExecutor`（`app/services/history/stock_executor.py`）：单股任务生命周期执行器，三事务模式（①创建 task=running → ②锁外 fetch/validate → ③写锁内原子提交 replace_for_instrument_range + advance_watermark + finish_success + add_counts，或失败记录）
+  - `stock_effective_range`（`app/services/history/planner.py`）：个股有效区间计算，返回 `StockSyncRange(start_date, end_date)`，端点收敛到严格交易日历
+  - `sync_service.run()` 重构：日级数据集改为"解析 target → 批量补建缺失 stock_sync_state 行 → universe 按 (watermark ASC NULLS FIRST, ts_code ASC) → 逐股（无工作 skipped；有工作交 Executor；单股异常记录后 continue；系统级异常终止 Run）"
+- **移除旧日级代码**（-738 行）：`_sync_day_level_dataset`、`_sync_single_day`、`_fetch_day`、`_daily_basic_fallback`、`reconcile_daily_watermarks`、`reconcile_dataset`、`history_day_status` 写入
+- **性能验证**：`scripts/bench/bench_history_write.py` 新增个股区间场景（20 股 × 4000 行，真实 `StockSyncExecutor`）；实测提交次数 = 2×股数（task 创建 + 成功提交）、SQL 语句数 241 条 << 80k 行、批量写入加速比 36.2× 逐行基线（远超 5× 要求）
+
+### 数据库迁移
+
+- **Migration 0004**（`migrations/versions/0004_per_stock_history_sync.sql`）：
+  - 新表：`stock_sync_state`（个股水位，24k 行量级）、`sync_task`（任务流水）
+  - 扩展表：`history_sync_run` 新增 `status` 枚举与 `requested_by_user_id`；`history_sync_run_dataset` 新增 `processed_count`/`task_success_count`/`task_failed_count`/`skipped_count`，旧水位列保留但冻结置 NULL/0
+  - 旧表保留：`history_day_status` 表不删除（供后续分析对比），不再写入
+- **升级步骤**：
+  1. **停服**：`systemctl stop marketmind`（v0.4.0 不支持热迁移）
+  2. **备份**：`.duckdb` + `.wal` 成对备份（两文件必须同一时刻快照）
+  3. **迁移**：启动服务自动执行 Migration 0004（约 5-10 秒）
+  4. **首轮回填**：升级后首次运行自动批量创建 24k 行 `stock_sync_state`（watermark 初始为 NULL），全量回填预计耗时 8-12 小时（分多轮自动完成，进度经 `/admin/data` 实时查看）
+- **回滚限制**：Migration 0004 不可逆，回滚需恢复备份；v0.3.1 不支持运行于 0004 库
+
+### 升级注意事项
+
+- **数据总览完成率从 0% 逐股上升属正常**：旧日级模型迁移到个股模型后，`stock_sync_state.watermark` 初始全 NULL，完成率 = 0%；首轮回填后逐股推进，直至全部追平
+- **最近执行记录统计口径变化**：旧列（`last_watermark_date`/`days_fetched`/`days_failed`）输出冻结值 NULL/0；新列（`processed_count`/`task_success_count`/`task_failed_count`/`skipped_count`）反映个股任务统计
+- **Run 状态语义变化**：SUCCESS 允许个股 failed（旧版单日失败则 PARTIAL）；NOOP 表示全部追平零请求（旧版不存在此状态）
+- **Stock-level 日志规范**：每股一条概要 INFO（run_id/dataset/ts_code/row_count/elapsed_ms）、重试 WARNING、耗尽 ERROR；错误文本脱敏不含 Token
+
+### 测试覆盖
+
+- **全量回归**：703 项离线测试通过，0 失败（耗时 7 分 38 秒）
+- **新增测试**：
+  - `test_stock_executor.py`（4 项）：三事务模式、duration 毫秒级计量、配置类错误立即终止、空结果推进水位
+  - `test_history_sync_service.py`（32 项重写）：个股水位推进、失败隔离、自动补偿、全部追平 NOOP、生命周期边界、系统级异常
+  - `test_history_today_status_counts.py`（8 项）：多时区跨日归属、同日先失败后成功只计成功
+- **重写测试**：
+  - `test_history_alias_service.py`（7 项重写）：旧代码股区间回填、ALIAS_CONFLICT 只失败该股、UNKNOWN_INSTRUMENT 拒绝占位
+  - `test_admin_history_api.py`（57 项扩展）：summary 新字段、overall_status 分支、/stocks 分页筛选排序、/tasks 详情、权限矩阵
+  - `test_admin_data_page.py`（21 项扩展）：个股页面渲染、导航、chip/filter/search/pagination 交互
+- **性能基准**：
+  - 场景 1（整日替换）：120 万行 103 秒，提交次数 200（=2×100），SQL 1737 条，加速比 57×
+  - 场景 2（个股替换）：8 万行 10.4 秒，提交次数 40（=2×20），SQL 241 条，加速比 36.2×
+
+### 文档
+
+- 新增 `docs/testing/v0.4.0-regression-report.md`（703 项测试分布统计、架构变更覆盖验证、已知排除项）
+- 新增 `docs/testing/v0.4.0-performance-benchmark.md`（两场景结果、加速比分析、回归阈值建议、生产环境预估）
+
 ## [v0.3.1] - 2026-09-20
 
 修复 A 股历史首次回填因 Tushare 历史证券代码变更而无法推进

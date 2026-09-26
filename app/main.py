@@ -300,6 +300,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             request, "admin_data.html", {"current_user": current_user}
         )
 
+    @app.get("/admin/data/stocks")
+    def admin_data_stocks_page(
+        request: Request, current_user: CurrentUser = Depends(require_admin_page)
+    ):
+        """个股历史同步页（per-stock-history-sync，tasks 8.5）：
+        数据集切换、状态筛选、搜索、分页；失败行详情 modal。"""
+        return templates.TemplateResponse(
+            request, "admin_data_stocks.html", {"current_user": current_user}
+        )
+
     @app.get("/admin/status")
     def admin_status_page(
         request: Request, current_user: CurrentUser = Depends(require_admin_page)

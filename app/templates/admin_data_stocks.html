@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
+  <title>个股历史 · 行情看板</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="admin-data-stocks">
+  <header class="topbar">
+    <h1>个股历史同步</h1>
+    <nav class="user-nav">
+      <a href="/admin/data">← 数据总览</a>
+      <a href="/">行情首页</a>
+      <span class="current-user">{{ current_user.username }}（管理员）</span>
+      <a href="/admin/users">用户管理</a>
+      <a href="/admin/status">系统状态</a>
+      <a href="/change-password">修改密码</a>
+      <a href="#" id="logout-link">退出登录</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <div class="data-overview">
+        <div class="overview-item">
+          <span class="overview-label">数据集</span>
+          <span id="dataset-display">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">股票总数</span>
+          <span id="stock-count">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">已追平</span>
+          <span id="up-to-date-count" class="status-badge ok">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">有缺口</span>
+          <span id="lagging-count" class="status-badge warn">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">今日成功</span>
+          <span id="today-success">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">今日失败</span>
+          <span id="today-failed">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">完整度</span>
+          <span id="completion-rate">—</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="stocks-toolbar">
+        <div id="dataset-chips" class="chip-group">
+          <!-- 数据集切换 chip 由 JS 渲染 -->
+        </div>
+        <div class="stocks-filter">
+          <select id="status-filter">
+            <option value="all">全部状态</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+          <input type="text" id="search-input" placeholder="搜索名称 / 代码…" />
+        </div>
+      </div>
+
+      <table class="table" id="stocks-table">
+        <thead>
+          <tr>
+            <th>代码</th>
+            <th>名称</th>
+            <th>上市日</th>
+            <th>退市日</th>
+            <th>水位日期</th>
+            <th>状态</th>
+            <th>最后成功</th>
+            <th>最后尝试</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="9" class="muted">加载中…</td></tr>
+        </tbody>
+      </table>
+      <p id="stocks-empty" class="empty hidden">没有匹配的股票。</p>
+
+      <div class="pagination">
+        <button id="prev-page" disabled>上一页</button>
+        <span id="page-info">第 1 / 1 页 · 共 0 条</span>
+        <button id="next-page" disabled>下一页</button>
+      </div>
+      <p class="muted">每页 100 条；运行中每 4 秒自动刷新。</p>
+    </section>
+  </main>
+
+  <!-- 失败详情 modal -->
+  <div id="error-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3 id="error-modal-title">失败详情</h3>
+      <div class="modal-hint">
+        <span id="error-modal-tscode"></span>
+        <span class="muted"> · </span>
+        <span id="error-modal-errorcode"></span>
+      </div>
+      <div id="error-modal-message" class="error-detail"></div>
+      <div class="modal-actions">
+        <button id="error-modal-close">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

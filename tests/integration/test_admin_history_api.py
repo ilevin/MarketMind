@@ -33,11 +33,6 @@ from app.models.history_sync import (
 from app.models.trading_calendar import TradingCalendarDay
 from app.services.history.availability import AvailabilityPolicy
 from app.services.market_session_service import now_beijing
-from tests.integration.test_history_sync_service import (  # noqa: F401 - fixture 复用
-    FakeHistoryProviders,
-    frozen_now,
-    make_service,
-)
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 OPEN_DAYS = [date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)]
@@ -198,6 +193,26 @@ class TestAuthAndCsrf:
             )
             assert resp.status_code == 403
 
+    def test_stocks_requires_admin(self, client_factory):
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert client.get("/api/admin/history-data/stocks?dataset=daily").status_code == 403
+
+    def test_stocks_requires_login(self, client_factory):
+        with client_factory(FakeNameProvider()) as client:
+            assert client.get("/api/admin/history-data/stocks?dataset=daily").status_code == 401
+
+    def test_tasks_requires_admin(self, client_factory):
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert client.get("/api/admin/history-data/tasks/1").status_code == 403
+
+    def test_tasks_requires_login(self, client_factory):
+        with client_factory(FakeNameProvider()) as client:
+            assert client.get("/api/admin/history-data/tasks/1").status_code == 401
+
+    def test_datasets_requires_admin(self, client_factory):
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert client.get("/api/admin/history-data/datasets").status_code == 403
+
 
 class TestSummary:
     def test_fresh_db_shape(self, client_factory, session_factory):
@@ -238,17 +253,23 @@ class TestSummary:
             body = client.get("/api/admin/history-data/summary").json()
 
         daily = next(d for d in body["daily_datasets"] if d["dataset"] == "daily")
+        # v0.4.0 个股口径：旧字段保留 + 6 个新字段
         assert set(daily) == {
             "dataset", "display_name", "status", "history_start_date",
             "data_min_date", "data_max_date", "latest_complete_trade_date",
             "latest_expected_trade_date", "next_trade_date", "lag_trade_days",
             "record_count", "current_trade_date", "current_attempt",
             "last_success_at", "last_error_code", "last_error",
+            "stock_count", "up_to_date_count", "lagging_count",
+            "today_success_count", "today_failed_count", "completion_rate",
         }
         assert daily["display_name"] == "日线行情"
         assert daily["record_count"] == 3
-        assert daily["lag_trade_days"] == 0
+        assert daily["lag_trade_days"] == 0, "旧 lag 字段保留（冻结兼容）"
         assert daily["last_success_at"].endswith("+08:00"), "时间须为北京时间带时区 ISO"
+        # 无 stock_sync_state 行时，个股统计全为 0
+        assert daily["stock_count"] == 0
+        assert daily["completion_rate"] == 0.0
 
     def test_failed_dataset_shows_watermark_and_next_date(
         self, client_factory, session_factory, monkeypatch
@@ -274,83 +295,231 @@ class TestSummary:
         assert moneyflow["last_error_code"] == "TUSHARE_TIMEOUT"
         assert body["overall_status"] == "ERROR", "任一核心数据集失败即整体 ERROR（§84）"
 
-    def test_failed_then_success_no_longer_shows_stale_error(
-        self, make_service, session_factory, frozen_now, client_factory
+    def test_individual_stock_failure_is_lagging_not_error(
+        self, client_factory, session_factory
     ):
-        """回归：FAILED → 下一轮 SUCCESS 后 summary 不再展示旧错误。
+        """v0.4.0 个股口径：个股失败 → overall_status = LAGGING，非 ERROR。
 
-        旧实现 ``finish_success`` 只写 status/last_success_at，失败留下的
-        ``last_error_code``/``last_error`` 会被管理员页面当作"最后错误"继续
-        展示，出现 "CAUGHT_UP + 陈旧错误码" 的自相矛盾状态（现场实测：
-        stock_basic 追平后仍显示 TUSHARE_TIMEOUT）。本用例端到端跑两轮真实
-        Service：首轮让 daily 某日失败 10 次 → FAILED，次轮恢复 → 追平，再断言
-        summary 不再带旧错误。
+        设计 D12：单股失败不升级 ERROR，系统级（数据集 status=FAILED）才 ERROR。
+        直接构造 stock_sync_state 行模拟个股失败，验证 summary 口径。
         """
-        frozen_now()
+        from app.models.history_sync import StockSyncState
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+
         _seed_calendar(session_factory)
-
-        # 首轮：09-15 抛错 10 次 → daily FAILED（水位停 09-14），其余数据集成功
-        providers = FakeHistoryProviders(
-            fail_dates={"daily": {date(2026, 9, 15): 10}}
+        _seed_state(
+            session_factory, DatasetName.DAILY,
+            status=DatasetStatus.CAUGHT_UP.value,
+            latest_complete_trade_date=date(2026, 9, 16),
+            latest_expected_trade_date=date(2026, 9, 16),
         )
-        service, _p, _c, _slept = make_service(providers=providers)
-        service.run(trigger=TriggerType.MANUAL)
-
-        failed_state = _sync_state(session_factory, DatasetName.DAILY)
-        assert failed_state.status == DatasetStatus.FAILED.value
-        assert failed_state.last_error_code == "TUSHARE_TIMEOUT"
-        assert failed_state.last_error is not None
-        assert failed_state.last_error_at is not None
-        assert failed_state.current_trade_date == date(2026, 9, 15)
-
-        # 全程复用同一个 client：同一用户重复登录会产生多条 Session，
-        # conftest 的 _current_csrf_token 取单值会 MultipleResultsFound。
-        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
-            # 失败态必须可见（spec"失败数据集可见"）——先确认前置语义成立
-            body = client.get("/api/admin/history-data/summary").json()
-            daily = next(d for d in body["daily_datasets"] if d["dataset"] == "daily")
-            assert daily["last_error_code"] == "TUSHARE_TIMEOUT"
-            assert body["overall_status"] == "ERROR"
-
-            # 次轮：故障恢复，daily 推进到 09-16 追平
-            recovered = FakeHistoryProviders()  # 无 fail_dates
-            service2, _p2, _c2, _s2 = make_service(providers=recovered)
-            service2.run(trigger=TriggerType.MANUAL)
-
-            ok_state = _sync_state(session_factory, DatasetName.DAILY)
-            assert ok_state.status == DatasetStatus.CAUGHT_UP.value, "次轮应追平"
-            assert ok_state.latest_complete_trade_date == date(2026, 9, 16)
-            assert ok_state.last_error_code is None, "追平后不得残留错误码"
-            assert ok_state.last_error is None, "追平后不得残留错误文本"
-            assert ok_state.last_error_at is None, "追平后不得残留错误时刻"
-            assert ok_state.current_trade_date is None, "追平后不得残留失败日"
-            assert ok_state.current_attempt == 0, "追平后尝试次数归零"
-            assert ok_state.last_success_at is not None, "last_success_at 必须保留"
-
-            # 核心断言：summary 不再展示旧错误，整体状态回到健康
-            body = client.get("/api/admin/history-data/summary").json()
-        daily = next(d for d in body["daily_datasets"] if d["dataset"] == "daily")
-        assert daily["last_error_code"] is None, "summary 不得展示上一轮的陈旧错误码"
-        assert daily["last_error"] is None, "summary 不得展示上一轮的陈旧错误文本"
-        assert daily["current_trade_date"] is None
-        assert daily["current_attempt"] == 0
-        assert body["overall_status"] != "ERROR", "追平后整体状态不得停在 ERROR"
-
-        # 历史不丢：失败那一轮的 run_dataset 仍保留错误码（§19 执行记录）
+        # 构造 2 只股票：一只追平、一只失败
+        # Instrument 先建（FK 约束），再建 cn_stock_basic + stock_sync_state
         with session_factory() as session:
-            failed_rows = [
-                row
-                for row in session.scalars(
-                    select(HistorySyncRunDataset).where(
-                        HistorySyncRunDataset.dataset == DatasetName.DAILY.value,
-                        HistorySyncRunDataset.status == RunDatasetStatus.FAILED.value,
-                    )
-                )
-            ]
-        assert failed_rows, "失败的历史执行记录必须保留"
-        assert any(
-            row.last_error_code == "TUSHARE_TIMEOUT" for row in failed_rows
-        ), "历史错误码由 run_dataset 承载，清除 state 不得丢失历史"
+            session.add_all([
+                Instrument(
+                    instrument_id="CN:STOCK:000001", symbol="000001",
+                    name="平安银行", market="CN", asset_type="STOCK",
+                    currency="CNY", exchange="SZSE", is_active=True,
+                ),
+                Instrument(
+                    instrument_id="CN:STOCK:000002", symbol="000002",
+                    name="万科A", market="CN", asset_type="STOCK",
+                    currency="CNY", exchange="SZSE", is_active=True,
+                ),
+            ])
+            session.flush()
+            session.add_all([
+                CnStockBasic(
+                    instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                    symbol="000001", name="平安银行",
+                    list_date=date(2010, 1, 4),
+                    source="tushare", fetched_at=now_beijing(),
+                    source_last_seen_at=now_beijing(),
+                ),
+                CnStockBasic(
+                    instrument_id="CN:STOCK:000002", ts_code="000002.SZ",
+                    symbol="000002", name="万科A",
+                    list_date=date(2010, 1, 4),
+                    source="tushare", fetched_at=now_beijing(),
+                    source_last_seen_at=now_beijing(),
+                ),
+                StockSyncState(
+                    dataset=DatasetName.DAILY.value,
+                    instrument_id="CN:STOCK:000001",
+                    ts_code="000001.SZ",
+                    watermark_date=date(2026, 9, 16),  # 已追平
+                    last_status="success",
+                    last_success_at=now_beijing(),
+                    last_attempt_at=now_beijing(),
+                    created_at=now_beijing(),
+                    updated_at=now_beijing(),
+                ),
+                StockSyncState(
+                    dataset=DatasetName.DAILY.value,
+                    instrument_id="CN:STOCK:000002",
+                    ts_code="000002.SZ",
+                    watermark_date=date(2026, 9, 14),  # 落后
+                    last_status="failed",
+                    last_error_code="TUSHARE_TIMEOUT",
+                    last_error="请求超时",
+                    last_attempt_at=now_beijing(),
+                    created_at=now_beijing(),
+                    updated_at=now_beijing(),
+                ),
+            ])
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        daily = next(d for d in body["daily_datasets"] if d["dataset"] == "daily")
+        assert daily["stock_count"] == 2
+        assert daily["up_to_date_count"] == 1
+        assert daily["lagging_count"] == 1
+        # 个股失败不升级 ERROR：数据集 status 仍为 CAUGHT_UP，整体 LAGGING
+        assert daily["status"] == DatasetStatus.CAUGHT_UP.value
+        assert body["overall_status"] == "LAGGING", (
+            "个股失败 → 整体 LAGGING，不得升级 ERROR"
+        )
+        assert body["overall_status"] != "ERROR"
+
+    def test_all_caught_up_is_healthy(self, client_factory, session_factory):
+        """全部股票追平 → overall_status = HEALTHY。"""
+        from app.models.history_sync import StockSyncState
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+
+        _seed_calendar(session_factory)
+        for ds in (
+            DatasetName.DAILY, DatasetName.ADJ_FACTOR,
+            DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
+        ):
+            _seed_state(
+                session_factory, ds,
+                status=DatasetStatus.CAUGHT_UP.value,
+                latest_complete_trade_date=date(2026, 9, 16),
+                latest_expected_trade_date=date(2026, 9, 16),
+            )
+        with session_factory() as session:
+            session.add(Instrument(
+                instrument_id="CN:STOCK:000001", symbol="000001",
+                name="平安银行", market="CN", asset_type="STOCK",
+                currency="CNY", exchange="SZSE", is_active=True,
+            ))
+            session.flush()
+            session.add(CnStockBasic(
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                symbol="000001", name="平安银行",
+                list_date=date(2010, 1, 4),
+                source="tushare", fetched_at=now_beijing(),
+                source_last_seen_at=now_beijing(),
+            ))
+            for ds in (
+                DatasetName.DAILY, DatasetName.ADJ_FACTOR,
+                DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
+            ):
+                session.add(StockSyncState(
+                    dataset=ds.value,
+                    instrument_id="CN:STOCK:000001",
+                    ts_code="000001.SZ",
+                    watermark_date=date(2026, 9, 16),  # 已追平
+                    last_status="success",
+                    last_success_at=now_beijing(),
+                    last_attempt_at=now_beijing(),
+                    created_at=now_beijing(),
+                    updated_at=now_beijing(),
+                ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        assert body["overall_status"] == "HEALTHY"
+        for d in body["daily_datasets"]:
+            assert d["stock_count"] == 1
+            assert d["up_to_date_count"] == 1
+            assert d["lagging_count"] == 0
+            assert d["completion_rate"] == 1.0
+
+    def test_system_level_failure_is_error(self, client_factory, session_factory):
+        """数据集级 FAILED（系统级失败） → overall_status = ERROR。"""
+        _seed_calendar(session_factory)
+        _seed_state(
+            session_factory, DatasetName.DAILY,
+            status=DatasetStatus.FAILED.value,
+            latest_complete_trade_date=date(2026, 9, 14),
+            current_trade_date=date(2026, 9, 15),
+            last_error_code="DATABASE_ERROR",
+            last_error="数据库写入失败",
+        )
+        for ds in (DatasetName.ADJ_FACTOR, DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW):
+            _seed_state(
+                session_factory, ds,
+                status=DatasetStatus.CAUGHT_UP.value,
+                latest_complete_trade_date=date(2026, 9, 16),
+            )
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        assert body["overall_status"] == "ERROR", "数据集级 FAILED 必须升级 ERROR"
+
+    def test_active_run_is_running(self, client_factory, session_factory):
+        """有 active run → overall_status = RUNNING（优先级最高）。"""
+        _seed_calendar(session_factory)
+        _seed_state(
+            session_factory, DatasetName.DAILY,
+            status=DatasetStatus.FAILED.value,  # 即使有 FAILED
+            last_error_code="X", last_error="x",
+        )
+        with session_factory() as session:
+            session.add(HistorySyncRun(
+                run_id="r-running", trigger_type=TriggerType.MANUAL.value,
+                status=RunStatus.RUNNING.value, started_at=now_beijing(),
+                created_at=now_beijing(),
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        assert body["overall_status"] == "RUNNING", "active run 优先于 ERROR"
+        assert body["active_run"]["run_id"] == "r-running"
+
+    def test_history_run_dataset_preserves_error(self, client_factory, session_factory):
+        """历史不丢：失败 run_dataset 仍保留错误码（不因 state 清除而丢失）。"""
+        _seed_calendar(session_factory)
+        started = now_beijing()
+        with session_factory() as session:
+            session.add(HistorySyncRun(
+                run_id="run-failed", trigger_type=TriggerType.MANUAL.value,
+                status=RunStatus.FAILED.value,
+                started_at=started, finished_at=started + timedelta(seconds=30),
+                error_summary="daily 失败",
+                created_at=started,
+            ))
+            session.add(HistorySyncRunDataset(
+                run_id="run-failed", dataset=DatasetName.DAILY.value,
+                status=RunDatasetStatus.FAILED.value,
+                last_error_code="TUSHARE_TIMEOUT",
+                last_error="请求超时",
+                processed_count=0, task_success_count=0,
+                task_failed_count=1, skipped_count=0,
+                started_at=started, finished_at=started + timedelta(seconds=30),
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            detail = client.get("/api/admin/history-data/runs/run-failed").json()
+
+        daily = next(d for d in detail["datasets"] if d["dataset"] == "daily")
+        assert daily["last_error_code"] == "TUSHARE_TIMEOUT"
+        assert daily["last_error"] == "请求超时"
+        # 个股统计列存在
+        assert "processed_count" in daily
+        assert daily["task_failed_count"] == 1
 
     def test_master_dataset_fields(self, client_factory, session_factory):
         from app.models.history_sync import HistorySyncState
@@ -633,7 +802,9 @@ class TestManualSync:
 
         assert job.run_calls, "后台任务未启动"
         user_id, reserved_run_id = job.run_calls[0]
-        assert user_id == admin["user_id"], "必须使用认证用户 id，而非客户端传值"
+        # requested_by_user_id 为字符串（DB 列 String(64)），修复 int→str 类型瑕疵
+        assert user_id == str(admin["user_id"]), "必须使用认证用户 id，而非客户端传值"
+        assert isinstance(user_id, str), "requested_by_user_id 须为字符串"
         assert reserved_run_id == resp.json()["run_id"]
 
     def test_conflict_reports_reserved_run_id_immediately(
@@ -815,12 +986,397 @@ class TestRuns:
             assert client.get("/api/admin/history-data/runs?limit=0").status_code == 422
             assert client.get("/api/admin/history-data/runs?limit=500").status_code == 422
 
+    def test_run_detail_has_stock_counts_and_old_watermark_compat(
+        self, client_factory, session_factory
+    ):
+        """run 详情同时包含个股统计列（新）与旧水位列（兼容冻结）。"""
+        started = now_beijing()
+        with session_factory() as session:
+            session.add(HistorySyncRun(
+                run_id="run-stock", trigger_type=TriggerType.MANUAL.value,
+                status=RunStatus.SUCCESS.value,
+                started_at=started, finished_at=started + timedelta(seconds=10),
+                created_at=started,
+            ))
+            session.add(HistorySyncRunDataset(
+                run_id="run-stock", dataset=DatasetName.DAILY.value,
+                status=RunDatasetStatus.SUCCESS.value,
+                # 旧水位列（历史数据保留，但新 run 可以为 NULL）
+                start_watermark=None, target_trade_date=None, end_watermark=None,
+                dates_completed=0,
+                # 累计列
+                rows_written=1234, request_count=5, retry_count=0,
+                # 个股统计列（新）
+                processed_count=100, task_success_count=98,
+                task_failed_count=2, skipped_count=50,
+                started_at=started, finished_at=started + timedelta(seconds=10),
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/runs/run-stock").json()
+
+        daily = next(d for d in body["datasets"] if d["dataset"] == "daily")
+        # 新列存在
+        assert daily["processed_count"] == 100
+        assert daily["task_success_count"] == 98
+        assert daily["task_failed_count"] == 2
+        assert daily["skipped_count"] == 50
+        # 旧兼容列仍存在（值为 NULL 或 0）
+        assert "start_watermark" in daily
+        assert "end_watermark" in daily
+        assert "dates_completed" in daily
+        # progress 字段存在（非运行中为 None）
+        assert "progress" in body
+        assert body["progress"] is None
+
+    def test_run_detail_running_has_progress_field(self, client_factory, session_factory):
+        """RUNNING 状态的 run，detail 响应带 progress 字段（可能为 None 或有值）。"""
+        started = now_beijing()
+        with session_factory() as session:
+            session.add(HistorySyncRun(
+                run_id="run-progress", trigger_type=TriggerType.MANUAL.value,
+                status=RunStatus.RUNNING.value,
+                started_at=started, created_at=started,
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/runs/run-progress").json()
+
+        assert "progress" in body
+        # progress 可以是 None（没有 history_sync_service 在 app.state）或 dict
+        if body["progress"] is not None:
+            assert "current_dataset" in body["progress"]
+            assert "processed" in body["progress"]
+
+
+class TestStocks:
+    """GET /api/admin/history-data/stocks 个股列表测试（tasks 8.2）。"""
+
+    def _seed_stocks(self, session_factory, *, dataset="daily", n=3):
+        """构造测试股票数据（instrument + cn_stock_basic + 可选 stock_sync_state）。"""
+        from app.models.history_sync import StockSyncState as SSS
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+
+        _seed_calendar(session_factory)
+        _seed_state(
+            session_factory, DatasetName(dataset),
+            status=DatasetStatus.CAUGHT_UP.value,
+            latest_complete_trade_date=date(2026, 9, 16),
+            latest_expected_trade_date=date(2026, 9, 16),
+        )
+        with session_factory() as session:
+            for i in range(1, n + 1):
+                symbol = f"{i:06d}"
+                inst_id = f"CN:STOCK:{symbol}"
+                ts_code = f"{symbol}.SZ"
+                session.add(Instrument(
+                    instrument_id=inst_id, symbol=symbol,
+                    name=f"股票{i}", market="CN", asset_type="STOCK",
+                    currency="CNY", exchange="SZSE", is_active=True,
+                ))
+            session.flush()
+            for i in range(1, n + 1):
+                symbol = f"{i:06d}"
+                inst_id = f"CN:STOCK:{symbol}"
+                ts_code = f"{symbol}.SZ"
+                session.add(CnStockBasic(
+                    instrument_id=inst_id, ts_code=ts_code,
+                    symbol=symbol, name=f"股票{i}",
+                    list_date=date(2010, 1, 4),
+                    source="tushare", fetched_at=now_beijing(),
+                    source_last_seen_at=now_beijing(),
+                ))
+            session.commit()
+
+    def test_stocks_requires_dataset(self, client_factory, session_factory):
+        """缺 dataset 参数 → 422。"""
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            assert client.get("/api/admin/history-data/stocks").status_code == 422
+
+    def test_stocks_rejects_non_daily_dataset(self, client_factory, session_factory):
+        """非日级数据集 → 422。"""
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            resp = client.get("/api/admin/history-data/stocks?dataset=stock_basic")
+            assert resp.status_code == 422
+            assert "日级数据集" in resp.json()["detail"]
+
+    def test_stocks_rejects_invalid_status(self, client_factory, session_factory):
+        """非法 status → 422。"""
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            resp = client.get("/api/admin/history-data/stocks?dataset=daily&status=bogus")
+            assert resp.status_code == 422
+
+    def test_stocks_requires_admin(self, client_factory):
+        """普通用户 → 403。"""
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert client.get("/api/admin/history-data/stocks?dataset=daily").status_code == 403
+
+    def test_stocks_requires_login(self, client_factory):
+        """未登录 → 401。"""
+        with client_factory(FakeNameProvider()) as client:
+            assert client.get("/api/admin/history-data/stocks?dataset=daily").status_code == 401
+
+    def test_stocks_list_response_structure(self, client_factory, session_factory):
+        """响应结构：items + stats + pagination。"""
+        self._seed_stocks(session_factory, n=3)
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/stocks?dataset=daily").json()
+
+        assert "items" in body
+        assert "stats" in body
+        assert "pagination" in body
+        assert isinstance(body["items"], list)
+        assert len(body["items"]) == 3
+        # items 字段
+        item = body["items"][0]
+        for field in (
+            "ts_code", "name", "list_date", "delist_date",
+            "watermark_date", "last_status", "last_error_code",
+            "last_error", "last_success_at", "last_attempt_at",
+        ):
+            assert field in item, f"缺少字段 {field}"
+        # stats 字段
+        for field in (
+            "stock_count", "up_to_date_count", "lagging_count",
+            "today_success_count", "today_failed_count", "completion_rate",
+        ):
+            assert field in body["stats"], f"缺少 stats.{field}"
+        # pagination 字段
+        assert body["pagination"]["page"] == 1
+        assert body["pagination"]["page_size"] == 100
+        assert body["pagination"]["total"] == 3
+        assert body["pagination"]["total_pages"] == 1
+
+    def test_stocks_default_order_failed_first_then_watermark_asc(
+        self, client_factory, session_factory
+    ):
+        """默认排序：失败优先 → 水位升序（NULL 最前） → ts_code 升序。"""
+        from app.models.history_sync import StockSyncState as SSS
+
+        self._seed_stocks(session_factory, n=3)
+        # 股票1: 失败（排最前）、股票2: 无水位（NULL，次之）、股票3: 水位 09-16（最后）
+        with session_factory() as session:
+            session.add(SSS(
+                dataset="daily", instrument_id="CN:STOCK:000001",
+                ts_code="000001.SZ", watermark_date=date(2026, 9, 14),
+                last_status="failed", last_error_code="E1", last_error="err",
+                last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.add(SSS(
+                dataset="daily", instrument_id="CN:STOCK:000003",
+                ts_code="000003.SZ", watermark_date=date(2026, 9, 16),
+                last_status="success",
+                last_success_at=now_beijing(), last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            # 股票2 无 stock_sync_state 行（NULL 水位）
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/stocks?dataset=daily").json()
+
+        codes = [item["ts_code"] for item in body["items"]]
+        # 失败排最前 → NULL 水位 → 成功且有水位
+        assert codes[0] == "000001.SZ", "失败股票应排最前"
+        assert codes[1] == "000002.SZ", "无水位（NULL）应次之"
+        assert codes[2] == "000003.SZ", "已追平排最后"
+
+    def test_stocks_status_filter(self, client_factory, session_factory):
+        """status=success / failed 筛选。"""
+        from app.models.history_sync import StockSyncState as SSS
+
+        self._seed_stocks(session_factory, n=3)
+        with session_factory() as session:
+            session.add(SSS(
+                dataset="daily", instrument_id="CN:STOCK:000001",
+                ts_code="000001.SZ", watermark_date=date(2026, 9, 14),
+                last_status="failed",
+                last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.add(SSS(
+                dataset="daily", instrument_id="CN:STOCK:000002",
+                ts_code="000002.SZ", watermark_date=date(2026, 9, 16),
+                last_status="success",
+                last_success_at=now_beijing(), last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            success = client.get("/api/admin/history-data/stocks?dataset=daily&status=success").json()
+            failed = client.get("/api/admin/history-data/stocks?dataset=daily&status=failed").json()
+
+        assert len(success["items"]) == 1
+        assert success["items"][0]["ts_code"] == "000002.SZ"
+        assert len(failed["items"]) == 1
+        assert failed["items"][0]["ts_code"] == "000001.SZ"
+
+    def test_stocks_search_by_name_or_code(self, client_factory, session_factory):
+        """q 参数按 name / ts_code 模糊搜索。"""
+        self._seed_stocks(session_factory, n=5)
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            # 按代码搜
+            r1 = client.get("/api/admin/history-data/stocks?dataset=daily&q=000003").json()
+            assert len(r1["items"]) == 1
+            assert r1["items"][0]["ts_code"] == "000003.SZ"
+            # 按名称搜
+            r2 = client.get("/api/admin/history-data/stocks?dataset=daily&q=股票5").json()
+            assert len(r2["items"]) == 1
+            assert r2["items"][0]["name"] == "股票5"
+
+    def test_stocks_pagination(self, client_factory, session_factory):
+        """分页：page_size=100，超过时分页。"""
+        from app.models.history_sync import StockSyncState as SSS
+
+        self._seed_stocks(session_factory, n=150)
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            p1 = client.get("/api/admin/history-data/stocks?dataset=daily&page=1").json()
+            p2 = client.get("/api/admin/history-data/stocks?dataset=daily&page=2").json()
+
+        assert len(p1["items"]) == 100
+        assert p1["pagination"]["page"] == 1
+        assert p1["pagination"]["total"] == 150
+        assert p1["pagination"]["total_pages"] == 2
+
+        assert len(p2["items"]) == 50
+        assert p2["pagination"]["page"] == 2
+
+
+class TestTasks:
+    """GET /api/admin/history-data/tasks/{task_id} 任务详情测试（tasks 8.3）。"""
+
+    def _seed_task(self, session_factory):
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+        from app.models.history_sync import SyncTask
+
+        with session_factory() as session:
+            session.add(Instrument(
+                instrument_id="CN:STOCK:000001", symbol="000001",
+                name="平安银行", market="CN", asset_type="STOCK",
+                currency="CNY", exchange="SZSE", is_active=True,
+            ))
+            session.flush()
+            session.add(CnStockBasic(
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                symbol="000001", name="平安银行",
+                list_date=date(2010, 1, 4),
+                source="tushare", fetched_at=now_beijing(),
+                source_last_seen_at=now_beijing(),
+            ))
+            started = now_beijing()
+            task = SyncTask(
+                id=1,  # 手动指定 id（sequence 在 DuckDB 中测试不太方便）
+                run_id="run-task-1", dataset=DatasetName.DAILY.value,
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                start_date=date(2026, 9, 15), end_date=date(2026, 9, 16),
+                status="success", retry_count=0, attempt_count=1,
+                records_fetched=2, records_written=2,
+                started_at=started, finished_at=started + timedelta(seconds=3),
+                duration_ms=3000,
+                created_at=started,
+            )
+            session.add(task)
+            session.commit()
+            return task.id
+
+    def test_task_detail_success(self, client_factory, session_factory):
+        """任务详情正常返回 + JOIN 主档补 stock_name。"""
+        task_id = self._seed_task(session_factory)
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get(f"/api/admin/history-data/tasks/{task_id}").json()
+
+        assert body["id"] == task_id
+        assert body["run_id"] == "run-task-1"
+        assert body["dataset"] == "daily"
+        assert body["ts_code"] == "000001.SZ"
+        assert body["stock_name"] == "平安银行"
+        assert body["status"] == "success"
+        assert body["records_fetched"] == 2
+        assert body["records_written"] == 2
+        assert body["duration_ms"] == 3000
+        assert body["started_at"].endswith("+08:00")
+        assert "error_code" in body
+        assert "error_message" in body
+
+    def test_task_not_found(self, client_factory, session_factory):
+        """不存在的 task_id → 404。"""
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            resp = client.get("/api/admin/history-data/tasks/999999")
+            assert resp.status_code == 404
+            assert "不存在" in resp.json()["detail"]
+
+    def test_task_requires_admin(self, client_factory):
+        """普通用户 → 403。"""
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert client.get("/api/admin/history-data/tasks/1").status_code == 403
+
+    def test_task_requires_login(self, client_factory):
+        """未登录 → 401。"""
+        with client_factory(FakeNameProvider()) as client:
+            assert client.get("/api/admin/history-data/tasks/1").status_code == 401
+
+
+class TestDatasetsEndpoint:
+    def test_datasets_returns_daily_and_master(self, client_factory, session_factory):
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/datasets").json()
+        assert "daily" in body
+        assert "master" in body
+        assert len(body["daily"]) == 4
+        assert any(d["dataset"] == "daily" for d in body["daily"])
+
 
 class TestNoTokenLeak:
-    def test_summary_and_runs_never_contain_token(self, client_factory, session_factory):
+    def test_all_endpoints_never_contain_token(self, client_factory, session_factory):
         """§51.3/§62：API 响应不得出现 Token 明文（沿 config 无 Token 路径）。"""
+        from app.models.history_sync import SyncTask
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+
+        # 构造测试数据确保各端点有内容返回
+        _seed_calendar(session_factory)
+        _seed_state(session_factory, DatasetName.DAILY,
+                    status=DatasetStatus.CAUGHT_UP.value)
+        with session_factory() as session:
+            session.add(Instrument(
+                instrument_id="CN:STOCK:000001", symbol="000001",
+                name="测试", market="CN", asset_type="STOCK",
+                currency="CNY", exchange="SZSE", is_active=True,
+            ))
+            session.flush()
+            session.add(CnStockBasic(
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                symbol="000001", name="测试",
+                list_date=date(2010, 1, 4),
+                source="tushare", fetched_at=now_beijing(),
+                source_last_seen_at=now_beijing(),
+            ))
+            started = now_beijing()
+            session.add(SyncTask(
+                id=42, run_id="r1", dataset=DatasetName.DAILY.value,
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                start_date=date(2026, 9, 15), end_date=date(2026, 9, 16),
+                status="success", records_fetched=1, records_written=1,
+                started_at=started, finished_at=started, duration_ms=100,
+                created_at=started,
+            ))
+            session.commit()
+
         with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
-            summary = client.get("/api/admin/history-data/summary")
-            runs = client.get("/api/admin/history-data/runs")
-        for resp in (summary, runs):
-            assert "token" not in resp.text.lower().replace("last_error_code", "")
+            responses = [
+                client.get("/api/admin/history-data/summary"),
+                client.get("/api/admin/history-data/runs"),
+                client.get("/api/admin/history-data/datasets"),
+                client.get("/api/admin/history-data/stocks?dataset=daily"),
+                client.get("/api/admin/history-data/tasks/42"),
+            ]
+        for resp in responses:
+            assert resp.status_code == 200, resp.url
+            text = resp.text.lower().replace("last_error_code", "")
+            assert "token" not in text, f"{resp.url} 响应包含 token"

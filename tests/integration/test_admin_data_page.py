@@ -79,9 +79,12 @@ def test_admin_page_includes_csrf_meta(admin_client):
 
 
 def test_admin_page_nav_present(admin_client):
-    """页面加入现有管理员导航（用户管理/系统状态；本页自身不重复链接）。"""
+    """页面加入现有管理员导航（个股历史/用户管理/系统状态；本页自身不重复链接）。"""
     body = admin_client.get("/admin/data").text
-    for href in ('href="/admin/users"', 'href="/admin/status"', 'href="/"'):
+    for href in (
+        'href="/admin/data/stocks"', 'href="/admin/users"',
+        'href="/admin/status"', 'href="/"',
+    ):
         assert href in body
 
 
@@ -93,6 +96,57 @@ def test_admin_nav_entry_added_everywhere(client_factory, path):
     with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
         body = client.get(path).text
     assert 'href="/admin/data"' in body, f"{path} 缺少数据管理导航入口"
+
+
+# ==================== 个股历史页（/admin/data/stocks） ====================
+
+
+class TestAdminDataStocksPage:
+    def test_anonymous_redirects_to_login(self, client_factory, user_factory):
+        """未登录访问 /admin/data/stocks：302 跳转 /login。"""
+        user_factory("someone")
+        client = client_factory(FakeNameProvider())
+        resp = client.get("/admin/data/stocks", follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/login"
+
+    def test_normal_user_returns_403(self, client_factory):
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            resp = client.get("/admin/data/stocks")
+            assert resp.status_code == 403
+
+    def test_admin_page_renders(self, admin_client):
+        resp = admin_client.get("/admin/data/stocks")
+        assert resp.status_code == 200
+        body = resp.text
+
+        assert 'data-page="admin-data-stocks"' in body
+        # 关键页面元素
+        for anchor in (
+            'id="dataset-chips"',     # 数据集切换 chip
+            'id="status-filter"',      # 状态筛选
+            'id="search-input"',       # 搜索框
+            'id="stocks-table"',       # 股票列表表格
+            'id="prev-page"',          # 上一页
+            'id="next-page"',          # 下一页
+            'id="page-info"',          # 分页信息
+            'id="error-modal"',        # 失败详情 modal
+        ):
+            assert anchor in body, f"缺少页面元素 {anchor}"
+
+    def test_page_includes_csrf_meta(self, admin_client):
+        body = admin_client.get("/admin/data/stocks").text
+        assert 'name="csrf-token"' in body
+
+    def test_page_js_loaded(self, admin_client):
+        body = admin_client.get("/admin/data/stocks").text
+        assert "/static/app.js" in body
+        assert "/static/style.css" in body
+
+    def test_nav_includes_back_to_overview(self, admin_client):
+        """个股页导航应包含返回数据总览的链接。"""
+        body = admin_client.get("/admin/data/stocks").text
+        assert 'href="/admin/data"' in body
 
 
 def test_admin_nav_entry_hidden_for_normal_user(client_factory):

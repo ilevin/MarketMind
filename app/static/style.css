@@ -285,3 +285,81 @@ td.num { font-variant-numeric: tabular-nums; }
   white-space: normal;
 }
 .data-card-body dd.num { font-variant-numeric: tabular-nums; }
+
+/* 个股历史页：工具栏 / chip 分组 / 分页 / 错误详情 */
+.stocks-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.chip-group { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip-group .chip {
+  cursor: pointer;
+  padding: 4px 14px;
+  border-radius: 14px;
+  border: 1px solid #d0d3d8;
+  background: #fff;
+  font-size: 13px;
+}
+.chip-group .chip.on {
+  background: #3366cc;
+  border-color: #3366cc;
+  color: #fff;
+}
+.stocks-filter { display: flex; gap: 8px; align-items: center; }
+.stocks-filter select,
+.stocks-filter input[type="text"] {
+  padding: 5px 8px;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.stocks-filter input[type="text"] { width: 180px; }
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+.pagination button {
+  padding: 5px 14px;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.pagination button:disabled {
+  color: #aaa;
+  cursor: default;
+  background: #f5f6f7;
+}
+
+.active-progress {
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: #f5f7fb;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.error-detail {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: #fafbfc;
+  border: 1px solid #e3e5e8;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #b03a2e;
+  margin-bottom: 12px;
+}

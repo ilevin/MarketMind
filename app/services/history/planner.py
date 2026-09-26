@@ -86,23 +86,3 @@ class HistorySyncPlanner:
             return StockSyncRange(None, None)
 
         return StockSyncRange(result_days[0], result_days[-1])
-
-    # ---- 向后兼容：管理员 summary 仍使用 lag_days（组 8 升级时替换） ----
-
-    @staticmethod
-    def lag_days(
-        *,
-        latest_complete: date | None,
-        latest_expected: date | None,
-        open_days: list[date],
-    ) -> int:
-        """落后交易日天数（管理员页面展示用）：目标以内、已完成之后的交易日数。
-
-        注意：个股模式下该口径是"数据集级旧水位列"的展示兼容，不再反映
-        真实的个股完整度。组 8 升级 summary 后该方法退役。
-        """
-        if latest_expected is None:
-            return 0
-        if latest_complete is None:
-            return len([day for day in open_days if day <= latest_expected])
-        return len([day for day in open_days if latest_complete < day <= latest_expected])

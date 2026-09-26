@@ -828,7 +828,7 @@ function initAdminDataPage() {
       const range = d.data_min_date
         ? `${d.data_min_date} ~ ${d.data_max_date || "—"}`
         : "尚无数据";
-      const lag = d.lag_trade_days > 0 ? `${d.lag_trade_days} 个交易日` : "已追平";
+      const pct = d.stock_count > 0 ? ((d.completion_rate || 0) * 100).toFixed(1) : "0.0";
       card.innerHTML = `
         <div class="data-card-head">
           <span class="data-card-title">${esc(d.display_name)}</span>
@@ -836,15 +836,14 @@ function initAdminDataPage() {
         </div>
         <dl class="data-card-body">
           <dt>数据范围</dt><dd>${esc(range)}</dd>
-          <dt>连续水位</dt><dd>${esc(d.latest_complete_trade_date || "—")}</dd>
-          <dt>当前目标</dt><dd>${esc(d.latest_expected_trade_date || "—")}</dd>
-          <dt>落后</dt><dd>${esc(lag)}</dd>
+          <dt>目标日期</dt><dd>${esc(d.latest_expected_trade_date || "—")}</dd>
+          <dt>股票总数</dt><dd class="num">${(d.stock_count || 0).toLocaleString("zh-CN")}</dd>
+          <dt>已追平</dt><dd class="num">${(d.up_to_date_count || 0).toLocaleString("zh-CN")}</dd>
+          <dt>有缺口</dt><dd class="num">${(d.lagging_count || 0).toLocaleString("zh-CN")}</dd>
+          <dt>完整度</dt><dd class="num">${pct}%</dd>
+          <dt>今日成功</dt><dd class="num">${(d.today_success_count || 0).toLocaleString("zh-CN")}</dd>
+          <dt>今日失败</dt><dd class="num">${(d.today_failed_count || 0).toLocaleString("zh-CN")}</dd>
           <dt>记录数</dt><dd class="num">${(d.record_count || 0).toLocaleString("zh-CN")}</dd>
-          <dt>当前处理</dt><dd>${
-            d.current_trade_date
-              ? `${esc(d.current_trade_date)}（第 ${d.current_attempt} 次）`
-              : "—"
-          }</dd>
           <dt>最后成功</dt><dd>${fmtDateTime(d.last_success_at)}</dd>
           <dt>最后错误</dt><dd class="muted">${
             d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
@@ -877,13 +876,24 @@ function initAdminDataPage() {
     });
   }
 
-  function renderActiveRun(run, datasets) {
+  function renderActiveRun(run, datasets, progress) {
     const box = document.getElementById("active-run");
     if (!run) {
       box.innerHTML = '<p class="muted">当前没有运行中的同步任务。</p>';
       return;
     }
     const done = datasets.filter((d) => d.status !== "RUNNING");
+    // 实时进度（来自进程内 progress 快照）
+    let progressHtml = "";
+    if (progress && progress.current_dataset) {
+      progressHtml = `
+      <div class="active-progress">
+        <span class="muted">当前进度：</span>
+        <strong>${esc(progress.current_dataset)}</strong> /
+        <code>${esc(progress.current_ts_code || "—")}</code>
+        <span class="muted">· 已处理 ${progress.processed} · 成功 ${progress.succeeded} · 失败 ${progress.failed} · 跳过 ${progress.skipped}</span>
+      </div>`;
+    }
     const rows = datasets
       .map(
         (d) => `
@@ -894,9 +904,10 @@ function initAdminDataPage() {
             DATASET_STATUS_LABEL,
             DATASET_STATUS_CLASS
           )}</td>
-          <td>${esc(d.start_watermark || "—")} → ${esc(d.end_watermark || "—")}</td>
-          <td>${esc(d.target_trade_date || "—")}</td>
-          <td class="right num">${d.dates_completed || 0}</td>
+          <td class="right num">${d.processed_count || 0}</td>
+          <td class="right num">${d.task_success_count || 0}</td>
+          <td class="right num">${d.task_failed_count || 0}</td>
+          <td class="right num">${d.skipped_count || 0}</td>
           <td class="right num">${(d.rows_written || 0).toLocaleString("zh-CN")}</td>
           <td class="right num">${d.retry_count || 0}</td>
           <td class="muted">${
@@ -910,12 +921,15 @@ function initAdminDataPage() {
         run ${esc(run.run_id)} · ${TRIGGER_LABEL[run.trigger_type] || run.trigger_type} ·
         开始于 ${fmtDateTime(run.started_at)} · 已完成 ${done.length}/${datasets.length} 个数据集
       </p>
+      ${progressHtml}
       <table class="table">
         <thead>
           <tr>
-            <th>数据集</th><th>状态</th><th>起止水位</th><th>目标</th>
-            <th class="right">完成天数</th><th class="right">写入行数</th>
-            <th class="right">重试</th><th>最后错误</th>
+            <th>数据集</th><th>状态</th>
+            <th class="right">已处理</th><th class="right">成功</th>
+            <th class="right">失败</th><th class="right">跳过</th>
+            <th class="right">写入行数</th><th class="right">重试</th>
+            <th>最后错误</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -932,7 +946,14 @@ function initAdminDataPage() {
       const detail = await api(`/api/admin/history-data/runs/${encodeURIComponent(run.run_id)}`);
       const advanced = detail.datasets
         .map((d) => {
-          const mark = d.dates_completed > 0 ? `${d.dates_completed} 天` : "无";
+          // v0.4.0 优先展示个股口径（processed/success/failed/skipped），
+          // 历史 run 无个股统计时回落到旧 dates_completed 口径
+          let mark;
+          if (d.processed_count > 0 || d.task_success_count > 0 || d.task_failed_count > 0 || d.skipped_count > 0) {
+            mark = `${d.task_success_count}成 ${d.task_failed_count}败 ${d.skipped_count}跳`;
+          } else {
+            mark = d.dates_completed > 0 ? `${d.dates_completed} 天` : "无";
+          }
           return `<span class="chip readonly">${esc(d.display_name)}：${mark}</span>`;
         })
         .join("");
@@ -961,7 +982,7 @@ function initAdminDataPage() {
       const detail = await api(
         `/api/admin/history-data/runs/${encodeURIComponent(summary.active_run.run_id)}`
       );
-      renderActiveRun(detail.run, detail.datasets);
+      renderActiveRun(detail.run, detail.datasets, detail.progress);
       startPolling();
     } else {
       renderActiveRun(null, []);
@@ -1012,6 +1033,245 @@ function initAdminDataPage() {
   refresh().catch((err) => showMsg(msg, err.message, "error"));
 }
 
+// ---------- 个股历史页（admin，per-stock-history-sync 8.5） ----------
+
+function initAdminDataStocksPage() {
+  const chipsBox = document.getElementById("dataset-chips");
+  const statusFilter = document.getElementById("status-filter");
+  const searchInput = document.getElementById("search-input");
+  const prevBtn = document.getElementById("prev-page");
+  const nextBtn = document.getElementById("next-page");
+  const pageInfo = document.getElementById("page-info");
+  const tbody = document.querySelector("#stocks-table tbody");
+  const emptyEl = document.getElementById("stocks-empty");
+  const tableEl = document.getElementById("stocks-table");
+
+  const POLL_MS = 4000;
+  let pollTimer = null;
+  let currentDataset = "daily";
+  let currentStatus = "all";
+  let currentPage = 1;
+  let currentQ = "";
+  let currentTotal = 0;
+  let currentTotalPages = 1;
+  let searchTimer = null;
+
+  const DATASET_NAMES = {
+    daily: "日线行情",
+    adj_factor: "复权因子",
+    daily_basic: "每日指标",
+    moneyflow: "资金流",
+  };
+
+  const LAST_STATUS_LABEL = {
+    success: "成功",
+    failed: "失败",
+  };
+  const LAST_STATUS_CLASS = {
+    success: "ok",
+    failed: "bad",
+  };
+
+  function fmtDateTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  }
+
+  function renderDatasetChips() {
+    chipsBox.innerHTML = "";
+    Object.keys(DATASET_NAMES).forEach((ds) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (ds === currentDataset ? " on" : "");
+      chip.textContent = DATASET_NAMES[ds];
+      chip.dataset.dataset = ds;
+      chip.addEventListener("click", () => {
+        currentDataset = ds;
+        currentPage = 1;
+        renderDatasetChips();
+        loadStocks();
+      });
+      chipsBox.appendChild(chip);
+    });
+  }
+
+  function renderStats(stats) {
+    document.getElementById("dataset-display").textContent = DATASET_NAMES[currentDataset] || currentDataset;
+    document.getElementById("stock-count").textContent = stats.stock_count.toLocaleString("zh-CN");
+    document.getElementById("up-to-date-count").textContent = stats.up_to_date_count.toLocaleString("zh-CN");
+    document.getElementById("lagging-count").textContent = stats.lagging_count.toLocaleString("zh-CN");
+    document.getElementById("today-success").textContent = stats.today_success_count.toLocaleString("zh-CN");
+    document.getElementById("today-failed").textContent = stats.today_failed_count.toLocaleString("zh-CN");
+    const pct = stats.stock_count > 0 ? ((stats.completion_rate || 0) * 100).toFixed(1) : "0.0";
+    document.getElementById("completion-rate").textContent = pct + "%";
+  }
+
+  function renderTable(items) {
+    tbody.innerHTML = "";
+    const hasItems = items.length > 0;
+    emptyEl.classList.toggle("hidden", hasItems);
+    tableEl.classList.toggle("hidden", !hasItems);
+    if (!hasItems) return;
+
+    items.forEach((item) => {
+      const tr = document.createElement("tr");
+      const statusBadge = item.last_status
+        ? `<span class="status-badge ${LAST_STATUS_CLASS[item.last_status] || ""}">${esc(LAST_STATUS_LABEL[item.last_status] || item.last_status)}</span>`
+        : '<span class="muted">未同步</span>';
+      const errorCell = item.last_status === "failed" && item.last_error
+        ? `<button class="link" data-act="error" data-tscode="${esc(item.ts_code)}" data-errorcode="${esc(item.last_error_code || "")}" data-errormsg="${esc(item.last_error || "")}">查看</button>`
+        : '<span class="muted">—</span>';
+      tr.innerHTML = `
+        <td><code>${esc(item.ts_code)}</code></td>
+        <td>${esc(item.name || "—")}</td>
+        <td>${esc(item.list_date || "—")}</td>
+        <td>${esc(item.delist_date || "—")}</td>
+        <td>${esc(item.watermark_date || "—")}</td>
+        <td>${statusBadge}</td>
+        <td class="muted">${fmtDateTime(item.last_success_at)}</td>
+        <td class="muted">${fmtDateTime(item.last_attempt_at)}</td>
+        <td>${errorCell}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderPagination() {
+    pageInfo.textContent = `第 ${currentPage} / ${currentTotalPages} 页 · 共 ${currentTotal} 条`;
+    prevBtn.disabled = currentPage <= 1;
+    nextBtn.disabled = currentPage >= currentTotalPages;
+  }
+
+  async function loadStocks() {
+    const params = new URLSearchParams({
+      dataset: currentDataset,
+      status: currentStatus,
+      q: currentQ,
+      page: String(currentPage),
+    });
+    try {
+      const data = await api(`/api/admin/history-data/stocks?${params.toString()}`);
+      renderStats(data.stats);
+      renderTable(data.items);
+      currentTotal = data.pagination.total;
+      currentTotalPages = data.pagination.total_pages;
+      if (currentPage > currentTotalPages) {
+        currentPage = currentTotalPages;
+        loadStocks();
+        return;
+      }
+      renderPagination();
+    } catch (err) {
+      emptyEl.classList.remove("hidden");
+      tableEl.classList.add("hidden");
+      emptyEl.textContent = `加载失败：${err.message}`;
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollTimer = window.setInterval(() => {
+      loadStocks().catch(() => {});
+    }, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (pollTimer === null) return;
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  // 事件绑定
+  statusFilter.addEventListener("change", () => {
+    currentStatus = statusFilter.value;
+    currentPage = 1;
+    loadStocks();
+  });
+
+  searchInput.addEventListener("input", () => {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      currentQ = searchInput.value.trim();
+      currentPage = 1;
+      loadStocks();
+    }, 300);
+  });
+
+  prevBtn.addEventListener("click", () => {
+    if (currentPage > 1) {
+      currentPage--;
+      loadStocks();
+    }
+  });
+
+  nextBtn.addEventListener("click", () => {
+    if (currentPage < currentTotalPages) {
+      currentPage++;
+      loadStocks();
+    }
+  });
+
+  // 失败详情 modal
+  const modal = document.getElementById("error-modal");
+  const modalTitle = document.getElementById("error-modal-title");
+  const modalTsCode = document.getElementById("error-modal-tscode");
+  const modalErrCode = document.getElementById("error-modal-errorcode");
+  const modalMsg = document.getElementById("error-modal-message");
+  const modalClose = document.getElementById("error-modal-close");
+
+  function openErrorModal(tsCode, errCode, errMsg) {
+    modalTitle.textContent = `失败详情：${tsCode}`;
+    modalTsCode.textContent = tsCode;
+    modalErrCode.textContent = errCode || "未知错误码";
+    modalMsg.textContent = errMsg || "（无错误信息）";
+    modal.classList.remove("hidden");
+  }
+
+  function closeErrorModal() {
+    modal.classList.add("hidden");
+  }
+
+  modalClose.addEventListener("click", closeErrorModal);
+  modal.addEventListener("click", (ev) => {
+    if (ev.target === modal) closeErrorModal();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !modal.classList.contains("hidden")) {
+      closeErrorModal();
+    }
+  });
+
+  tbody.addEventListener("click", (ev) => {
+    const btn = ev.target.closest('button[data-act="error"]');
+    if (!btn) return;
+    openErrorModal(btn.dataset.tscode, btn.dataset.errorcode, btn.dataset.errormsg);
+  });
+
+  // 运行中轮询：先查一次 summary 判断是否有 active run
+  async function checkPolling() {
+    try {
+      const summary = await api("/api/admin/history-data/summary");
+      if (summary.active_run) {
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    } catch (err) {
+      stopPolling();
+    }
+  }
+
+  window.addEventListener("beforeunload", stopPolling);
+
+  // 初始化
+  renderDatasetChips();
+  loadStocks();
+  checkPolling();
+  // 每 30 秒检查一次是否需要轮询（同步任务可能在页面打开期间启动）
+  setInterval(checkPolling, 30000);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const page = document.body.dataset.page;
   bindLogout();
@@ -1023,4 +1283,5 @@ document.addEventListener("DOMContentLoaded", () => {
   else if (page === "change-password") initChangePasswordPage();
   else if (page === "admin-users") initAdminUsersPage();
   else if (page === "admin-data") initAdminDataPage();
+  else if (page === "admin-data-stocks") initAdminDataStocksPage();
 });

@@ -1,9 +1,19 @@
-"""历史数据管理 API Schema（a-share-historical-data，技术方案 §52、tasks 7.1）。
+"""历史数据管理 API Schema（a-share-historical-data，技术方案 §52、tasks 8.1~8.3）。
 
-首个按域拆分的 Schema 模块（此前集中于 ``app/schemas/__init__.py``）：历史
-数据管理的 summary / sync / runs 模型字段较多且仅本域使用，集中于此更清晰。
+按域拆分的 Schema 模块：历史数据管理的 summary / sync / runs / stocks / tasks
+模型字段较多且仅本域使用，集中于此更清晰。
 
 时间字段统一为北京时间带时区 ISO（与 ``app/api/status.py`` 的既有约定一致）。
+
+v0.4.0（per-stock-history-sync）升级：
+- ``DailyDatasetSummary`` 新增个股口径字段（stock_count / up_to_date_count /
+  lagging_count / today_success_count / today_failed_count / completion_rate）；
+  旧水位字段保留输出（历史 run_dataset 行兼容，冻结为 NULL/0）。
+- ``RunDatasetDetail`` 新增 processed_count / task_success_count /
+  task_failed_count / skipped_count 四列（个股模式统计口径）。
+- 新增 ``StockListItem`` / ``StockListResponse``（个股列表，§8.2）。
+- 新增 ``TaskDetailResponse``（任务详情，§8.3）。
+- 新增 ``StockSyncProgressSchema``（运行中实时进度，design D10）。
 """
 
 from __future__ import annotations
@@ -11,11 +21,24 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
-# ---- summary（§52.1） ----
+# ---- summary（§52.1 / D12） ----
 
 
 class DailyDatasetSummary(BaseModel):
-    """日级数据集状态（字段与 §52.1 一一对应）。"""
+    """日级数据集状态（v0.4.0 个股口径，design D11/D12）。
+
+    个股口径字段：
+        stock_count: 数据集范围内的股票总数（universe 大小）
+        up_to_date_count: 水位 >= target 的股票数（已追平）
+        lagging_count: 水位 < target 或无水位的股票数（有缺口）
+        today_success_count: 今日（Asia/Shanghai）最后一次尝试成功的股票数
+        today_failed_count: 今日最后一次尝试失败的股票数
+        completion_rate: 完整度（0~1，up_to_date_count / stock_count）
+
+    旧口径字段保留输出（兼容历史与冻结展示）：
+        latest_complete_trade_date / lag_trade_days / current_trade_date /
+        current_attempt 等，新写入下为冻结值。
+    """
 
     dataset: str
     display_name: str
@@ -33,6 +56,13 @@ class DailyDatasetSummary(BaseModel):
     last_success_at: str | None = None
     last_error_code: str | None = None
     last_error: str | None = None
+    # —— 个股口径（v0.4.0 新增） ——
+    stock_count: int = 0
+    up_to_date_count: int = 0
+    lagging_count: int = 0
+    today_success_count: int = 0
+    today_failed_count: int = 0
+    completion_rate: float = 0.0
 
 
 class MasterDatasetSummary(BaseModel):
@@ -85,25 +115,32 @@ class SyncConflictResponse(BaseModel):
     message: str = "历史数据同步正在运行"
 
 
-# ---- 执行记录（§52.3/§52.4） ----
+# ---- 执行记录（§52.3 / §52.4，v0.4.0 新增个股统计列） ----
 
 
 class RunDatasetDetail(BaseModel):
     dataset: str
     display_name: str
     status: str
+    # 旧水位列（冻结兼容，新 run_dataset 行为 NULL/0）
     start_watermark: str | None = None
     target_trade_date: str | None = None
     end_watermark: str | None = None
     start_cursor: str | None = None
     end_cursor: str | None = None
     dates_completed: int = 0
-    rows_written: int = 0
-    request_count: int = 0
-    retry_count: int = 0
     failed_trade_date: str | None = None
     last_error_code: str | None = None
     last_error: str | None = None
+    # 累计口径（个股模式下继续累计）
+    rows_written: int = 0
+    request_count: int = 0
+    retry_count: int = 0
+    # —— 个股口径统计（v0.4.0 新增） ——
+    processed_count: int = 0
+    task_success_count: int = 0
+    task_failed_count: int = 0
+    skipped_count: int = 0
     started_at: str | None = None
     finished_at: str | None = None
 
@@ -123,8 +160,89 @@ class RunListResponse(BaseModel):
     items: list[RunItem] = []
 
 
+class StockSyncProgressSchema(BaseModel):
+    """运行中实时进度快照（design D10，API 只读展示）。"""
+
+    current_dataset: str | None = None
+    current_ts_code: str | None = None
+    processed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+
 class RunDetailResponse(BaseModel):
-    """run 详情：供页面轮询当前进度（run + 每个 dataset 的执行详情）。"""
+    """run 详情：供页面轮询当前进度（run + 每个 dataset 的执行详情 + 实时 progress）。"""
 
     run: RunItem
     datasets: list[RunDatasetDetail] = []
+    progress: StockSyncProgressSchema | None = None
+
+
+# ---- 个股列表（§8.2 / D12） ----
+
+
+class StockListItem(BaseModel):
+    """个股列表行（cn_stock_basic LEFT JOIN stock_sync_state）。"""
+
+    ts_code: str
+    name: str | None = None
+    list_date: str | None = None
+    delist_date: str | None = None
+    watermark_date: str | None = None
+    last_status: str | None = None  # success / failed / None（从未尝试）
+    last_error_code: str | None = None
+    last_error: str | None = None
+    last_success_at: str | None = None
+    last_attempt_at: str | None = None
+
+
+class StockStats(BaseModel):
+    """个股列表页的统计块（复用 summary 口径）。"""
+
+    stock_count: int = 0
+    up_to_date_count: int = 0
+    lagging_count: int = 0
+    today_success_count: int = 0
+    today_failed_count: int = 0
+    completion_rate: float = 0.0
+
+
+class StockPagination(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class StockListResponse(BaseModel):
+    items: list[StockListItem] = []
+    stats: StockStats
+    pagination: StockPagination
+
+
+# ---- 任务详情（§8.3 / D12） ----
+
+
+class TaskDetailResponse(BaseModel):
+    """sync_task 详情（JOIN 主档补 stock_name），只读。"""
+
+    id: int
+    run_id: str
+    dataset: str
+    instrument_id: str
+    ts_code: str
+    stock_name: str | None = None
+    start_date: str
+    end_date: str
+    status: str
+    retry_count: int
+    attempt_count: int
+    records_fetched: int
+    records_written: int
+    error_code: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    started_at: str
+    finished_at: str | None = None
+    duration_ms: int | None = None

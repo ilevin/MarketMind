@@ -2,24 +2,22 @@
 
 与 ``tests/unit/test_history_ts_code_alias.py``（Provider 边界单测）互补：
 这里把**真实** ``TushareHistoricalMarketDataProvider`` 接进
-``HistorySyncService``，走完整的"抓取 → 别名规范化 → 校验（含
-``known_instrument_ids`` 主档保护）→ 单日原子提交 → 水位推进"链路，验证修复
-在业务层真的生效，而不只是在 Provider 单测里成立。
+``HistorySyncService``，走完整的"抓取 → 别名规范化 → 校验 → 单股区间原子
+提交 → 水位推进"链路（per-stock-history-sync 个股口径，tasks 7.3），验证
+修复在业务层真的生效，而不只是在 Provider 单测里成立。
 
 覆盖：
 
-- 旧代码只出现在事实数据里时，历史交易日能被正常提交、水位推进，落库的是
-  规范 instrument，且不新建 ``CN:STOCK:000022`` 假证券；
-- ``ALIAS_CONFLICT`` 属配置类错误 → 一次尝试即终态失败、水位不推进；
-- 一个数据集冲突不影响其余数据集推进（design D17 互不阻塞）；
-- ``daily_basic`` 截断补齐的候选集差额不含规范代码，不会重复请求（§11.3）。
+- 旧代码股区间回填落规范码并推进水位（个股水位，非数据集级水位）
+- ALIAS_CONFLICT 只失败该股不阻塞数据集（其他股正常、数据集 LAGGING、Run SUCCESS）
+- UNKNOWN_INSTRUMENT 拒绝不建占位证券（instrument 表断言无新增）
 
 Tushare SDK 由 fake client 替代——本文件不访问网络。
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -27,7 +25,16 @@ import pytest
 from sqlalchemy import select
 
 from app.config import AppConfig, TushareConfig
-from app.models.history_sync import DatasetName, DatasetStatus, TriggerType
+from app.models.history_fact import HISTORY_FACT_TABLES
+from app.models.history_sync import (
+    DatasetName,
+    DatasetStatus,
+    RunDatasetStatus,
+    RunStatus,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_SUCCESS,
+    TriggerType,
+)
 from app.providers.history import HistoryProviderRegistry
 from app.providers.history.tushare import (
     STOCK_BASIC_FIELDS,
@@ -38,7 +45,12 @@ from app.providers.trading_calendar.provider import CalendarDayRecord
 from app.providers.tushare_common import TushareRequestGate, TushareTransport
 from app.repositories.history_fact import HistoryFactRepository
 from app.repositories.history_master import HistoryMasterRepository
-from app.repositories.history_sync import HistorySyncStateRepository
+from app.repositories.history_sync import (
+    HistorySyncRunDatasetRepository,
+    HistorySyncRunRepository,
+    HistorySyncStateRepository,
+    StockSyncStateRepository,
+)
 from app.services.history.sync_service import HistorySyncService
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -53,6 +65,8 @@ CANONICAL_TS_CODE = "001872.SZ"    # 招商港口（今天的代码）
 CANONICAL_SYMBOL = "001872"
 LEGACY_SYMBOL = "000022"
 OTHER_SYMBOL = "000001"
+CANONICAL_INSTRUMENT_ID = f"CN:STOCK:{CANONICAL_SYMBOL}"
+OTHER_INSTRUMENT_ID = f"CN:STOCK:{OTHER_SYMBOL}"
 
 DAY_LEVEL_DATASETS = (
     DatasetName.DAILY,
@@ -80,9 +94,14 @@ class FakeCalendarProvider:
 class FakeTushareClient:
     """按 endpoint 预置响应的 fake SDK client。
 
+    同时支持两种调用形态：
+    - 单日：``endpoint(trade_date="YYYYMMDD", ...)`` —— 旧路径/主档用
+    - 区间：``endpoint(ts_code="XXX.SZ", start_date="YYYYMMDD", end_date="YYYYMMDD")``
+      —— 个股路径 ``get_history_by_stock`` 用
+
     ``stock_basic`` 只返回**今天的**代码——旧代码在任何 exchange ×
     list_status 分片里都不存在，与真实情况一致（这正是问题成因）。
-    ``daily`` 同时返回新旧两行（模拟上游同时给出两套代码）。
+    ``daily`` 同时返回新旧两行（模拟上游同时给出两套代码，别名层负责合并/冲突检测）。
     """
 
     def __init__(self, *, daily_conflict: bool = False):
@@ -121,52 +140,89 @@ class FakeTushareClient:
             ]
         )
 
-    # -- 日级事实 --
+    # -- 日级事实（同时支持单日与区间调用） --
+
+    def _range_dates(self, params: dict) -> list[date]:
+        """从 params 中解析日期范围，返回 date 列表。
+
+        - 有 ``trade_date`` → 单日
+        - 有 ``start_date`` + ``end_date`` → 区间（含端点）
+        """
+        if "trade_date" in params:
+            return [pd.Timestamp(params["trade_date"]).date()]
+        if "start_date" in params and "end_date" in params:
+            start = pd.Timestamp(params["start_date"]).date()
+            end = pd.Timestamp(params["end_date"]).date()
+            dates = []
+            d = start
+            while d <= end:
+                dates.append(d)
+                d += timedelta(days=1)
+            return dates
+        return []
+
+    def _codes_for_request(self, params: dict) -> list[str]:
+        """根据请求参数确定返回哪些 ts_code 的行。
+
+        规则：
+        - 没指定 ts_code（全市场单日）→ 返回旧码 + 新码 + 000001.SZ
+        - 指定规范码 001872.SZ → 返回旧码 000022.SZ + 规范码 001872.SZ（模拟上游回旧代码）
+        - 指定其他代码 → 返回该代码自己的一行
+        """
+        requested = params.get("ts_code")
+        if requested is None:
+            return [LEGACY_TS_CODE, CANONICAL_TS_CODE, f"{OTHER_SYMBOL}.SZ"]
+        if requested == CANONICAL_TS_CODE:
+            # 上游对历史日期即使被问规范代码，仍可能回旧代码
+            return [LEGACY_TS_CODE, CANONICAL_TS_CODE]
+        return [requested]
 
     def daily(self, **params) -> pd.DataFrame:
         self.calls.append(("daily", params))
-        day = params["trade_date"]
-        legacy_close = 12.3
-        canonical_close = 99.0 if self.daily_conflict else 12.3
-        return pd.DataFrame(
-            [
-                _daily_row(LEGACY_TS_CODE, day, close=legacy_close),
-                _daily_row(CANONICAL_TS_CODE, day, close=canonical_close),
-            ]
-        )
+        dates = self._range_dates(params)
+        codes = self._codes_for_request(params)
+        rows = []
+        for d in dates:
+            day_str = d.strftime("%Y%m%d")
+            for code in codes:
+                if code == CANONICAL_TS_CODE and self.daily_conflict:
+                    rows.append(_daily_row(code, day_str, close=99.0))
+                else:
+                    rows.append(_daily_row(code, day_str, close=12.3))
+        return pd.DataFrame(rows)
 
     def adj_factor(self, **params) -> pd.DataFrame:
         self.calls.append(("adj_factor", params))
-        day = params["trade_date"]
-        return pd.DataFrame(
-            [
-                {"ts_code": LEGACY_TS_CODE, "trade_date": day, "adj_factor": 1.0},
-                {"ts_code": CANONICAL_TS_CODE, "trade_date": day, "adj_factor": 1.0},
-            ]
-        )
+        dates = self._range_dates(params)
+        codes = self._codes_for_request(params)
+        rows = []
+        for d in dates:
+            day_str = d.strftime("%Y%m%d")
+            for code in codes:
+                rows.append({"ts_code": code, "trade_date": day_str, "adj_factor": 1.0})
+        return pd.DataFrame(rows)
 
     def daily_basic(self, **params) -> pd.DataFrame:
         self.calls.append(("daily_basic", params))
-        day = params["trade_date"]
-        requested = params.get("ts_code")
-        if requested == CANONICAL_TS_CODE:
-            # 上游对历史日期即使被问规范代码，仍可能回旧代码
-            codes = [LEGACY_TS_CODE]
-        elif requested:
-            codes = [requested]
-        else:
-            codes = [LEGACY_TS_CODE, CANONICAL_TS_CODE]
-        return pd.DataFrame([_daily_basic_row(code, day) for code in codes])
+        dates = self._range_dates(params)
+        codes = self._codes_for_request(params)
+        rows = []
+        for d in dates:
+            day_str = d.strftime("%Y%m%d")
+            for code in codes:
+                rows.append(_daily_basic_row(code, day_str))
+        return pd.DataFrame(rows)
 
     def moneyflow(self, **params) -> pd.DataFrame:
         self.calls.append(("moneyflow", params))
-        day = params["trade_date"]
-        return pd.DataFrame(
-            [
-                _moneyflow_row(LEGACY_TS_CODE, day),
-                _moneyflow_row(CANONICAL_TS_CODE, day),
-            ]
-        )
+        dates = self._range_dates(params)
+        codes = self._codes_for_request(params)
+        rows = []
+        for d in dates:
+            day_str = d.strftime("%Y%m%d")
+            for code in codes:
+                rows.append(_moneyflow_row(code, day_str))
+        return pd.DataFrame(rows)
 
     def __getattr__(self, endpoint: str):
         def call(**params):
@@ -218,20 +274,11 @@ def _build_provider(client: FakeTushareClient) -> TushareHistoricalMarketDataPro
 
 
 class SpyRegistry(HistoryProviderRegistry):
-    """记录 ``get_daily_basic_for_instruments`` 收到的缺失代码。"""
+    """透传 registry：用于观察 Provider 行为。"""
 
     def __init__(self, client: FakeTushareClient):
         config = AppConfig(tushare=TushareConfig(token="fake-token"))
         super().__init__(config, provider=_build_provider(client))
-        self.missing_calls: list[list[str] | None] = []
-
-    def get_daily_basic_for_instruments(
-        self, trade_date, instruments, *, missing_ts_codes=None
-    ):
-        self.missing_calls.append(missing_ts_codes)
-        return super().get_daily_basic_for_instruments(
-            trade_date, instruments, missing_ts_codes=missing_ts_codes
-        )
 
 
 @pytest.fixture()
@@ -250,7 +297,7 @@ def make_service(session_factory, frozen_now):
     def _make(client: FakeTushareClient, *, registry=None) -> HistorySyncService:
         config = AppConfig(tushare=TushareConfig(token="fake-token"))
         config.history.start_date = LEGACY_DAY
-        config.history.max_attempts = 3
+        config.history.max_retries = 3  # 总尝试 4 次
         return HistorySyncService(
             config,
             session_factory,
@@ -263,7 +310,12 @@ def make_service(session_factory, frozen_now):
     return _make
 
 
-def _state(session_factory, dataset: DatasetName):
+def _stock_state(session_factory, dataset: DatasetName, instrument_id: str):
+    with session_factory() as session:
+        return StockSyncStateRepository(session).get(dataset, instrument_id)
+
+
+def _dataset_state(session_factory, dataset: DatasetName):
     with session_factory() as session:
         return HistorySyncStateRepository(session).get(dataset)
 
@@ -274,8 +326,6 @@ def _fact_rows(session_factory, dataset: DatasetName, trade_date: date) -> int:
 
 
 def _fact_ts_codes(session_factory, dataset: DatasetName, trade_date: date) -> set[str]:
-    from app.models.history_fact import HISTORY_FACT_TABLES
-
     with session_factory() as session:
         table = HISTORY_FACT_TABLES[dataset.value]
         return set(
@@ -293,32 +343,37 @@ def _master_ids(session_factory) -> set[str]:
         }
 
 
-# ---- 主场景：旧代码不再阻塞历史回填 ----
+# ---- 主场景：旧代码区间回填落规范码 ----
 
 
 class TestLegacyCodeBackfill:
-    def test_all_day_level_datasets_advance_watermark(
+    """旧代码股区间回填：落规范码、推进个股水位。"""
+
+    def test_all_day_level_datasets_advance_stock_watermark(
         self, make_service, session_factory
     ):
-        """§15.1/§15.2：旧代码出现不再让日级数据集失败，水位正常推进。"""
+        """旧代码出现不再让数据集失败，个股水位正常推进到目标日。"""
         service = make_service(FakeTushareClient())
         service.run(trigger=TriggerType.MANUAL)
 
         for dataset in DAY_LEVEL_DATASETS:
-            state = _state(session_factory, dataset)
-            assert state.last_error_code is None, (
-                f"{dataset.value} 不应因旧代码失败，实际 {state.last_error_code}: "
-                f"{state.last_error}"
+            state = _stock_state(session_factory, dataset, CANONICAL_INSTRUMENT_ID)
+            assert state is not None, f"{dataset.value} 缺少 stock_sync_state 行"
+            assert state.last_status == TASK_STATUS_SUCCESS, (
+                f"{dataset.value} 不应因旧代码失败，实际 last_error_code="
+                f"{state.last_error_code}: {state.last_error}"
             )
-            assert state.latest_complete_trade_date == NEXT_DAY, (
-                f"{dataset.value} 水位应为 {NEXT_DAY}，实际 "
-                f"{state.latest_complete_trade_date}"
+            assert state.watermark_date == NEXT_DAY, (
+                f"{dataset.value} 水位应为 {NEXT_DAY}，实际 {state.watermark_date}"
+            )
+            assert state.ts_code == CANONICAL_TS_CODE, (
+                f"{dataset.value} 冗余 ts_code 列应为规范码"
             )
 
     def test_facts_stored_under_canonical_ts_code(
         self, make_service, session_factory
     ):
-        """§11.3：落库 ts_code 是规范代码，旧代码不得进入事实表。"""
+        """落库 ts_code 是规范代码，旧代码不得进入事实表。"""
         service = make_service(FakeTushareClient())
         service.run(trigger=TriggerType.MANUAL)
 
@@ -330,60 +385,92 @@ class TestLegacyCodeBackfill:
             )
 
     def test_no_duplicate_fact_rows_after_merge(self, make_service, session_factory):
-        """§15.4：新旧两行合并后，单证券单日只有一条事实记录。"""
+        """新旧两行合并后，单证券单日只有一条事实记录。
+
+        stock_basic 返回 001872 + 000001 两只；其中 001872 的上游返回
+        新旧两行，经别名合并后只有 1 条规范码记录；000001 只有 1 行。
+        因此每日总事实数 = 2（2 只证券各 1 条），总 record_count = 4（2 只 × 2 天）。
+        """
         service = make_service(FakeTushareClient())
         service.run(trigger=TriggerType.MANUAL)
 
-        # 该日主档只有 001872（000001 未出现在事实数据里），合并后应为 1 行
         for dataset in DAY_LEVEL_DATASETS:
-            assert _fact_rows(session_factory, dataset, LEGACY_DAY) == 1, (
-                f"{dataset.value} 出现重复事实键"
+            # 每日 2 行（2 只证券各 1 行）：001872 合并后 1 行，000001 本来就 1 行
+            assert _fact_rows(session_factory, dataset, LEGACY_DAY) == 2, (
+                f"{dataset.value} 出现重复事实键或行数不符"
             )
-        # 连续两个交易日都写入，record_count 不因合并而少算
-        assert _state(session_factory, DatasetName.DAILY).record_count == 2
+            # 001872 的事实行 ts_code 是规范码（不是旧码）
+            codes = _fact_ts_codes(session_factory, dataset, LEGACY_DAY)
+            assert CANONICAL_TS_CODE in codes
+            assert LEGACY_TS_CODE not in codes
+        # 总 record_count = 2 只 × 2 天
+        assert _dataset_state(session_factory, DatasetName.DAILY).record_count == 4
 
     def test_no_placeholder_instrument_created(self, make_service, session_factory):
-        """§15.3：不得为旧代码创建 CN:STOCK:000022 假证券。"""
+        """不得为旧代码创建 CN:STOCK:000022 假证券。"""
         service = make_service(FakeTushareClient())
         service.run(trigger=TriggerType.MANUAL)
 
         ids = _master_ids(session_factory)
-        assert f"CN:STOCK:{CANONICAL_SYMBOL}" in ids
+        assert CANONICAL_INSTRUMENT_ID in ids
         assert f"CN:STOCK:{LEGACY_SYMBOL}" not in ids, "不得创建假历史证券"
 
 
-# ---- 冲突：一次尝试即终态失败，水位不推进 ----
+# ---- 冲突：单股快速失败、不阻塞其他股、Run SUCCESS ----
 
 
 class TestAliasConflictTerminalFailure:
-    def test_conflict_fails_fast_without_advancing(
+    """ALIAS_CONFLICT 属配置类错误：首试即终态、不阻塞数据集。"""
+
+    def test_conflict_fails_fast_for_that_stock(
         self, make_service, session_factory
     ):
-        """同一证券同一天两种取值 → ALIAS_CONFLICT，不提交、不推进水位。"""
+        """同一证券同一交易日两种取值 → ALIAS_CONFLICT，该股 task=failed、水位不动。"""
         client = FakeTushareClient(daily_conflict=True)
         service = make_service(client)
         run_id = service.run(trigger=TriggerType.MANUAL)
 
-        state = _state(session_factory, DatasetName.DAILY)
-        assert state.status == DatasetStatus.FAILED.value
+        # 001872（冲突股）：个股失败
+        state = _stock_state(session_factory, DatasetName.DAILY, CANONICAL_INSTRUMENT_ID)
+        assert state.last_status == TASK_STATUS_FAILED
         assert state.last_error_code == "ALIAS_CONFLICT"
-        assert state.latest_complete_trade_date is None, "冲突日不得推进水位"
-        assert state.current_trade_date == LEGACY_DAY
-        assert _fact_rows(session_factory, DatasetName.DAILY, LEGACY_DAY) == 0
+        assert state.watermark_date is None, "冲突股不得推进水位"
+        # 冲突股（001872）没有事实行；其他股（000001）正常落库
+        from app.models.history_fact import HISTORY_FACT_TABLES
 
-        # 配置类错误：只尝试一次，不睡满 max_attempts 轮退避
+        with session_factory() as session:
+            table = HISTORY_FACT_TABLES[DatasetName.DAILY.value]
+            canonical_rows = session.execute(
+                select(table.c.ts_code).where(
+                    table.c.trade_date == LEGACY_DAY,
+                    table.c.ts_code == CANONICAL_TS_CODE,
+                )
+            ).fetchall()
+        assert len(canonical_rows) == 0, "冲突股不得写入事实数据"
+
+        # 配置类错误：只请求一次（快速失败）
         daily_calls = [params for name, params in client.calls if name == "daily"]
-        assert len(daily_calls) == 1, (
-            f"ALIAS_CONFLICT 应快速失败，实际请求 {len(daily_calls)} 次"
+        # 有两只股票（001872 + 000001），各一次区间请求
+        assert len(daily_calls) == 2, (
+            f"配置类错误每只股票应只请求一次，实际 {len(daily_calls)} 次"
         )
-        assert run_id
+        # 000001（非冲突股）应成功
+        other_state = _stock_state(session_factory, DatasetName.DAILY, OTHER_INSTRUMENT_ID)
+        assert other_state.watermark_date == NEXT_DAY
 
-    def test_conflict_is_recorded_on_run_dataset(
+        # Run 仍为 SUCCESS（个股失败不使 Run 失败）
+        with session_factory() as session:
+            run = HistorySyncRunRepository(session).get(run_id)
+        assert run.status == RunStatus.SUCCESS.value
+
+        # 数据集级状态 = LAGGING（有个股失败）
+        ds_state = _dataset_state(session_factory, DatasetName.DAILY)
+        assert ds_state.status == DatasetStatus.LAGGING.value
+
+    def test_conflict_recorded_on_run_dataset_and_stock_state(
         self, make_service, session_factory
     ):
-        """运行记录（/admin/data 的"最近执行记录"）必须暴露冲突与失败日。"""
-        from app.repositories.history_sync import HistorySyncRunDatasetRepository
-
+        """run_dataset.task_failed_count 与 stock_sync_state.last_error_code 都反映冲突。"""
         service = make_service(FakeTushareClient(daily_conflict=True))
         run_id = service.run(trigger=TriggerType.MANUAL)
 
@@ -391,130 +478,35 @@ class TestAliasConflictTerminalFailure:
             row = HistorySyncRunDatasetRepository(session).get(
                 run_id, DatasetName.DAILY
             )
-        assert row.last_error_code == "ALIAS_CONFLICT"
-        assert row.failed_trade_date == LEGACY_DAY
+        # 个股失败口径：task_failed_count = 1（001872 失败，000001 成功）
+        assert row.task_failed_count == 1
+        assert row.task_success_count == 1
+        assert row.processed_count == 2
+        # 旧水位列冻结
+        assert row.failed_trade_date is None
+        # run_dataset 状态仍为 SUCCESS（允许存在个股失败）
+        assert row.status == RunDatasetStatus.SUCCESS.value
+
+        # 个股 state 记录错误码
+        stock_state = _stock_state(
+            session_factory, DatasetName.DAILY, CANONICAL_INSTRUMENT_ID
+        )
+        assert stock_state.last_error_code == "ALIAS_CONFLICT"
 
     def test_conflict_does_not_block_other_datasets(
         self, make_service, session_factory
     ):
-        """数据集互不阻塞（design D17）：daily 冲突不影响其余三个数据集。"""
+        """数据集互不阻塞：daily 冲突不影响其余三个数据集推进。"""
         service = make_service(FakeTushareClient(daily_conflict=True))
         service.run(trigger=TriggerType.MANUAL)
 
-        assert _state(session_factory, DatasetName.DAILY).status == (
-            DatasetStatus.FAILED.value
-        )
+        daily_state = _dataset_state(session_factory, DatasetName.DAILY)
+        assert daily_state.status == DatasetStatus.LAGGING.value
+
         for dataset in (DatasetName.ADJ_FACTOR, DatasetName.DAILY_BASIC,
                         DatasetName.MONEYFLOW):
-            assert _state(
-                session_factory, dataset
-            ).latest_complete_trade_date == NEXT_DAY, (
+            stock_state = _stock_state(session_factory, dataset, CANONICAL_INSTRUMENT_ID)
+            assert stock_state.watermark_date == NEXT_DAY, (
                 f"{dataset.value} 不应被 daily 的冲突拖累"
             )
-
-
-# ---- §11.3：daily_basic 候选集补齐不重复请求规范证券 ----
-
-
-class TestDailyBasicCandidateSet:
-    """§11.3：候选集差额用的是 Provider **输出**的 ts_code。
-
-    Service 计算 ``候选集 - 已返回代码`` 时两边都必须是规范代码：否则
-    ``returned`` 里是 000022.SZ、候选集里是 001872.SZ，规范证券会被判为
-    缺失而重复请求一次。
-    """
-
-    def _run_to_master(self, make_service, registry, client) -> list:
-        """先跑一轮让主档落库，再取主档 instruments 直接调 Provider。"""
-        service = make_service(client, registry=registry)
-        service.run(trigger=TriggerType.MANUAL)
-        with service.session_factory() as session:
-            return HistoryMasterRepository(session).list_cn_stock_instruments()
-
-    def test_canonical_code_is_not_treated_as_missing(
-        self, make_service, session_factory
-    ):
-        client = FakeTushareClient()
-        registry = SpyRegistry(client)
-        master = self._run_to_master(make_service, registry, client)
-
-        primary = registry.provider.get_daily_basic(LEGACY_DAY, master)
-        returned = {record.ts_code for record in primary.records}
-        assert CANONICAL_TS_CODE in returned
-        assert LEGACY_TS_CODE not in returned
-
-        with session_factory() as session:
-            candidates = set(
-                HistoryMasterRepository(session).list_ts_codes_tradable_on(LEGACY_DAY)
-            )
-        assert CANONICAL_TS_CODE in candidates
-        assert CANONICAL_TS_CODE not in sorted(candidates - returned), (
-            "规范证券被误判为缺失，会被重复请求"
-        )
-
-    def test_daily_basic_primary_batch_is_a_single_record_per_instrument(
-        self, make_service, session_factory
-    ):
-        """新旧两行合并后，Provider 只交付一条记录（不产生第二个 instrument）。"""
-        client = FakeTushareClient()
-        registry = SpyRegistry(client)
-        master = self._run_to_master(make_service, registry, client)
-
-        primary = registry.provider.get_daily_basic(LEGACY_DAY, master)
-        assert len(primary.records) == 1
-        assert primary.raw_row_count == 2, "原始行数仍记录上游真实规模"
-        assert primary.records[0].instrument_id == f"CN:STOCK:{CANONICAL_SYMBOL}"
-
-    def test_fallback_querying_canonical_code_yields_canonical_record(
-        self, make_service, session_factory
-    ):
-        """逐只补齐请求 001872.SZ，上游回旧代码时仍归到规范 instrument。"""
-        client = FakeTushareClient()
-        registry = SpyRegistry(client)
-        master = self._run_to_master(make_service, registry, client)
-
-        batch = registry.provider.get_daily_basic_for_instruments(
-            LEGACY_DAY, master, missing_ts_codes=[CANONICAL_TS_CODE]
-        )
-        assert len(batch.records) == 1
-        assert batch.records[0].instrument_id == f"CN:STOCK:{CANONICAL_SYMBOL}"
-        assert batch.records[0].ts_code == CANONICAL_TS_CODE
-        # 逐只补齐确实按规范代码发起请求（不是旧代码）
-        per_ts_code = [
-            params for name, params in client.calls
-            if name == "daily_basic" and params.get("ts_code")
-        ]
-        assert [params["ts_code"] for params in per_ts_code] == [CANONICAL_TS_CODE]
-
-    def test_candidate_missing_diff_is_computed_on_canonical_codes(
-        self, make_service, session_factory, monkeypatch
-    ):
-        """端到端：真实截断触发补齐，缺失集合按**规范代码**计算。
-
-        把行数上限压低到 2，主路径的 daily_basic（新旧两行，规范化后合并为
-        一条规范记录）即被判定为截断，从而真正驱动 ``Service._daily_basic_fallback``。
-        断言传入补齐路径的缺失集合不含规范代码——若 Provider 输出的 ts_code
-        仍是旧代码，``候选集 - 已返回`` 会把 001872.SZ 算成缺失并重复请求。
-        """
-        monkeypatch.setattr(
-            "app.providers.history.tushare.DAILY_ROW_CAP", 2, raising=True
-        )
-        client = FakeTushareClient()
-        registry = SpyRegistry(client)
-        service = make_service(client, registry=registry)
-        service.run(trigger=TriggerType.MANUAL)
-
-        # 截断必须真的发生过，否则本用例退化为恒真
-        assert registry.missing_calls, (
-            "补齐路径未被驱动（截断未触发），用例失效"
-        )
-        for missing in registry.missing_calls:
-            if missing is None:
-                continue
-            assert CANONICAL_TS_CODE not in missing, (
-                f"规范证券被误判为缺失、会被重复请求: {missing}"
-            )
-        # 旧代码也不该出现在缺失集合里（它不是候选集成员）
-        for missing in registry.missing_calls:
-            if missing:
-                assert LEGACY_TS_CODE not in missing
+            assert stock_state.last_status == TASK_STATUS_SUCCESS

@@ -69,6 +69,6 @@
 ## 10. 在线冒烟、文档与发布
 
 - [ ] 10.1 `tests/integration/test_history_online_smoke.py` 扩展：四数据集按股票区间真实请求断言（含 spike 样本股的空结果与行数上限语义），沿用 `@pytest.mark.online` 只读约定
-- [ ] 10.2 更新 `docs/CHANGELOG.md`（v0.4.0 条目：个股水位模型、Run/Task 两层、失败隔离与自动补偿、API/页面变化、升级注意）与 `docs/README.md` 历史数据章节（个股口径说明、升级后首轮全量回填预期约数小时跨多轮完成、数据总览完成率从 0% 逐股上升属正常）
-- [ ] 10.3 更新 `config.example.yaml` history 节（max_retries 与兼容语义注释）；确认部署文档沿用停服升级、`.duckdb`+`.wal` 成对备份、回滚=恢复备份（不支持 v0.3.1 运行于 0004 库）
-- [ ] 10.4 `app/version.py` 版本号升至 v0.4.0；最终校验（全量 pytest、`openspec validate`/`openspec status` 全部 applyRequires 完成）并提交
+- [x] 10.2 更新 `docs/CHANGELOG.md`（v0.4.0 条目：个股水位模型、Run/Task 两层、失败隔离与自动补偿、API/页面变化、升级注意）与 `docs/README.md` 历史数据章节（个股口径说明、升级后首轮全量回填预期约数小时跨多轮完成、数据总览完成率从 0% 逐股上升属正常）
+- [x] 10.3 `config.example.yaml` history 节 max_retries 注释已完整（max_attempts 标记 deprecated）；部署文档确认停服升级、`.duckdb`+`.wal` 成对备份、回滚=恢复备份（README.md 已更新）
+- [ ] 10.4 `app/version.py` 版本号升至 v0.4.0；最终校验（全量 pytest、代码检查）并提交

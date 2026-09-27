@@ -7,12 +7,13 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
-# 不 COPY README：pyproject.toml 未声明 readme 字段，pip 构建不读它
-COPY pyproject.toml alembic.ini ./
-COPY app ./app
+# 使用预构建 wheel + 离线依赖（避免容器内网络请求 PyPI）
+COPY dist/wheels /tmp/wheels
+COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels marketmind==0.4.0 \
+    && rm -rf /tmp/wheels
 
 RUN mkdir -p /app/data
 

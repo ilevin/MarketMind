@@ -1,0 +1,48 @@
+# 虚拟环境与本地开发文件（避免复制到镜像上下文）
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+build/
+# 保留 wheels 目录用于离线构建
+dist/*.tar.gz
+dist/*.egg
+
+# 本地数据与配置
+data/
+config.yaml
+*.db
+*.duckdb
+*.duckdb.wal
+
+# Git 与开发工具
+.git/
+.gitignore
+.github/
+
+# IDE 与编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 文档与参考资料（非运行时必需）
+docs/
+reference/
+research/
+openspec/
+.claude/
+
+# 测试与脚本
+tests/
+scripts/
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db

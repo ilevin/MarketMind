@@ -3,7 +3,7 @@
  * + 数据管理页（admin-data）。
  * 页面通过 body[data-page] 区分；v0.03 增加标签管理与行情页标签筛选（本地过滤）；
  * multi-user-auth：统一 fetch 封装注入 X-CSRF-Token，会话失效自动回登录页；
- * a-share-historical-data：数据管理页在运行中每 4 秒轮询 sync 小表 API。 */
+ * a-share-historical-data：数据管理页在运行中每 10 秒轮询 sync 小表 API。 */
 
 "use strict";
 
@@ -780,7 +780,7 @@ function initAdminDataPage() {
   if (!syncBtn) return;
 
   const msg = document.getElementById("sync-message");
-  const POLL_MS = 4000;
+  const POLL_MS = 10000;
   let pollTimer = null;
 
   function fmtDateTime(iso) {
@@ -1046,7 +1046,7 @@ function initAdminDataStocksPage() {
   const emptyEl = document.getElementById("stocks-empty");
   const tableEl = document.getElementById("stocks-table");
 
-  const POLL_MS = 4000;
+  const POLL_MS = 10000;
   let pollTimer = null;
   let currentDataset = "daily";
   let currentStatus = "all";

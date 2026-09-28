@@ -295,7 +295,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         request: Request, current_user: CurrentUser = Depends(require_admin_page)
     ):
         """数据管理页（admin-data-management spec）：服务端渲染首屏壳，
-        数据由原生 JS 调 /api/admin/history-data/* 填充（运行中每 4 秒轮询）。"""
+        数据由原生 JS 调 /api/admin/history-data/* 填充（运行中每 10 秒轮询）。"""
         return templates.TemplateResponse(
             request, "admin_data.html", {"current_user": current_user}
         )

@@ -99,22 +99,6 @@ TBD - created by archiving change duckdb-migration. Update Purpose after archive
 - **WHEN** 在 /login 提交正确凭据
 - **THEN** 跳转到 / 并以登录态展示首页
 
-### Requirement: 导航栏用户信息
-
-业务页面导航栏 SHALL 显示当前用户名与角色,提供「修改密码」与「退出登录」入口;管理员额外显示「用户管理」与「系统状态」入口。退出登录 SHALL 调用 logout API 并跳转 /login。
-
-#### Scenario: 普通用户导航栏
-- **WHEN** role=user 登录后查看任意业务页面
-- **THEN** 导航栏显示用户名、角色,含修改密码与退出登录,不含用户管理入口
-
-#### Scenario: 管理员导航栏
-- **WHEN** role=admin 登录后查看任意业务页面
-- **THEN** 导航栏额外显示用户管理入口
-
-#### Scenario: 退出登录
-- **WHEN** 点击导航栏退出登录
-- **THEN** Session 撤销,跳转 /login,回退按钮无法恢复登录态
-
 ### Requirement: 修改密码页面
 
 系统 SHALL 提供修改密码界面(旧密码 + 新密码 + 确认新密码),成功后要求重新登录。

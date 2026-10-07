@@ -310,6 +310,24 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             request, "admin_data_stocks.html", {"current_user": current_user}
         )
 
+    @app.get("/admin/data/etf")
+    def admin_data_etf_page(
+        request: Request, current_user: CurrentUser = Depends(require_admin_page)
+    ):
+        """ETF 数据占位页（optimize-navigation）：导航入口先就位，功能由后续变更实现。"""
+        return templates.TemplateResponse(
+            request, "admin_data_etf.html", {"current_user": current_user}
+        )
+
+    @app.get("/admin/data/etf/history")
+    def admin_data_etf_history_page(
+        request: Request, current_user: CurrentUser = Depends(require_admin_page)
+    ):
+        """ETF 历史占位页（optimize-navigation）：导航入口先就位，功能由后续变更实现。"""
+        return templates.TemplateResponse(
+            request, "admin_data_etf_history.html", {"current_user": current_user}
+        )
+
     @app.get("/admin/status")
     def admin_status_page(
         request: Request, current_user: CurrentUser = Depends(require_admin_page)

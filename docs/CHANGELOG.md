@@ -4,6 +4,28 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
+## [v0.5.0] - 2026-10-07
+
+导航重构 + ETF 占位页（OpenSpec 变更 optimize-navigation，设计稿 v2）。
+
+### 核心变更
+
+- **全站两级导航**：顶栏（深色，logo「📈 MarketMind」+ 主导航三分区 + 右侧用户菜单 hover 下拉）+ 分区子导航（pill 条目，active 高亮 `#dbeafe`/`#2563eb`）。三分区：行情首页（行情 / 自选管理 / 标签管理）、数据管理（股票数据 / 个股历史 / ETF数据 / ETF历史）、系统设置（用户管理 / 系统状态）
+- **当前位置标识**：主导航项与子导航条目 active 样式 + `aria-current`，替代原先「本页链接不出现」的隐式做法
+- **角色可见性**：数据管理 / 系统设置分区（含子导航）仅管理员可见；管理员从任意页面可一步到达全部分区（修复原管理页缺自选 / 标签入口、修改密码页缺自选 / 标签入口的不一致）
+- **共享导航模板**：新增 `app/templates/base.html`，8 个登录态页面改为 `{% extends %}` 复用，消除逐页复制粘贴的内联导航；子模板以 `{% set nav_section/nav_item/page_id/page_title %}` 声明位置
+- **用户菜单**：退出登录沿用原 `bindLogout()` 行为（登出撤销 Session 跳 `/login`），管理员按钮附加「管理员」标注；下拉支持 hover 与键盘 Tab 聚焦展开（`focus-within`），避免旧导航直链移除后键盘不可达
+
+### 新增页面
+
+- **ETF 占位页**：`/admin/data/etf`（ETF数据）、`/admin/data/etf/history`（ETF历史），管理员专属，仅「敬请期待」空状态说明；ETF 数据同步与展示由后续版本实现
+
+### 一致化修复
+
+- 8 个登录态页面 `<title>` 统一为「页面名 · MarketMind」，顶栏 logo 统一为「📈 MarketMind」（`/login`、`/setup` 匿名页刻意保持不变）
+- `admin_status.html` 补齐 CSRF meta（原先为唯一缺失的登录页，随 base.html 统一注入）
+- 页面语义标题下沉到内容区（`.page-heading`），顶栏不再承载 h1
+
 ## [v0.4.0] - 2026-09-23
 
 架构升级：历史数据同步从**日级水位**改为**个股水位**，实现失败隔离与自动补偿

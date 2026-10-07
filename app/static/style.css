@@ -9,17 +9,82 @@ body {
   background: #f6f7f9;
 }
 
+/* v0.05：全站两级导航（optimize-navigation，设计稿 v2）——顶栏：深色 chrome（logo + 主导航 + 用户菜单） */
 .topbar {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 10px 24px;
-  background: #fff;
-  border-bottom: 1px solid #e3e5e8;
+  height: 64px;
+  padding: 0 28px;
+  background: #0f172a;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
 }
-.topbar h1 { font-size: 18px; margin: 0; }
-.topbar nav { display: flex; gap: 14px; }
-.topbar nav a { color: #3366cc; text-decoration: none; }
+.logo {
+  margin-right: 30px;
+  font-size: 20px;
+  font-weight: bold;
+  color: #fff;
+  white-space: nowrap;
+}
+.nav-main { display: flex; height: 64px; align-items: center; gap: 5px; }
+.nav-item {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  padding: 0 22px;
+  color: #cbd5e1;
+  text-decoration: none;
+}
+.nav-item:hover, .nav-item.active { background: #1e293b; color: #fff; }
+
+/* 右侧用户菜单：hover 纯 CSS 下拉（修改密码 / 退出登录，无 JS） */
+.user { margin-left: auto; position: relative; }
+.user-btn {
+  padding: 10px 16px;
+  background: #1e293b;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.user-menu {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  width: 150px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+}
+.user:hover .user-menu,
+.user:focus-within .user-menu { display: block; }
+.user-menu a { display: block; padding: 12px 16px; color: #334155; text-decoration: none; }
+.user-menu a:hover { background: #f1f5f9; }
+
+/* 子导航栏：当前分区条目（pill） */
+.subbar {
+  display: flex;
+  align-items: center;
+  height: 52px;
+  padding: 0 30px;
+  gap: 10px;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+}
+.sub-item {
+  padding: 8px 18px;
+  border-radius: 18px;
+  color: #475569;
+  text-decoration: none;
+  font-size: 13px;
+}
+.sub-item:hover, .sub-item.active { background: #dbeafe; color: #2563eb; }
+
+/* 内容区页面标题（顶栏不再承载 h1，页面语义标题下沉到内容区） */
+.page-heading { font-size: 18px; margin: 4px 0 12px; color: #0f172a; }
 
 /* v0.03：页脚版本信息 */
 .footer {
@@ -193,11 +258,7 @@ button.link { border: none; background: none; padding: 2px 6px; }
 table quote-time { font-variant-numeric: tabular-nums; }
 td.num { font-variant-numeric: tabular-nums; }
 
-/* ---- 多用户认证（multi-user-auth） ---- */
-
-/* 顶栏用户导航：用户名/角色 + 修改密码 / 用户管理 / 退出登录 */
-.topbar nav.user-nav { align-items: center; }
-.current-user { color: #555; font-size: 13px; }
+/* ---- 多用户认证（multi-user-auth；v0.05 起顶栏用户导航由 base.html 两级导航取代） ---- */
 
 /* 登录页 */
 .login-wrap {

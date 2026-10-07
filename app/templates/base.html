@@ -1,0 +1,54 @@
+{# 共享导航基座（optimize-navigation，site-navigation spec）。
+   子模板约定：在 {% extends %} 之前声明四个变量——
+     {% set nav_section = "market|data|setting" %}  所属主导航分区；无分区页面（修改密码）不设
+     {% set nav_item = "行情" %}                      当前子导航条目名（active / aria-current 依据）
+     {% set page_id = "watchlist" %}                  body[data-page]（app.js 行为分发）
+     {% set page_title = "自选管理" %}                 <title> 与内容区页面标题（「页面名 · MarketMind」）
+   「数据管理」「系统设置」分区仅管理员可见；子导航条目集合见下方 NAV。 #}
+{% set NAV = {
+  "market": [("行情", "/"), ("自选管理", "/watchlist"), ("标签管理", "/tags")],
+  "data": [("股票数据", "/admin/data"), ("个股历史", "/admin/data/stocks"), ("ETF数据", "/admin/data/etf"), ("ETF历史", "/admin/data/etf/history")],
+  "setting": [("用户管理", "/admin/users"), ("系统状态", "/admin/status")],
+} %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
+  <title>{{ page_title }} · MarketMind</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body data-page="{{ page_id }}">
+  <header class="topbar">
+    <div class="logo">📈 MarketMind</div>
+    <nav class="nav-main">
+      <a class="nav-item{% if nav_section == "market" %} active{% endif %}"{% if nav_section == "market" %} aria-current="page"{% endif %} href="/">行情首页</a>
+      {% if current_user.is_admin %}
+      <a class="nav-item{% if nav_section == "data" %} active{% endif %}"{% if nav_section == "data" %} aria-current="page"{% endif %} href="/admin/data">数据管理</a>
+      <a class="nav-item{% if nav_section == "setting" %} active{% endif %}"{% if nav_section == "setting" %} aria-current="page"{% endif %} href="/admin/users">系统设置</a>
+      {% endif %}
+    </nav>
+    <div class="user">
+      <button type="button" class="user-btn">👤 {{ current_user.username }}{% if current_user.is_admin %}（管理员）{% endif %} ▾</button>
+      <div class="user-menu">
+        <a href="/change-password">修改密码</a>
+        <a href="#" id="logout-link">退出登录</a>
+      </div>
+    </div>
+  </header>
+  {% if nav_section is defined and nav_section in NAV %}
+  <div class="subbar">
+    {% for name, href in NAV[nav_section] %}
+    <a class="sub-item{% if nav_item == name %} active{% endif %}"{% if nav_item == name %} aria-current="page"{% endif %} href="{{ href }}">{{ name }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+  <main class="container">
+    <h1 class="page-heading">{{ page_title }}</h1>
+    {% block content %}{% endblock %}
+  </main>
+  {% block footer %}{% endblock %}
+  <script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

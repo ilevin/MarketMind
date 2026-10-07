@@ -79,20 +79,28 @@ def test_admin_page_includes_csrf_meta(admin_client):
 
 
 def test_admin_page_nav_present(admin_client):
-    """页面加入现有管理员导航（个股历史/用户管理/系统状态；本页自身不重复链接）。"""
+    """页面采用全站两级导航（site-navigation spec）：
+    主导航三分区 + 数据管理分区子导航（含 ETF 占位入口）+ 用户菜单。"""
     body = admin_client.get("/admin/data").text
+    # 主导航三分区：行情首页 / 数据管理 / 系统设置
+    for href in ('href="/"', 'href="/admin/data"', 'href="/admin/users"'):
+        assert href in body
+    # 子导航：数据管理分区其余三个条目（个股历史与两个 ETF 占位页入口）
     for href in (
-        'href="/admin/data/stocks"', 'href="/admin/users"',
-        'href="/admin/status"', 'href="/"',
+        'href="/admin/data/stocks"', 'href="/admin/data/etf"',
+        'href="/admin/data/etf/history"',
     ):
         assert href in body
+    # 用户菜单：修改密码 / 退出登录
+    assert 'href="/change-password"' in body
+    assert 'id="logout-link"' in body
 
 
 @pytest.mark.parametrize(
     "path", ["/", "/watchlist", "/tags", "/change-password", "/admin/users", "/admin/status"]
 )
 def test_admin_nav_entry_added_everywhere(client_factory, path):
-    """现有导航为各模板内联：管理员在每个页面都能看到数据管理入口。"""
+    """全站共享主导航（base.html）：管理员在每个页面都能看到数据管理入口。"""
     with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
         body = client.get(path).text
     assert 'href="/admin/data"' in body, f"{path} 缺少数据管理导航入口"
@@ -144,7 +152,7 @@ class TestAdminDataStocksPage:
         assert "/static/style.css" in body
 
     def test_nav_includes_back_to_overview(self, admin_client):
-        """个股页导航应包含返回数据总览的链接。"""
+        """子导航提供返回数据总览（股票数据）的入口。"""
         body = admin_client.get("/admin/data/stocks").text
         assert 'href="/admin/data"' in body
 

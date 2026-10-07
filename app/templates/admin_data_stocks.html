@@ -1,27 +1,10 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
-  <title>个股历史 · 行情看板</title>
-  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
-</head>
-<body data-page="admin-data-stocks">
-  <header class="topbar">
-    <h1>个股历史同步</h1>
-    <nav class="user-nav">
-      <a href="/admin/data">← 数据总览</a>
-      <a href="/">行情首页</a>
-      <span class="current-user">{{ current_user.username }}（管理员）</span>
-      <a href="/admin/users">用户管理</a>
-      <a href="/admin/status">系统状态</a>
-      <a href="/change-password">修改密码</a>
-      <a href="#" id="logout-link">退出登录</a>
-    </nav>
-  </header>
+{% set nav_section = "data" %}
+{% set nav_item = "个股历史" %}
+{% set page_id = "admin-data-stocks" %}
+{% set page_title = "个股历史" %}
+{% extends "base.html" %}
 
-  <main class="container">
+{% block content %}
     <section class="panel">
       <div class="data-overview">
         <div class="overview-item">
@@ -97,24 +80,20 @@
       </div>
       <p class="muted">每页 100 条；运行中每 10 秒自动刷新。</p>
     </section>
-  </main>
 
-  <!-- 失败详情 modal -->
-  <div id="error-modal" class="modal-overlay hidden">
-    <div class="modal">
-      <h3 id="error-modal-title">失败详情</h3>
-      <div class="modal-hint">
-        <span id="error-modal-tscode"></span>
-        <span class="muted"> · </span>
-        <span id="error-modal-errorcode"></span>
-      </div>
-      <div id="error-modal-message" class="error-detail"></div>
-      <div class="modal-actions">
-        <button id="error-modal-close">关闭</button>
+    <!-- 失败详情 modal -->
+    <div id="error-modal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="error-modal-title">失败详情</h3>
+        <div class="modal-hint">
+          <span id="error-modal-tscode"></span>
+          <span class="muted"> · </span>
+          <span id="error-modal-errorcode"></span>
+        </div>
+        <div id="error-modal-message" class="error-detail"></div>
+        <div class="modal-actions">
+          <button id="error-modal-close">关闭</button>
+        </div>
       </div>
     </div>
-  </div>
-
-  <script src="/static/app.js?v={{ app_version }}"></script>
-</body>
-</html>
+{% endblock %}

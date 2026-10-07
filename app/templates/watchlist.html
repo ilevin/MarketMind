@@ -1,26 +1,10 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="csrf-token" content="{{ current_user.csrf_token }}">
-  <title>自选管理 · 行情看板</title>
-  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
-</head>
-<body data-page="watchlist">
-  <header class="topbar">
-    <h1>自选管理</h1>
-    <nav class="user-nav">
-      <a href="/">← 行情首页</a>
-      <a href="/tags">标签管理 →</a>
-      <span class="current-user">{{ current_user.username }}（{{ "管理员" if current_user.role == "admin" else "用户" }}）</span>
-      <a href="/change-password">修改密码</a>
-      {% if current_user.role == "admin" %}<a href="/admin/data">数据管理</a><a href="/admin/users">用户管理</a><a href="/admin/status">系统状态</a>{% endif %}
-      <a href="#" id="logout-link">退出登录</a>
-    </nav>
-  </header>
+{% set nav_section = "market" %}
+{% set nav_item = "自选管理" %}
+{% set page_id = "watchlist" %}
+{% set page_title = "自选管理" %}
+{% extends "base.html" %}
 
-  <main class="container">
+{% block content %}
     <section class="panel">
       <h2>股票 / ETF 自选</h2>
       <form id="add-watchlist-form" class="add-form">
@@ -68,20 +52,16 @@
       </table>
       <p id="idx-empty" class="empty hidden">还没有配置指数。</p>
     </section>
-  </main>
 
-  <!-- 标签编辑弹层：操作列「标签」按钮打开，层内点击标签即添加/取消关联 -->
-  <div id="tag-edit-modal" class="modal-overlay hidden">
-    <div class="modal">
-      <h3 id="tag-edit-title">编辑标签</h3>
-      <div id="tag-edit-chips" class="modal-chips"></div>
-      <p class="modal-hint">点击标签即可添加 / 取消关联（即时保存）；新标签请先在标签管理页创建。</p>
-      <div class="modal-actions">
-        <button type="button" id="tag-edit-close">关闭</button>
+    <!-- 标签编辑弹层：操作列「标签」按钮打开，层内点击标签即添加/取消关联 -->
+    <div id="tag-edit-modal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="tag-edit-title">编辑标签</h3>
+        <div id="tag-edit-chips" class="modal-chips"></div>
+        <p class="modal-hint">点击标签即可添加 / 取消关联（即时保存）；新标签请先在标签管理页创建。</p>
+        <div class="modal-actions">
+          <button type="button" id="tag-edit-close">关闭</button>
+        </div>
       </div>
     </div>
-  </div>
-
-  <script src="/static/app.js?v={{ app_version }}"></script>
-</body>
-</html>
+{% endblock %}

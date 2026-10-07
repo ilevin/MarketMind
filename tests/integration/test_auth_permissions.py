@@ -115,7 +115,7 @@ def test_business_api_anonymous_returns_401(client_factory, path):
     assert resp.status_code == 401
 
 
-# ---- /admin/status 系统状态页（dashboard-ui spec：管理员导航「系统状态」入口） ----
+# ---- /admin/status 系统状态页（site-navigation spec：「系统设置」分区子导航条目） ----
 
 
 def test_admin_status_page_anonymous_redirects_to_setup(client_factory):

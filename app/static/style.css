@@ -9,7 +9,7 @@ body {
   background: #f6f7f9;
 }
 
-/* v0.05：全站两级导航（optimize-navigation，设计稿 v2）——顶栏：深色 chrome（logo + 主导航 + 用户菜单） */
+/* v0.4.1：全站两级导航（optimize-navigation，设计稿 v2）——顶栏：深色 chrome（logo + 主导航 + 用户菜单） */
 .topbar {
   display: flex;
   align-items: center;
@@ -258,7 +258,7 @@ button.link { border: none; background: none; padding: 2px 6px; }
 table quote-time { font-variant-numeric: tabular-nums; }
 td.num { font-variant-numeric: tabular-nums; }
 
-/* ---- 多用户认证（multi-user-auth；v0.05 起顶栏用户导航由 base.html 两级导航取代） ---- */
+/* ---- 多用户认证（multi-user-auth；v0.4.1 起顶栏用户导航由 base.html 两级导航取代） ---- */
 
 /* 登录页 */
 .login-wrap {

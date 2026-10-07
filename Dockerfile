@@ -12,7 +12,7 @@ COPY dist/wheels /tmp/wheels
 COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels marketmind==0.5.0 \
+RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels marketmind==0.4.1 \
     && rm -rf /tmp/wheels
 
 RUN mkdir -p /app/data

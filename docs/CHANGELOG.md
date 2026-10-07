@@ -4,7 +4,7 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
-## [v0.5.0] - 2026-10-07
+## [v0.4.1] - 2026-10-07
 
 导航重构 + ETF 占位页（OpenSpec 变更 optimize-navigation，设计稿 v2）。
 

@@ -63,4 +63,4 @@
 ## 10. 文档与发布
 
 - [x] 10.1 更新 `docs/CHANGELOG.md`（v0.4.2 条目：三表、数据集、双数据源、水位复用、Quant API、两页面、配置项、升级注意——ETF 全量回填预期、fund_adj 积分依赖、qfq 基准滚动说明）与 `docs/README.md` ETF 章节（数据说明、单位口径、复权计算口径）
-- [ ] 10.2 `app/version.py` 与 `pyproject.toml` 版本号升至 v0.4.2；最终校验（全量 pytest、`openspec validate`）并提交
+- [x] 10.2 `app/version.py` 与 `pyproject.toml` 版本号升至 v0.4.2；最终校验（全量 pytest、`openspec validate`）并提交

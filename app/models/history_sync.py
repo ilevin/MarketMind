@@ -31,7 +31,7 @@ from app.db import Base
 
 
 class DatasetName(str, Enum):
-    """数据集名称（§17.1，第一阶段固定八个）。"""
+    """数据集名称（§17.1；etf-data-module 扩展为十一个）。"""
 
     STOCK_BASIC = "stock_basic"
     TRADE_CAL = "trade_cal"
@@ -41,6 +41,10 @@ class DatasetName(str, Enum):
     ADJ_FACTOR = "adj_factor"
     DAILY_BASIC = "daily_basic"
     MONEYFLOW = "moneyflow"
+    # —— ETF 数据集（etf-data-module）——
+    ETF_BASIC = "etf_basic"
+    ETF_DAILY = "etf_daily"
+    ETF_ADJ_FACTOR = "etf_adj_factor"
 
 
 class DatasetKind(str, Enum):

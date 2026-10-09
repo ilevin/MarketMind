@@ -24,7 +24,8 @@ def _make_app(duckdb_url, session_factory, *, enabled: bool):
     config.history.enabled = enabled
     # startup catch-up 会真的调 Tushare；测试里不启动调度副作用
     config.history.startup_catchup = False
-    app = create_app(config)
+    # 注入共享 engine（单连接池，避免双 engine DuckDB 线程泄漏——v0.4.2 修复）
+    app = create_app(config, session_factory=session_factory)
     app.state.session_factory = session_factory
     app.state.name_provider = FakeNameProvider()
     return app

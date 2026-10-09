@@ -498,7 +498,9 @@ def test_0004_fresh_db_full_chain(tmp_path):
             version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
         assert set(V040_NEW_TABLES) <= tables
         assert "seq_sync_task_id" in seqs
-        assert version == V040_HEAD_REVISION
+        # head 随 0005 前移（0004 之后的版本见 V042_HEAD_REVISION）
+        assert version == V042_HEAD_REVISION
+        assert version != V040_HEAD_REVISION
     finally:
         engine.dispose()
 
@@ -707,5 +709,246 @@ def test_0004_run_dataset_new_columns_default_zero(tmp_path):
                 "FROM history_sync_run_dataset WHERE run_id = 'r-new' AND dataset = 'daily'"
             )).one()
         assert row == (0, 0, 0, 0)
+    finally:
+        engine.dispose()
+
+
+# ============================================================
+# 0005_etf_data_module 迁移测试（db-migration spec / tasks 2.5）
+# ============================================================
+
+V041_BASE_REVISION = "0004_per_stock_history_sync"
+V042_HEAD_REVISION = "0005_etf_data_module"
+
+ETF_NEW_TABLES = ("cn_etf_basic", "etf_daily", "etf_adj_factor")
+
+
+def _seed_v041_data(db_path: Path) -> dict[str, int]:
+    """在 0004 schema 上灌入 v0.4.1 历史数据（主档 + 事实 + 个股水位）。
+
+    返回各表行数基准，供升级后比对。
+    """
+    command.upgrade(_alembic_config(db_path), V041_BASE_REVISION)
+    engine = sa.create_engine(f"duckdb:////{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO instrument (instrument_id, symbol, name, market, asset_type, "
+                "currency, is_active, created_at, updated_at) VALUES "
+                "('CN:STOCK:600519', '600519', '贵州茅台', 'CN', 'STOCK', 'CNY', true, now(), now()), "
+                "('CN:ETF:510300', '510300', '沪深300ETF', 'CN', 'ETF', 'CNY', true, now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO cn_stock_basic (instrument_id, ts_code, symbol, name, "
+                "list_date, source_last_seen_at, source, fetched_at) VALUES "
+                "('CN:STOCK:600519', '600519.SH', '600519', '贵州茅台', '2001-08-27', now(), 'tushare', now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO market_daily_bar (instrument_id, ts_code, trade_date, "
+                "open, high, low, close, vol, amount, source, fetched_at) VALUES "
+                "('CN:STOCK:600519', '600519.SH', '2026-09-10', 1700.0, 1720.0, 1690.0, 1710.0, "
+                "1000.0, 1700000.0, 'tushare', now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO stock_sync_state (dataset, instrument_id, ts_code, watermark_date, "
+                "last_status, created_at, updated_at) VALUES "
+                "('daily', 'CN:STOCK:600519', '600519.SH', '2026-09-10', 'success', now(), now())"
+            ))
+            conn.execute(sa.text(
+                "INSERT INTO sync_task (run_id, dataset, instrument_id, ts_code, start_date, "
+                "end_date, status, records_fetched, records_written, started_at, created_at) VALUES "
+                "('run-v041', 'daily', 'CN:STOCK:600519', '600519.SH', '2026-09-01', '2026-09-10', "
+                "'success', 1, 1, now(), now())"
+            ))
+        tables = [
+            "instrument", "cn_stock_basic", "market_daily_bar",
+            "stock_sync_state", "sync_task",
+        ]
+        with engine.connect() as conn:
+            return {t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one() for t in tables}
+    finally:
+        engine.dispose()
+
+
+def test_0005_upgrade_from_v041_preserves_data(tmp_path):
+    """v0.4.1 库升级 0005：既有数据（含用户自选产生的 ETF instrument 行）无损、新表为空。"""
+    db = tmp_path / "v041.duckdb"
+    baseline = _seed_v041_data(db)
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        # 既有表行数不变（含 v0.4.1 已有的 ETF instrument 行）
+        with engine.connect() as conn:
+            for table, expected in baseline.items():
+                actual = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+                assert actual == expected, f"{table} 行数变化: {expected} -> {actual}"
+
+        # 新表存在且为空
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+        assert set(ETF_NEW_TABLES) <= tables
+        assert version == V042_HEAD_REVISION
+        for table in ETF_NEW_TABLES:
+            with engine.connect() as conn:
+                count = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            assert count == 0, f"{table} 初始应为空"
+
+        # 既有个股水位不被触碰
+        with engine.connect() as conn:
+            row = conn.execute(sa.text(
+                "SELECT watermark_date, last_status FROM stock_sync_state "
+                "WHERE dataset = 'daily' AND instrument_id = 'CN:STOCK:600519'"
+            )).one()
+        assert row == (date(2026, 9, 10), "success")
+    finally:
+        engine.dispose()
+
+
+def test_0005_fresh_db_full_chain(tmp_path):
+    """全新库 upgrade head：0001→0005 全链执行，三张 ETF 新表随链建立。"""
+    db = tmp_path / "fresh.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+        assert set(ETF_NEW_TABLES) <= tables
+        assert version == V042_HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_0005_table_shapes(tmp_path):
+    """新表形态：cn_etf_basic 主键+命名 FK；两张事实表无主键/FK/唯一约束、列齐全。"""
+    db = tmp_path / "shape.duckdb"
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        # cn_etf_basic：主键 + 命名外键，无 UNIQUE/二级索引
+        with engine.connect() as conn:
+            rows = conn.execute(sa.text(
+                "SELECT constraint_type, constraint_name FROM duckdb_constraints() "
+                "WHERE schema_name = 'main' AND table_name = 'cn_etf_basic'"
+            )).fetchall()
+        types = {r[0] for r in rows}
+        fk_names = {r[1] for r in rows if r[0] == "FOREIGN KEY"}
+        assert "PRIMARY KEY" in types
+        # DuckDB 将 FK 约束名规范化为方言名（cn_*_instrument_id_instrument_id_fkey，
+        # 与 0003 cn_stock_basic 同行为），迁移代码传入的显式命名仅作意图标注
+        assert "FOREIGN KEY" in types
+        assert "UNIQUE" not in types
+
+        # 两张事实表：仅 NOT NULL，无主键/FK/唯一约束（Core 风格）
+        for table in ("etf_daily", "etf_adj_factor"):
+            constraints = _constraints(engine, table)
+            assert constraints == {"NOT NULL"}, (
+                f"{table} 不应有主键/外键/唯一约束，实际: {constraints}"
+            )
+
+        # 列齐全
+        etf_daily_cols = set(_columns(engine, "etf_daily"))
+        assert etf_daily_cols == {
+            "instrument_id", "ts_code", "trade_date", "open", "high", "low", "close",
+            "volume", "amount", "turnover_rate", "source", "fetched_at",
+        }, f"etf_daily 列差异: {etf_daily_cols}"
+
+        etf_adj_cols = set(_columns(engine, "etf_adj_factor"))
+        assert etf_adj_cols == {
+            "instrument_id", "ts_code", "trade_date", "adj_factor", "source", "fetched_at",
+        }, f"etf_adj_factor 列差异: {etf_adj_cols}"
+
+        # 类型抽查：volume BIGINT、OHLC/adj_factor DOUBLE、trade_date DATE
+        daily_types = _columns(engine, "etf_daily")
+        assert daily_types["volume"][1].upper() == "BIGINT"
+        assert daily_types["close"][1].upper() == "DOUBLE"
+        assert daily_types["trade_date"][1].upper() == "DATE"
+        adj_types = _columns(engine, "etf_adj_factor")
+        assert adj_types["adj_factor"][1].upper() == "DOUBLE"
+
+        # cn_etf_basic 悬空 instrument_id 被 FK 拦截
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(sa.text(
+                    "INSERT INTO cn_etf_basic (instrument_id, ts_code, symbol, source, "
+                    "fetched_at, source_last_seen_at) VALUES "
+                    "('CN:ETF:999999', '999999.SH', '999999', 'sina', now(), now())"
+                ))
+    finally:
+        engine.dispose()
+
+
+def test_0005_idempotent_replay(tmp_path):
+    """0005 迁移可重复执行：对已迁移库再 upgrade head 不报错、数据不变。"""
+    db = tmp_path / "idem.duckdb"
+    baseline = _seed_v041_data(db)
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            pre_version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+            pre_counts = {
+                t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
+                for t in list(baseline.keys()) + list(ETF_NEW_TABLES)
+            }
+    finally:
+        engine.dispose()
+
+    # 第二次 upgrade head（应幂等）
+    command.upgrade(_alembic_config(db), "head")
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            post_version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+            post_counts = {
+                t: conn.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
+                for t in list(baseline.keys()) + list(ETF_NEW_TABLES)
+            }
+        assert post_version == pre_version
+        assert post_counts == pre_counts
+    finally:
+        engine.dispose()
+
+
+def test_0005_downgrade_rollback_clean(tmp_path):
+    """0005 downgrade：三张新表消失，v0.4.1 数据无损、版本回落 0004。"""
+    db = tmp_path / "down.duckdb"
+    baseline = _seed_v041_data(db)
+    command.upgrade(_alembic_config(db), "head")
+    command.downgrade(_alembic_config(db), V041_BASE_REVISION)
+
+    engine = sa.create_engine(f"duckdb:////{db}")
+    try:
+        with engine.connect() as conn:
+            tables = {
+                r[0] for r in conn.execute(sa.text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+                ))
+            }
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+        assert not (set(ETF_NEW_TABLES) & tables), f"降级后残留新表: {set(ETF_NEW_TABLES) & tables}"
+        assert version == V041_BASE_REVISION
+
+        with engine.connect() as conn:
+            for table, expected in baseline.items():
+                actual = conn.execute(sa.text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+                assert actual == expected, f"降级后 {table} 行数变化: {expected} -> {actual}"
     finally:
         engine.dispose()

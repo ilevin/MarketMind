@@ -167,13 +167,21 @@ def client_factory(session_factory, duckdb_url, user_factory):
       返回 AuthedClient（写请求自动带 X-CSRF-Token）。
     """
 
-    def _make(name_provider, *, login_as=None, role="user"):
+    def _make(name_provider, *, login_as=None, role="user", history_overrides=None):
+        """``history_overrides``：可选 dict，键值写入 config.history
+        （etf-data-module 8.5：etf_enabled=false 等分支测试覆盖配置）。"""
         from app.config import AppConfig, DatabaseConfig
         from app.main import create_app
 
         config = AppConfig(database=DatabaseConfig(url=duckdb_url))
         config.history.startup_catchup = False
-        app = create_app(config)
+        for key, value in (history_overrides or {}).items():
+            setattr(config.history, key, value)
+        # 注入共享 session_factory：app 与 fixture 复用同一 engine（单连接池）。
+        # 不注入时 create_app 会自建第二个 engine 指向同一 DuckDB 文件——
+        # 进程内共享底层 database 实例，双 engine 交错 dispose 后 DuckDB
+        # 工作线程不回收（全量回归泄漏数百线程——v0.4.2 修复）。
+        app = create_app(config, session_factory=session_factory)
         app.state.session_factory = session_factory
         app.state.name_provider = name_provider
         client = TestClient(app)

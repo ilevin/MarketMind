@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.history_market import CnStockBasic, CnStockCompany, CnStockNameChange
 from app.models.history_sync import (
@@ -29,6 +29,8 @@ from app.providers.base import (
     AdjFactor,
     DailyBar,
     DailyBasic,
+    EtfDailyBar,
+    EtfUniverseRecord,
     MoneyFlow,
     ProviderBatch,
     StockBasicRecord,
@@ -38,6 +40,7 @@ from app.providers.base import (
 from app.models.history_fact import HISTORY_FACT_TABLES
 from app.repositories.history_fact import HistoryFactRepository
 from app.repositories.history_master import HistoryMasterRepository, namechange_event_key
+from app.repositories.etf_master import EtfMasterRepository
 from app.repositories.history_sync import (
     HistoryDayStatusRepository,
     HistorySyncRunDatasetRepository,
@@ -100,6 +103,50 @@ def namechange_record(symbol: str, name: str, start: date, **overrides) -> Stock
     )
     fields.update(overrides)
     return StockNameChangeRecord(**fields)
+
+
+def etf_universe_record(symbol: str, **overrides) -> EtfUniverseRecord:
+    """ETF universe 记录构造器（etf-data-module）。"""
+    fields = dict(
+        ts_code=f"{symbol}.SZ",
+        symbol=symbol,
+        instrument_id=f"CN:ETF:{symbol}",
+        name=f"ETF{symbol}",
+        exchange="SZSE",
+        list_date=date(2015, 6, 1),
+    )
+    fields.update(overrides)
+    return EtfUniverseRecord(**fields)
+
+
+def etf_daily_record(symbol: str, trade_date: date, **overrides) -> EtfDailyBar:
+    """ETF 日线记录构造器（etf-data-module）。"""
+    fields = dict(
+        instrument_id=f"CN:ETF:{symbol}",
+        ts_code=f"{symbol}.SZ",
+        trade_date=trade_date,
+        open=2.5,
+        high=2.6,
+        low=2.4,
+        close=2.55,
+        volume=1000000,  # 手
+        amount=2550000.0,  # 元
+        turnover_rate=5.5,  # %
+    )
+    fields.update(overrides)
+    return EtfDailyBar(**fields)
+
+
+def etf_adj_factor_record(symbol: str, trade_date: date, **overrides) -> AdjFactor:
+    """ETF 复权因子记录构造器（复用 AdjFactor，etf-data-module）。"""
+    fields = dict(
+        instrument_id=f"CN:ETF:{symbol}",
+        ts_code=f"{symbol}.SZ",
+        trade_date=trade_date,
+        adj_factor=1.0,
+    )
+    fields.update(overrides)
+    return AdjFactor(**fields)
 
 
 def batch(records: list, *, raw: int | None = None, truncation: bool = False) -> ProviderBatch:
@@ -1430,3 +1477,339 @@ class TestValidationDateRange:
             val.validate_batch(
                 "stock_basic", batch([]), date_range=(self.D, self.D)
             )
+
+
+# ---- ETF 主档与事实表（etf-data-module，tasks 5.3） ----
+
+
+class TestEtfMasterRepository:
+    """ETF universe 刷新与生命周期管理（etf-data-module）。"""
+
+    def test_upsert_cn_etf_master_creates_instrument_and_basic(self, session):
+        """upsert 同时创建 instrument 与 cn_etf_basic。"""
+        from app.models.history_market import CnEtfBasic
+
+        repo = EtfMasterRepository(session)
+        records = [etf_universe_record("159915"), etf_universe_record("510050")]
+        n = repo.upsert_cn_etf_master(
+            records, source="eastmoney", run_id=RUN_ID, fetched_at=FETCHED_AT
+        )
+        assert n == 2
+
+        # instrument 存在
+        inst = session.get(Instrument, "CN:ETF:159915")
+        assert inst.market == "CN"
+        assert inst.asset_type == "ETF"
+        assert inst.is_active is True
+
+        # cn_etf_basic 存在
+        basic = session.get(CnEtfBasic, "CN:ETF:159915")
+        assert basic.symbol == "159915"
+        assert basic.source == "eastmoney"
+
+    def test_missing_etf_marked_inactive(self, session):
+        """本轮未见的 ETF 置 is_active=false（不删除）。"""
+        repo = EtfMasterRepository(session)
+
+        # 第一轮：两只 ETF
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915"), etf_universe_record("510050")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        # 第二轮：只有一只（510050 缺失）
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        inst_510050 = session.get(Instrument, "CN:ETF:510050")
+        assert inst_510050 is not None  # 未删除
+        assert inst_510050.is_active is False  # 标记 inactive
+
+    def test_delisted_etf_reappear_restores_active(self, session):
+        """退市 ETF 重新出现在 universe 时恢复 is_active=true。"""
+        repo = EtfMasterRepository(session)
+
+        # 第一轮
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("510050")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        # 第二轮：缺失（标记 inactive）
+        repo.upsert_cn_etf_master(
+            [], source="eastmoney", run_id=RUN_ID, fetched_at=FETCHED_AT
+        )
+        session.commit()
+
+        inst = session.get(Instrument, "CN:ETF:510050")
+        assert inst.is_active is False
+
+        # 第三轮：重新出现（恢复 active）
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("510050")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        inst = session.get(Instrument, "CN:ETF:510050")
+        assert inst.is_active is True
+
+    def test_list_date_null_saved(self, session):
+        """list_date 缺失时保存 NULL（不推算）。"""
+        from app.models.history_market import CnEtfBasic
+
+        repo = EtfMasterRepository(session)
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915", list_date=None)],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        basic = session.get(CnEtfBasic, "CN:ETF:159915")
+        assert basic.list_date is None
+
+    def test_list_cn_etf_instruments_includes_inactive(self, session):
+        """列出全部 ETF instruments（含 inactive），按 symbol 升序。"""
+        repo = EtfMasterRepository(session)
+        repo.upsert_cn_etf_master(
+            [
+                etf_universe_record("510050"),
+                etf_universe_record("159915"),
+            ],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        # 标记一只 inactive
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        etfs = repo.list_cn_etf_instruments()
+        assert [e.symbol for e in etfs] == ["159915", "510050"]
+        assert etfs[1].is_active is False
+
+    def test_get_cn_etf_lifecycle_map(self, session):
+        """返回 {instrument_id: (list_date, delist_date)} 映射。"""
+        repo = EtfMasterRepository(session)
+        repo.upsert_cn_etf_master(
+            [
+                etf_universe_record("159915", list_date=date(2012, 6, 8)),
+                etf_universe_record("510050", list_date=None),
+            ],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        lifecycle = repo.get_cn_etf_lifecycle_map()
+        assert lifecycle["CN:ETF:159915"] == (date(2012, 6, 8), None)
+        assert lifecycle["CN:ETF:510050"] == (None, None)
+
+    def test_upsert_idempotent(self, session):
+        """重复 upsert 幂等（字段刷新、行数不增）。"""
+        from app.models.history_market import CnEtfBasic
+
+        repo = EtfMasterRepository(session)
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915", name="创业板ETF")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        repo.upsert_cn_etf_master(
+            [etf_universe_record("159915", name="创业板ETF-新名称")],
+            source="eastmoney",
+            run_id=RUN_ID,
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        assert session.query(Instrument).filter_by(asset_type="ETF").count() == 1
+        assert session.query(CnEtfBasic).count() == 1
+        basic = session.get(CnEtfBasic, "CN:ETF:159915")
+        assert basic.name == "创业板ETF-新名称"
+
+
+class TestEtfFactRepository:
+    """ETF 事实表区间替换与幂等（etf-data-module，tasks 5.2）。"""
+
+    def test_etf_daily_instrument_range_replace(self, session):
+        """etf_daily 区间替换：DELETE 单 ETF 区间 + INSERT 新数据。"""
+        from app.models.history_fact import HISTORY_FACT_TABLES
+
+        repo = HistoryFactRepository(session)
+        d1, d2, d3 = date(2026, 9, 15), date(2026, 9, 16), date(2026, 9, 17)
+
+        # 初始写入 159915 三日数据
+        repo.insert_records(
+            "etf_daily",
+            [
+                etf_daily_record("159915", d1, close=2.5),
+                etf_daily_record("159915", d2, close=2.6),
+                etf_daily_record("159915", d3, close=2.7),
+            ],
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        # 区间替换 d1~d2（覆盖前两日）
+        old_count, inserted = repo.replace_for_instrument_range(
+            "etf_daily",
+            "CN:ETF:159915",
+            d1,
+            d2,
+            [
+                etf_daily_record("159915", d1, close=2.51),  # 修订
+                etf_daily_record("159915", d2, close=2.61),
+            ],
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        assert old_count == 2
+        assert inserted == 2
+
+        # 验证结果：d1/d2 更新，d3 保留
+        table = HISTORY_FACT_TABLES["etf_daily"]
+        rows = session.execute(
+            select(table.c.trade_date, table.c.close)
+            .where(table.c.instrument_id == "CN:ETF:159915")
+            .order_by(table.c.trade_date)
+        ).all()
+        assert len(rows) == 3
+        assert rows[0].close == pytest.approx(2.51)
+        assert rows[1].close == pytest.approx(2.61)
+        assert rows[2].close == pytest.approx(2.7)
+
+    def test_etf_adj_factor_instrument_range_replace(self, session):
+        """etf_adj_factor 区间替换（复用 HistoryFactRepository 泛化接口）。"""
+        from app.models.history_fact import HISTORY_FACT_TABLES
+
+        repo = HistoryFactRepository(session)
+        d1, d2 = date(2026, 9, 15), date(2026, 9, 16)
+
+        repo.insert_records(
+            "etf_adj_factor",
+            [etf_adj_factor_record("510050", d1, adj_factor=1.0)],
+            source="tushare",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        old_count, inserted = repo.replace_for_instrument_range(
+            "etf_adj_factor",
+            "CN:ETF:510050",
+            d1,
+            d2,
+            [
+                etf_adj_factor_record("510050", d1, adj_factor=1.01),
+                etf_adj_factor_record("510050", d2, adj_factor=1.02),
+            ],
+            source="tushare",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        assert old_count == 1
+        assert inserted == 2
+
+        table = HISTORY_FACT_TABLES["etf_adj_factor"]
+        count = session.scalar(
+            select(func.count()).select_from(table).where(table.c.instrument_id == "CN:ETF:510050")
+        )
+        assert count == 2
+
+    def test_etf_daily_no_duplicate_keys_after_replace(self, session):
+        """区间替换后 (instrument_id, trade_date) 无重复行。"""
+        from app.models.history_fact import HISTORY_FACT_TABLES
+
+        repo = HistoryFactRepository(session)
+        d = date(2026, 9, 16)
+
+        # 第一次写入
+        repo.replace_for_instrument_range(
+            "etf_daily",
+            "CN:ETF:159915",
+            d,
+            d,
+            [etf_daily_record("159915", d, close=2.5)],
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        # 第二次替换同一区间
+        repo.replace_for_instrument_range(
+            "etf_daily",
+            "CN:ETF:159915",
+            d,
+            d,
+            [etf_daily_record("159915", d, close=2.6)],
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        table = HISTORY_FACT_TABLES["etf_daily"]
+        count = session.scalar(
+            select(func.count())
+            .select_from(table)
+            .where(table.c.instrument_id == "CN:ETF:159915", table.c.trade_date == d)
+        )
+        assert count == 1  # 无重复
+
+    def test_etf_empty_range_clears_old_data(self, session):
+        """区间替换传入空记录：删除旧数据、record_count 正确递减。"""
+        repo = HistoryFactRepository(session)
+        d1, d2 = date(2026, 9, 15), date(2026, 9, 16)
+
+        repo.insert_records(
+            "etf_daily",
+            [etf_daily_record("159915", d1), etf_daily_record("159915", d2)],
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        old_count, inserted = repo.replace_for_instrument_range(
+            "etf_daily",
+            "CN:ETF:159915",
+            d1,
+            d2,
+            [],  # 空记录
+            source="eastmoney",
+            fetched_at=FETCHED_AT,
+        )
+        session.commit()
+
+        assert old_count == 2
+        assert inserted == 0
+        assert repo.count_for_instrument_range("etf_daily", "CN:ETF:159915", d1, d2) == 0
+

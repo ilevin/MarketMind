@@ -1,6 +1,6 @@
 /* 原生 JS：自选管理页（watchlist）+ 行情首页（index）+ 标签管理页（tags）
  * + 登录页（login）+ 修改密码页（change-password）+ 用户管理页（admin-users）
- * + 数据管理页（admin-data）。
+ * + 数据管理页（admin-data）+ ETF 数据页（admin-data-etf / admin-data-etf-history）。
  * 页面通过 body[data-page] 区分；v0.03 增加标签管理与行情页标签筛选（本地过滤）；
  * multi-user-auth：统一 fetch 封装注入 X-CSRF-Token，会话失效自动回登录页；
  * a-share-historical-data：数据管理页在运行中每 10 秒轮询 sync 小表 API。 */
@@ -1272,6 +1272,473 @@ function initAdminDataStocksPage() {
   setInterval(checkPolling, 30000);
 }
 
+// ---------- ETF 数据总览页（admin，etf-data-module 8.3） ----------
+
+function initAdminDataEtfPage() {
+  const syncBtn = document.getElementById("sync-button");
+  if (!syncBtn) return;
+
+  const msg = document.getElementById("sync-message");
+  const POLL_MS = 10000;
+  let pollTimer = null;
+  // ETF 数据集（页面当前任务进度只展示 ETF 段）
+  const ETF_DATASETS = ["etf_basic", "etf_daily", "etf_adj_factor"];
+
+  function fmtDateTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  }
+
+  function statusBadge(status, labels, classes) {
+    const label = labels[status] || status || "—";
+    const cls = classes[status] ? ` ${classes[status]}` : "";
+    return `<span class="status-badge${cls}">${esc(label)}</span>`;
+  }
+
+  function renderDisabled() {
+    document.getElementById("etf-disabled-panel").classList.remove("hidden");
+    ["etf-main", "etf-datasets-panel"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("hidden");
+    });
+    document.getElementById("active-run").closest(".panel").classList.add("hidden");
+  }
+
+  function renderOverview(summary) {
+    const overall = document.getElementById("overall-status");
+    overall.textContent = OVERALL_STATUS_LABEL[summary.overall_status] || summary.overall_status;
+    overall.className = `status-badge ${OVERALL_STATUS_CLASS[summary.overall_status] || ""}`.trim();
+    document.getElementById("etf-active-count").textContent =
+      (summary.etf_universe.active_count || 0).toLocaleString("zh-CN");
+    document.getElementById("etf-total-count").textContent =
+      (summary.etf_universe.total_count || 0).toLocaleString("zh-CN");
+    document.getElementById("etf-universe-refreshed").textContent =
+      fmtDateTime(summary.etf_universe.last_refreshed_at);
+    document.getElementById("history-start-date").textContent = summary.history_start_date || "—";
+
+    const active = summary.active_run;
+    syncBtn.disabled = !!active;
+    syncBtn.textContent = active ? "正在更新..." : "检查并更新数据";
+  }
+
+  function renderEtfCards(summary) {
+    const box = document.getElementById("etf-cards");
+    box.innerHTML = "";
+    summary.etf_datasets.forEach((d) => {
+      const card = document.createElement("div");
+      card.className = "data-card";
+      if (d.dataset === "etf_basic") {
+        // 主档卡：无交易日水位语义（§54.3）
+        const cursor = d.bootstrap_complete
+          ? "bootstrap 完成"
+          : d.master_cursor
+            ? `游标 ${d.master_cursor}`
+            : "—";
+        card.innerHTML = `
+          <div class="data-card-head">
+            <span class="data-card-title">${esc(d.display_name)}</span>
+            ${statusBadge(d.status, DATASET_STATUS_LABEL, DATASET_STATUS_CLASS)}
+          </div>
+          <dl class="data-card-body">
+            <dt>数据范围</dt><dd>${esc(d.data_min_date ? `${d.data_min_date} ~ ${d.data_max_date || "—"}` : "尚无数据")}</dd>
+            <dt>记录数</dt><dd class="num">${(d.record_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>最近刷新</dt><dd>${fmtDateTime(d.last_success_at)}</dd>
+            <dt>bootstrap / cursor</dt><dd>${esc(cursor)}</dd>
+            <dt>最后错误</dt><dd class="muted">${
+              d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
+            }</dd>
+          </dl>`;
+      } else {
+        // 日级卡：个股口径统计（stock_count 为 ETF 证券总数，字段名与股票条目同构）
+        const range = d.data_min_date
+          ? `${d.data_min_date} ~ ${d.data_max_date || "—"}`
+          : "尚无数据";
+        const pct = d.stock_count > 0 ? ((d.completion_rate || 0) * 100).toFixed(1) : "0.0";
+        card.innerHTML = `
+          <div class="data-card-head">
+            <span class="data-card-title">${esc(d.display_name)}</span>
+            ${statusBadge(d.status, DATASET_STATUS_LABEL, DATASET_STATUS_CLASS)}
+          </div>
+          <dl class="data-card-body">
+            <dt>数据范围</dt><dd>${esc(range)}</dd>
+            <dt>目标日期</dt><dd>${esc(d.latest_expected_trade_date || "—")}</dd>
+            <dt>ETF 总数</dt><dd class="num">${(d.stock_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>已追平</dt><dd class="num">${(d.up_to_date_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>有缺口</dt><dd class="num">${(d.lagging_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>完整度</dt><dd class="num">${pct}%</dd>
+            <dt>今日成功</dt><dd class="num">${(d.today_success_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>今日失败</dt><dd class="num">${(d.today_failed_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>记录数</dt><dd class="num">${(d.record_count || 0).toLocaleString("zh-CN")}</dd>
+            <dt>最后成功</dt><dd>${fmtDateTime(d.last_success_at)}</dd>
+            <dt>最后错误</dt><dd class="muted">${
+              d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
+            }</dd>
+          </dl>`;
+      }
+      box.appendChild(card);
+    });
+  }
+
+  function renderActiveRun(run, datasets, progress) {
+    const box = document.getElementById("active-run");
+    if (!run) {
+      box.innerHTML = '<p class="muted">当前没有运行中的同步任务。</p>';
+      return;
+    }
+    const etfRows = datasets.filter((d) => ETF_DATASETS.includes(d.dataset));
+    let progressHtml = "";
+    if (progress && progress.current_dataset) {
+      progressHtml = `
+      <div class="active-progress">
+        <span class="muted">当前进度：</span>
+        <strong>${esc(progress.current_dataset)}</strong> /
+        <code>${esc(progress.current_ts_code || "—")}</code>
+        <span class="muted">· 已处理 ${progress.processed} · 成功 ${progress.succeeded} · 失败 ${progress.failed} · 跳过 ${progress.skipped}</span>
+      </div>`;
+    }
+    const rows = etfRows
+      .map(
+        (d) => `
+        <tr>
+          <td>${esc(d.display_name)}</td>
+          <td>${statusBadge(
+            { RUNNING: "SYNCING", SUCCESS: "CAUGHT_UP", FAILED: "FAILED", NOOP: "UNINITIALIZED" }[d.status] || d.status,
+            DATASET_STATUS_LABEL,
+            DATASET_STATUS_CLASS
+          )}</td>
+          <td class="right num">${d.processed_count || 0}</td>
+          <td class="right num">${d.task_success_count || 0}</td>
+          <td class="right num">${d.task_failed_count || 0}</td>
+          <td class="right num">${d.skipped_count || 0}</td>
+          <td class="right num">${(d.rows_written || 0).toLocaleString("zh-CN")}</td>
+          <td class="muted">${
+            d.last_error ? `${esc(d.last_error_code || "")} ${esc(d.last_error)}` : "—"
+          }</td>
+        </tr>`
+      )
+      .join("");
+    box.innerHTML = `
+      <p class="muted">
+        run ${esc(run.run_id)} · ${TRIGGER_LABEL[run.trigger_type] || run.trigger_type} ·
+        开始于 ${fmtDateTime(run.started_at)}（整体任务含股票数据集，此处仅展示 ETF 段）
+      </p>
+      ${progressHtml}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>数据集</th><th>状态</th>
+            <th class="right">已处理</th><th class="right">成功</th>
+            <th class="right">失败</th><th class="right">跳过</th>
+            <th class="right">写入行数</th>
+            <th>最后错误</th>
+          </tr>
+        </thead>
+        <tbody>${rows || '<tr><td colspan="8" class="muted">ETF 段尚未开始</td></tr>'}</tbody>
+      </table>`;
+  }
+
+  async function refresh() {
+    const summary = await api("/api/admin/history-data/summary");
+    // etf_universe === null 即 history.etf_enabled=false（design D12 未启用说明态）
+    if (summary.etf_universe == null) {
+      renderDisabled();
+      stopPolling();
+      return;
+    }
+    renderOverview(summary);
+    renderEtfCards(summary);
+    if (summary.active_run) {
+      const detail = await api(
+        `/api/admin/history-data/runs/${encodeURIComponent(summary.active_run.run_id)}`
+      );
+      renderActiveRun(detail.run, detail.datasets, detail.progress);
+      startPolling();
+    } else {
+      renderActiveRun(null, []);
+      stopPolling();
+    }
+    return summary;
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollTimer = window.setInterval(() => {
+      refresh().catch((err) => {
+        stopPolling();
+        showMsg(msg, err.message, "error");
+      });
+    }, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (pollTimer === null) return;
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  syncBtn.addEventListener("click", async () => {
+    syncBtn.disabled = true;
+    syncBtn.textContent = "正在更新...";
+    msg.classList.add("hidden");
+    try {
+      await api("/api/admin/history-data/sync", { method: "POST" });
+      await refresh();
+    } catch (err) {
+      if (String(err.message).includes("正在运行")) {
+        showMsg(msg, "历史数据同步正在运行", "success");
+        await refresh().catch(() => {});
+      } else {
+        syncBtn.disabled = false;
+        syncBtn.textContent = "检查并更新数据";
+        showMsg(msg, err.message, "error");
+      }
+    }
+  });
+
+  window.addEventListener("beforeunload", stopPolling);
+
+  refresh().catch((err) => showMsg(msg, err.message, "error"));
+}
+
+// ---------- ETF 个股历史页（admin，etf-data-module 8.4） ----------
+
+function initAdminDataEtfHistoryPage() {
+  const chipsBox = document.getElementById("dataset-chips");
+  const statusFilter = document.getElementById("status-filter");
+  const searchInput = document.getElementById("search-input");
+  const prevBtn = document.getElementById("prev-page");
+  const nextBtn = document.getElementById("next-page");
+  const pageInfo = document.getElementById("page-info");
+  const tbody = document.querySelector("#stocks-table tbody");
+  const emptyEl = document.getElementById("stocks-empty");
+  const tableEl = document.getElementById("stocks-table");
+
+  const POLL_MS = 10000;
+  let pollTimer = null;
+  let currentDataset = "etf_daily";
+  let currentStatus = "all";
+  let currentPage = 1;
+  let currentQ = "";
+  let currentTotal = 0;
+  let currentTotalPages = 1;
+  let searchTimer = null;
+
+  const DATASET_NAMES = {
+    etf_daily: "ETF日线行情",
+    etf_adj_factor: "ETF复权因子",
+  };
+
+  const LAST_STATUS_LABEL = {
+    success: "成功",
+    failed: "失败",
+  };
+  const LAST_STATUS_CLASS = {
+    success: "ok",
+    failed: "bad",
+  };
+
+  function fmtDateTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  }
+
+  function renderDatasetChips() {
+    chipsBox.innerHTML = "";
+    Object.keys(DATASET_NAMES).forEach((ds) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (ds === currentDataset ? " on" : "");
+      chip.textContent = DATASET_NAMES[ds];
+      chip.dataset.dataset = ds;
+      chip.addEventListener("click", () => {
+        currentDataset = ds;
+        currentPage = 1;
+        renderDatasetChips();
+        loadStocks();
+      });
+      chipsBox.appendChild(chip);
+    });
+  }
+
+  function renderStats(stats) {
+    document.getElementById("dataset-display").textContent = DATASET_NAMES[currentDataset] || currentDataset;
+    document.getElementById("stock-count").textContent = stats.stock_count.toLocaleString("zh-CN");
+    document.getElementById("up-to-date-count").textContent = stats.up_to_date_count.toLocaleString("zh-CN");
+    document.getElementById("lagging-count").textContent = stats.lagging_count.toLocaleString("zh-CN");
+    document.getElementById("today-success").textContent = stats.today_success_count.toLocaleString("zh-CN");
+    document.getElementById("today-failed").textContent = stats.today_failed_count.toLocaleString("zh-CN");
+    const pct = stats.stock_count > 0 ? ((stats.completion_rate || 0) * 100).toFixed(1) : "0.0";
+    document.getElementById("completion-rate").textContent = pct + "%";
+  }
+
+  function renderTable(items) {
+    tbody.innerHTML = "";
+    const hasItems = items.length > 0;
+    emptyEl.classList.toggle("hidden", hasItems);
+    tableEl.classList.toggle("hidden", !hasItems);
+    if (!hasItems) return;
+
+    items.forEach((item) => {
+      const tr = document.createElement("tr");
+      const statusBadge = item.last_status
+        ? `<span class="status-badge ${LAST_STATUS_CLASS[item.last_status] || ""}">${esc(LAST_STATUS_LABEL[item.last_status] || item.last_status)}</span>`
+        : '<span class="muted">未同步</span>';
+      const errorCell = item.last_status === "failed" && item.last_error
+        ? `<button class="link" data-act="error" data-tscode="${esc(item.ts_code)}" data-errorcode="${esc(item.last_error_code || "")}" data-errormsg="${esc(item.last_error || "")}">查看</button>`
+        : '<span class="muted">—</span>';
+      tr.innerHTML = `
+        <td><code>${esc(item.ts_code)}</code></td>
+        <td>${esc(item.name || "—")}</td>
+        <td>${esc(item.list_date || "—")}</td>
+        <td>${esc(item.delist_date || "—")}</td>
+        <td>${esc(item.watermark_date || "—")}</td>
+        <td>${statusBadge}</td>
+        <td class="muted">${fmtDateTime(item.last_success_at)}</td>
+        <td class="muted">${fmtDateTime(item.last_attempt_at)}</td>
+        <td>${errorCell}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderPagination() {
+    pageInfo.textContent = `第 ${currentPage} / ${currentTotalPages} 页 · 共 ${currentTotal} 条`;
+    prevBtn.disabled = currentPage <= 1;
+    nextBtn.disabled = currentPage >= currentTotalPages;
+  }
+
+  async function loadStocks() {
+    const params = new URLSearchParams({
+      dataset: currentDataset,
+      status: currentStatus,
+      q: currentQ,
+      page: String(currentPage),
+    });
+    try {
+      const data = await api(`/api/admin/history-data/stocks?${params.toString()}`);
+      renderStats(data.stats);
+      renderTable(data.items);
+      currentTotal = data.pagination.total;
+      currentTotalPages = data.pagination.total_pages;
+      if (currentPage > currentTotalPages) {
+        currentPage = currentTotalPages;
+        loadStocks();
+        return;
+      }
+      renderPagination();
+    } catch (err) {
+      emptyEl.classList.remove("hidden");
+      tableEl.classList.add("hidden");
+      emptyEl.textContent = `加载失败：${err.message}`;
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollTimer = window.setInterval(() => {
+      loadStocks().catch(() => {});
+    }, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (pollTimer === null) return;
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  // 事件绑定
+  statusFilter.addEventListener("change", () => {
+    currentStatus = statusFilter.value;
+    currentPage = 1;
+    loadStocks();
+  });
+
+  searchInput.addEventListener("input", () => {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      currentQ = searchInput.value.trim();
+      currentPage = 1;
+      loadStocks();
+    }, 300);
+  });
+
+  prevBtn.addEventListener("click", () => {
+    if (currentPage > 1) {
+      currentPage--;
+      loadStocks();
+    }
+  });
+
+  nextBtn.addEventListener("click", () => {
+    if (currentPage < currentTotalPages) {
+      currentPage++;
+      loadStocks();
+    }
+  });
+
+  // 失败详情 modal（只读）
+  const modal = document.getElementById("error-modal");
+  const modalTitle = document.getElementById("error-modal-title");
+  const modalTsCode = document.getElementById("error-modal-tscode");
+  const modalErrCode = document.getElementById("error-modal-errorcode");
+  const modalMsg = document.getElementById("error-modal-message");
+  const modalClose = document.getElementById("error-modal-close");
+
+  function openErrorModal(tsCode, errCode, errMsg) {
+    modalTitle.textContent = `失败详情：${tsCode}`;
+    modalTsCode.textContent = tsCode;
+    modalErrCode.textContent = errCode || "未知错误码";
+    modalMsg.textContent = errMsg || "（无错误信息）";
+    modal.classList.remove("hidden");
+  }
+
+  function closeErrorModal() {
+    modal.classList.add("hidden");
+  }
+
+  modalClose.addEventListener("click", closeErrorModal);
+  modal.addEventListener("click", (ev) => {
+    if (ev.target === modal) closeErrorModal();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !modal.classList.contains("hidden")) {
+      closeErrorModal();
+    }
+  });
+
+  tbody.addEventListener("click", (ev) => {
+    const btn = ev.target.closest('button[data-act="error"]');
+    if (!btn) return;
+    openErrorModal(btn.dataset.tscode, btn.dataset.errorcode, btn.dataset.errormsg);
+  });
+
+  // 运行中轮询：先查一次 summary 判断是否有 active run
+  async function checkPolling() {
+    try {
+      const summary = await api("/api/admin/history-data/summary");
+      if (summary.active_run) {
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    } catch (err) {
+      stopPolling();
+    }
+  }
+
+  window.addEventListener("beforeunload", stopPolling);
+
+  // 初始化
+  renderDatasetChips();
+  loadStocks();
+  checkPolling();
+  // 每 30 秒检查一次是否需要轮询（同步任务可能在页面打开期间启动）
+  setInterval(checkPolling, 30000);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const page = document.body.dataset.page;
   bindLogout();
@@ -1284,4 +1751,6 @@ document.addEventListener("DOMContentLoaded", () => {
   else if (page === "admin-users") initAdminUsersPage();
   else if (page === "admin-data") initAdminDataPage();
   else if (page === "admin-data-stocks") initAdminDataStocksPage();
+  else if (page === "admin-data-etf") initAdminDataEtfPage();
+  else if (page === "admin-data-etf-history") initAdminDataEtfHistoryPage();
 });

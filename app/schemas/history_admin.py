@@ -88,13 +88,71 @@ class ActiveRunSummary(BaseModel):
     started_at: str
 
 
+class EtfUniverseSummary(BaseModel):
+    """ETF universe 概况（etf-data-module，design D12）。
+
+    active_count / total_count 来自 instrument 表（market='CN' AND
+    asset_type='ETF'，含 inactive）；last_refreshed_at 为 etf_basic 数据集
+    最近一次 universe 刷新成功时间。
+    """
+
+    active_count: int = 0
+    total_count: int = 0
+    last_refreshed_at: str | None = None
+
+
+class EtfDatasetSummary(BaseModel):
+    """ETF 数据集条目（etf-data-module，design D12）。
+
+    etf_basic 按主档条目结构（MasterDatasetSummary 同构）；
+    etf_daily / etf_adj_factor 按日级条目结构（DailyDatasetSummary 同构，
+    stock_count 为 ETF 证券总数——与股票条目共用字段名保持同构）。
+    同构字段平铺到本模型，避免前端处理多态。
+    """
+
+    # 主档条目字段（etf_basic 用）
+    dataset: str
+    display_name: str
+    status: str
+    record_count: int = 0
+    last_success_at: str | None = None
+    master_cursor: str | None = None
+    bootstrap_complete: bool = False
+    last_error_code: str | None = None
+    last_error: str | None = None
+    # 日级条目字段（etf_daily / etf_adj_factor 用；etf_basic 恒为默认值）
+    history_start_date: str | None = None
+    data_min_date: str | None = None
+    data_max_date: str | None = None
+    latest_complete_trade_date: str | None = None
+    latest_expected_trade_date: str | None = None
+    next_trade_date: str | None = None
+    lag_trade_days: int = 0
+    current_trade_date: str | None = None
+    current_attempt: int = 0
+    stock_count: int = 0
+    up_to_date_count: int = 0
+    lagging_count: int = 0
+    today_success_count: int = 0
+    today_failed_count: int = 0
+    completion_rate: float = 0.0
+
+
 class HistorySummaryResponse(BaseModel):
+    """summary 响应（etf-data-module 新增 ETF 分组，design D12）。
+
+    etf_universe / etf_datasets 在 history.etf_enabled=false 时为
+    None / 空列表（不返回统计）。
+    """
+
     overall_status: str
     history_start_date: str
     latest_market_trade_date: str | None = None
     active_run: ActiveRunSummary | None = None
     daily_datasets: list[DailyDatasetSummary] = []
     master_datasets: list[MasterDatasetSummary] = []
+    etf_universe: EtfUniverseSummary | None = None
+    etf_datasets: list[EtfDatasetSummary] = []
 
 
 # ---- 手动同步（§52.2） ----

@@ -168,3 +168,52 @@ def test_page_js_loaded(admin_client):
     body = admin_client.get("/admin/data").text
     assert "/static/app.js" in body
     assert "/static/style.css" in body
+
+
+# ==================== ETF 数据页（etf-data-module，tasks 8.5） ====================
+
+
+class TestAdminDataEtfPages:
+    def _get(self, admin_client, path):
+        resp = admin_client.get(path)
+        assert resp.status_code == 200
+        return resp.text
+
+    def test_etf_overview_csrf_meta_and_js(self, admin_client):
+        """ETF 总览页：CSRF meta（写请求依赖）+ 原生 JS。"""
+        body = self._get(admin_client, "/admin/data/etf")
+        assert 'name="csrf-token"' in body
+        assert "/static/app.js" in body
+        assert "/static/style.css" in body
+
+    def test_etf_history_csrf_meta_and_js(self, admin_client):
+        """ETF 个股历史页：CSRF meta + 原生 JS。"""
+        body = self._get(admin_client, "/admin/data/etf/history")
+        assert 'name="csrf-token"' in body
+        assert "/static/app.js" in body
+        assert "/static/style.css" in body
+
+    def test_etf_pages_nav_back_to_overview(self, admin_client):
+        """两个 ETF 页面子导航提供返回数据总览（/admin/data）的入口。"""
+        for path in ("/admin/data/etf", "/admin/data/etf/history"):
+            body = self._get(admin_client, path)
+            assert 'href="/admin/data"' in body, f"{path} 缺少返回总览入口"
+            # 数据管理分区子导航条目齐全
+            for href in (
+                'href="/admin/data/stocks"', 'href="/admin/data/etf"',
+                'href="/admin/data/etf/history"',
+            ):
+                assert href in body, f"{path} 缺少子导航 {href}"
+
+    def test_etf_overview_data_source_hint(self, admin_client):
+        """总览页明示双数据源与 universe 刷新周期（文档化口径）。"""
+        body = self._get(admin_client, "/admin/data/etf")
+        assert "东财" in body
+        assert "复权因子" in body
+
+    def test_normal_user_403_on_etf_pages(self, client_factory):
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            for path in ("/admin/data/etf", "/admin/data/etf/history"):
+                resp = client.get(path)
+                assert resp.status_code == 403, path
+                assert "ETF" not in resp.text or "403" in resp.text

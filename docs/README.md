@@ -8,6 +8,7 @@
 - 单体应用：FastAPI + DuckDB + Jinja2 + 原生 JS/CSS，无 Redis / MySQL / Node.js / 前端框架
 - 多用户认证（v0.2.0）：登录后使用，自选 / 指数配置 / 标签按用户隔离，行情与估值数据全局共享
 - A股历史数据（v0.3.0）：Tushare 日线 / 复权因子 / 每日指标 / 资金流 + 证券主档，落 DuckDB 供后续回测与分析；管理员在 `/admin/data` 查看与补齐
+- ETF 历史数据（v0.4.2）：东财 ETF 日线 + Tushare 复权因子，复用 v0.4.0 个股水位架构（失败隔离/自动补偿），`GET /api/quant/etf/daily` 提供 raw / qfq / hfq 复权查询；管理员在 `/admin/data/etf` 查看与补齐
 - 全站两级导航（v0.4.1）：顶部主导航三分区（行情首页 / 数据管理 / 系统设置）+ 分区子导航，当前页 active 标识，共享 `base.html` 单点维护；数据管理 / 系统设置分区仅管理员可见
 
 ## 环境要求
@@ -190,6 +191,24 @@ docker compose logs -f marketmind                     # 4. 确认迁移成功
   对同一证券同一天给出了两套互相矛盾的数据，需人工用交易所公告判定权威数据
   后再决定是否调整别名表——不要手工改库或跳过该交易日。
 
+- v0.4.0 → v0.4.2（ETF 历史数据）：
+
+```bash
+docker compose stop                                    # 1. 停服（DuckDB 单写者，必须先停）
+cp data/marketmind.duckdb     data/marketmind.duckdb.bak      # 2a. 备份主文件
+cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal  # 2b. WAL 存在时必须一并备份
+docker compose up -d                                   # 3. 容器启动时自动执行 Migration 0005
+docker compose logs -f marketmind                     # 4. 确认迁移成功
+```
+
+  Migration `0005_etf_data_module` 只增三张新表、不修改既有表、幂等可重执行。
+  启动后 ETF universe 自动刷新并开始首次全量回填（分多轮自动完成，进度在
+  `/admin/data/etf` 查看）；`fund_adj` 复权因子需要 Tushare 积分权限，无权限时
+  仅 `etf_adj_factor` 数据集失败，其余不受影响。升级前可运行只读在线验证
+  （`.venv/bin/python scripts/spike/verify_etf_sources_online.py`）确认东财/
+  新浪/`fund_adj` 通道在当前网络与 Token 下的真实可用性。详细注意事项见
+  「A 股历史数据」→「升级注意」。
+
 - 旧 stocksview（SQLite 版）数据**不能**原地升级；SQLite 历史数据导入工具（`import_sqlite.py`）与升级前自动备份（`db_upgrade`）属后续版本
 - 后续版本的常规升级：构建新镜像替换容器即可（启动时自动增量迁移，迁移内置数据校验）
 
@@ -236,6 +255,7 @@ docker compose logs -f marketmind                     # 4. 确认迁移成功
 | A股估值 | Tushare `daily_basic` | 每日收盘后更新一次，需 Token |
 | A股交易日历 | Tushare `trade_cal` | 按年缓存到 DuckDB |
 | A股历史数据 | Tushare `daily` / `adj_factor` / `daily_basic` / `moneyflow` / `stock_basic` / `namechange` / `stock_company` | 后台按交易日同步（v0.3.0），需 Token；见「A 股历史数据」 |
+| ETF 历史数据 | 东财（akshare `fund_etf_hist_em`）日线 + Tushare `fund_adj` 复权因子 + 新浪 ETF 列表（universe 备选） | 后台按交易日同步（v0.4.2）；复权因子需 Token 与 `fund_adj` 积分权限；见「A 股历史数据」 |
 | 港股交易日历 | Tushare `trade_cal`(HKEX)，不可用时回退周一至周五近似 | 近似规则下港股节假日会尝试刷新（无害），不影响数据正确性 |
 
 所有数据均可能存在延迟，仅供个人参考，不构成投资建议。
@@ -260,9 +280,10 @@ providers:
 
 股票 / ETF 自选支持标签分类（指数不支持）：先在「标签管理」页（`/tags`）创建标签，再到「自选管理」页点击操作列「标签」按钮，在弹层中点击标签添加 / 取消关联（即时保存）。一个自选条目可关联多个标签；被引用的标签不能删除（需先解除全部关联）。行情首页可按标签筛选（全部 / 指定标签 / 无标签），筛选为前端本地过滤，不会增加数据源请求。
 
-## A 股历史数据（v0.3.0 引入，v0.4.0 架构升级）
+## A 股历史数据（v0.3.0 引入，v0.4.0 架构升级，v0.4.2 扩展 ETF）
 
-面向后续回测与分析的历史数据底座：把 Tushare 的 A 股历史数据同步到本地 DuckDB。
+面向后续回测与分析的历史数据底座：把 A 股股票与 ETF 的历史数据同步到本地 DuckDB
+（股票数据集来自 Tushare，ETF 数据集来自东财 / 新浪 / Tushare 双数据源，见下文）。
 
 ### 数据集
 
@@ -276,8 +297,12 @@ providers:
 | `trade_cal` | 交易日历（严格模式，SSE/SZSE） | 交易日 |
 | `namechange` | 证券历史名称 | 事件 |
 | `stock_company` | 公司基本信息 | 证券 |
+| `etf_basic` | ETF 主档（全市场列表周期刷新，退市仅置 `is_active=false` 不删除） | ETF |
+| `etf_daily` | ETF 日线行情（未复权原始价，东财源） | ETF × 交易日 |
+| `etf_adj_factor` | ETF 复权因子（Tushare `fund_adj`，需积分权限） | ETF × 交易日 |
 
-历史起点默认 `2010-01-01`（`history.start_date`）。
+历史起点默认 `2010-01-01`（`history.start_date`）。ETF 数据集中
+`list_date` 为 NULL 的（新浪列表无上市日期列）从 `history.start_date` 起同步。
 
 ### 同步模型（v0.4.0 个股水位）
 
@@ -299,7 +324,7 @@ v0.4.0 起改为**个股水位模型**：每只股票独立维护 `(dataset, ins
 - 主档状态表、当前任务进度（数据集/股票/已处理/成功/失败/跳过）、最近 20 次执行记录
 - 唯一主操作按钮「检查并更新数据」：手动触发一次补齐，运行中禁用并显示「正在更新...」，
   每 10 秒自动刷新进度，任务结束后停止轮询
-- 数据管理分区子导航：股票数据 / 个股历史 / ETF数据（占位）/ ETF历史（占位）（v0.4.1）
+- 数据管理分区子导航：股票数据 / 个股历史 / ETF数据 / ETF历史（v0.4.1；ETF 两页 v0.4.2 实装）
 
 #### `/admin/data/stocks`（个股列表，v0.4.0 新增）
 
@@ -307,32 +332,80 @@ v0.4.0 起改为**个股水位模型**：每只股票独立维护 `(dataset, ins
 - 100 条分页表格：显示股票名称、代码、水位日期、最后尝试、状态
 - 失败行点击查看详情 modal（错误码、错误消息、尝试次数）
 
-#### `/admin/data/etf`、`/admin/data/etf/history`（ETF 占位页，v0.4.1 新增）
+#### `/admin/data/etf`（ETF 数据总览，v0.4.2 新增）
 
-- ETF 数据 / ETF 历史管理功能的占位页面，仅展示「敬请期待」说明，不提供任何数据操作
-- ETF 数据同步与展示由后续版本实现
+- universe 概况卡：活跃 ETF 数 / 总数 / 最近刷新时间
+- `etf_basic` 主档卡：数据范围 / 记录数 / 最近刷新 / 最后错误
+- 两个日级数据集卡片（`etf_daily` / `etf_adj_factor`）：个股口径统计（ETF 总数、已追平数、落后数、今日成功/失败数、完整度百分比）、数据范围、目标日期、最后成功 / 最后错误
+- 当前任务进度仅展示 ETF 段（整体任务含股票数据集）；「检查并更新数据」按钮复用总览页的 POST sync，运行中 409 提示
+- `history.etf_enabled=false` 时显示未启用说明态（无任何数据卡）
+
+#### `/admin/data/etf/history`（ETF 个股历史，v0.4.2 新增）
+
+- 数据集切换 chip（`etf_daily` / `etf_adj_factor`）、状态筛选（全部/成功/失败）、搜索（名称/代码）
+- 100 条分页表格：ETF 名称、代码、水位日期、最后尝试、状态——结构与交互复刻个股历史页
+- 失败行点击查看详情 modal（错误码、错误消息、尝试次数）
+
+### ETF 数据说明（v0.4.2）
+
+**数据来源与单位口径**（与股票数据集对齐，便于统一回测口径）：
+
+| 字段 | 单位 / 口径 | 与股票 `daily` 的对比 |
+|---|---|---|
+| OHLC 价格 | 元（东财 `adjust=''` 不复权原始价） | 一致（均为未复权） |
+| `volume` | **手** | 一致（Tushare `vol` 同为手） |
+| `amount` | **元**（东财原始口径） | **不一致**：股票 `daily` 的 `amount` 为 Tushare 千元口径；跨数据集做成交额计算时注意换算 |
+| `turnover_rate` | 百分比数值（5.23 表示 5.23%） | 一致 |
+| `adj_factor` | 累计复权因子（Tushare `fund_adj`） | 一致 |
+
+**universe 列表**：东财列表接口（`fund_etf_spot_em`）不可达时自动备选新浪列表
+（`fund_etf_category_sina`，实测约 1700 只）；代码前缀 `sz`/`sh` 解析市场（5→SSE、
+1→SZSE），无上市日期列故 `list_date` 落 NULL。**已知口径偏离**：配置选源键与
+metrics 统计键为 `eastmoney`，universe 物理来源实为新浪。
+
+**复权计算口径**（`GET /api/quant/etf/daily` 的 `adjust` 参数）：
+
+- `raw`：原始价直读，不受复权因子表影响
+- `hfq`（后复权）：`价格 = raw × factor_t`（当日因子）
+- `qfq`（前复权）：`价格 = raw × factor_t ÷ factor_latest`（**全库最新因子**为基准）
+- 复权只作用于 OHLC 价格字段，`volume` / `amount` / `turnover_rate` 不变
+- 因子缺失时报错并列出缺失交易日；因子全空报「复权因子未同步」
+
+**qfq 基准滚动说明**：`factor_latest` 取全库最新因子，当新除权事件发生、
+因子表同步后，全库 qfq 基准前移——历史区间的 qfq 值会整体变化。同一次查询
+内自洽；跨日对比 qfq 序列时请注意基准已滚动。这是前复权的固有口径，
+不是数据错误。
 
 ### 首次回填与限流
 
-- **首次回填 2010 年至今预计 8-12 小时，分多轮自动完成**（v0.4.0 个股水位模型）：
+- **股票首次回填 2010 年至今预计 8-12 小时，分多轮自动完成**（v0.4.0 个股水位模型）：
   - 升级后首次运行自动批量创建约 24k 行 `stock_sync_state`（watermark 初始为 NULL），完成率 = 0%
   - 每轮按 `(watermark ASC NULLS FIRST, ts_code ASC)` 顺序逐股推进，直至全部追平
   - 数据总览页面实时显示完成率从 0% 逐股上升，属正常
   - Tushare 有积分等级限流，同步推进到限流或当日可用时间边界为止；重复触发不会并行执行
-- 请求节奏由进程级 gate 统一约束（默认 0.6 秒/请求；`stock_basic` 接口 1.25 秒），
-  对所有 Tushare Provider 生效
-- 各数据集有可用时间 cutoff（北京时间）：`adj_factor` 09:30、`daily` 16:30、
-  `daily_basic` 17:30、`moneyflow` 20:30；未到点记 `WAITING_SOURCE` 不推进、不报错，
-  到点后自动补齐
+- **ETF 段（v0.4.2）复用同一模型与同一调度**：约 1700 只 × 2 个日级数据集各自独立水位，
+  失败隔离与自动补偿和股票一致；ETF 首次全量回填分多轮自动完成，进度在
+  `/admin/data/etf` 查看。ETF universe 列表默认每 24 小时刷新一次
+  （`history.etf_universe_refresh_hours`）
+- 请求节奏由进程级 gate 统一约束：Tushare 默认 0.6 秒/请求（`stock_basic` 接口
+  1.25 秒），东财 ETF 接口默认 0.5 秒/请求（`history.etf_request_min_interval_seconds`）
+- 各数据集有可用时间 cutoff（北京时间）：股票 `adj_factor` 09:30、`daily` 16:30、
+  `daily_basic` 17:30、`moneyflow` 20:30；ETF `etf_adj_factor` 09:30、`etf_daily` 16:30。
+  未到点记 `WAITING_SOURCE` 不推进、不报错，到点后自动补齐
 - 每日 `history.schedule_time`（默认 20:30 北京时间）自动触发；`history.startup_catchup`
-  控制启动时是否立即补齐一次
+  控制启动时是否立即补齐一次；`history.etf_enabled=false` 时 ETF 段（含 universe 刷新）
+  完全跳过
 - 同步任务在后台推进，单股区间替换在写事务内原子完成；同步期间不阻塞行情与估值功能
 
 ### 数据完整性
 
 - 返回恰 6000 行（Tushare 上限）判为潜在截断：改为逐证券细粒度请求、合并去重后复检，
   仍可疑则本轮失败且不推进水位
+- 东财 ETF 历史返回恰 10000 行（v0.4.2 行数上限）判为潜在截断：该 ETF 本轮失败
+  且不推进水位，下轮自动重试
 - 未知证券：刷新一次证券主档后重新映射；仍未知则报错且不推进水位（不创建占位证券）
+- ETF universe 刷新失败或返回空：ETF 三数据集本轮 FAILED（零请求）、不终止 Run，
+  股票段照常执行（v0.4.2 失败域隔离）
 - 交易日历严格模式：只认 Tushare 权威日历，缺失即失败，不用工作日推断兜底
 - 进程异常退出后残留的运行记录在下次启动标记为 `INTERRUPTED`，水位不受影响
 
@@ -352,11 +425,22 @@ history:
   stock_basic_min_interval_seconds: 1.25
   stock_basic_refresh_hours: 24       # 证券主档刷新周期
   master_refresh_days: 7              # 公司资料/历史名称刷新周期
+  etf_enabled: true                   # ETF 数据集总开关（v0.4.2）；false 时 ETF 段完全跳过（含 universe 刷新）
+  etf_request_min_interval_seconds: 0.5   # 东财 ETF 接口请求间隔
+  etf_universe_refresh_hours: 24      # ETF universe 列表刷新周期
   availability:                       # 各数据集可用时间（北京时间）
     adj_factor: "09:30"
     daily: "16:30"
     daily_basic: "17:30"
     moneyflow: "20:30"
+    etf_daily: "16:30"                # v0.4.2
+    etf_adj_factor: "09:30"           # v0.4.2
+
+providers:
+  history:                            # 历史数据选源（v0.4.2 新增 ETF 两个键）
+    market_data: "tushare"            # 股票八个数据集共用源
+    etf_daily: "eastmoney"            # ETF 日线源
+    etf_adj_factor: "tushare"         # ETF 复权因子源
 ```
 
 全部字段可省略（取上述默认值）。历史数据同步需要有效 Tushare Token；未配置
@@ -392,6 +476,22 @@ cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal   # 若存在
 - **回滚限制**：Migration 0004 执行后无法回滚到 v0.3.x，回滚需恢复备份；v0.3.1 不支持运行于 0004 库
 - **配置更新**：建议将 `config.yaml` 中的 `max_attempts` 改为 `max_retries`（自动转换兼容，但会记录 WARNING）
 
+**v0.4.1 → v0.4.2 升级注意事项**：
+
+- **Migration 0005 只增不改**：新增三张表（`cn_etf_basic` / `etf_daily` / `etf_adj_factor`），
+  不修改任何既有表，幂等可重执行；升级步骤同常规（停服 → 备份 → 启动自动迁移）
+- **ETF 首次全量回填**：升级后首次运行自动为约 1700 只 × 2 个日级数据集创建
+  `stock_sync_state` 行（watermark 初始 NULL），ETF 完成率从 0% 起步，分多轮自动
+  完成（受东财接口可用性与 0.5 秒请求间隔约束），进度在 `/admin/data/etf` 查看
+- **`fund_adj` 积分依赖**：ETF 复权因子需要 Tushare `fund_adj` 接口权限（积分门槛）；
+  无权限时 `etf_adj_factor` 持续失败（失败域隔离，不影响 `etf_daily` / `etf_basic`），
+  `adjust=raw` 查询不受影响
+- **ETF 未初始化时整体 LAGGING**：`etf_enabled` 默认 true，ETF 首次同步完成前
+  `overall_status` 显示 LAGGING（与股票未初始化语义一致）；急用股票数据可临时
+  置 `history.etf_enabled=false` 完全关闭 ETF 段
+- **东财通道依赖**：部分网络环境东财接口不可达（universe 自动走新浪备选不受影响），
+  `etf_daily` 会持续失败但股票段照常推进
+
 迁移 `0003_a_share_historical_data`（v0.3.0）新增 11 张表（4 事实 + 3 主档 + 4 同步控制）
 与索引，并给 `trading_calendar`
 增加 4 个可空列（`exchange` / `pretrade_date` / `source` / `fetched_at`，纯
@@ -401,6 +501,10 @@ cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal   # 若存在
 迁移 `0004_per_stock_history_sync`（v0.4.0）新增 2 张表（`stock_sync_state` / `sync_task`），
 扩展 `history_sync_run` / `history_sync_run_dataset` 列（旧水位列保留但冻结），
 保留 `history_day_status` 表（不再写入，供后续分析对比）。
+
+迁移 `0005_etf_data_module`（v0.4.2）新增 3 张表（`cn_etf_basic` 主档 + `etf_daily` /
+`etf_adj_factor` 两张事实表，结构对齐股票对应表），不修改任何既有表；同步控制表
+（`stock_sync_state` / `sync_task`）复用 v0.4.0 既有结构，按 dataset 区分股票与 ETF。
 
 ## 运行状态
 
@@ -412,9 +516,11 @@ cp data/marketmind.duckdb.wal data/marketmind.duckdb.bak.wal   # 若存在
 - `GET /api/admin/history-data/tasks/{task_id}`：单个任务详情（管理员，v0.4.0 新增）
 - `POST /api/admin/history-data/sync`：手动触发一次补齐（管理员，202 返回 `run_id`；运行中返回 409 并附当前 `run_id`）
 - `GET /api/admin/history-data/runs`、`GET /api/admin/history-data/runs/{run_id}`：执行历史与单次详情（管理员）
+- `GET /api/quant/etf/daily`：ETF 日线复权查询（登录用户，`adjust=raw|qfq|hfq`，v0.4.2 新增）
 - `/admin/data`：数据管理页面（管理员）
 - `/admin/data/stocks`：个股列表页面（管理员，v0.4.0 新增）
-- `/admin/data/etf`、`/admin/data/etf/history`：ETF 数据 / ETF 历史占位页（管理员，v0.4.1 新增）
+- `/admin/data/etf`：ETF 数据总览页面（管理员，v0.4.2 实装）
+- `/admin/data/etf/history`：ETF 个股历史页面（管理员，v0.4.2 实装）
 
 ## 测试执行方法
 
@@ -442,7 +548,7 @@ app/
 ├── config.py          # config.yaml -> Pydantic 配置模型
 ├── version.py         # 应用版本号唯一来源
 ├── db.py              # engine / session / WriteCoordinator（写事务协调）
-├── api/               # quotes / watchlist / index_watchlist / admin / admin_history / status / tags / auth / admin_users 路由
+├── api/               # quotes / watchlist / index_watchlist / admin / admin_history / status / tags / auth / admin_users / quant 路由
 ├── auth/              # 认证：密码 Argon2id / Session / CSRF / 限速 / FastAPI 依赖
 ├── models/            # SQLAlchemy 模型（instrument / watchlist / quote / fundamental / tag / app_user / user_session / history_* ...）
 ├── schemas/           # API Pydantic Schema
@@ -450,13 +556,14 @@ app/
 │   ├── base.py        # Quote/Fundamental/历史数据模型与 Provider Protocol
 │   ├── instrument_names.py
 │   ├── tushare_common.py  # Tushare 请求节奏 gate 与 Client 公共封装
+│   ├── eastmoney_common.py  # 东财请求节奏 gate 与 ETF 异常体系（etf-data-module v0.4.2）
 │   ├── quote/         # akshare（A股股票）/ tencent（其余）行情 Provider + 注册表（含超时注入）
 │   ├── fundamental/   # tushare 估值 Provider
-│   ├── history/       # 历史数据 Provider（tushare：八个数据集 + 注册表）
+│   ├── history/       # 历史数据 Provider（tushare 股票八数据集 + eastmoney ETF 两数据集 + 注册表）
 │   └── trading_calendar/  # 交易日历（Tushare + DuckDB 缓存）
 ├── observability/     # ProviderMetrics 指标与超时包装层
 ├── repositories/      # 数据访问（含 history_fact / history_master / history_sync）
-├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status / auth / user / history（同步编排）
+├── services/          # market_session / quote_cache / refresh / watchlist / tag / job_status / auth / user / history（同步编排）/ quant（ETF 复权查询）
 ├── cli/               # 管理 CLI：python -m app.cli users set-password/create/promote
 ├── jobs/              # 60 秒行情刷新任务、估值刷新任务、历史同步任务（均接入 JobStatus）
 ├── templates/         # index / watchlist / tags / login / change_password / admin_users / admin_status / admin_data（Jinja2）

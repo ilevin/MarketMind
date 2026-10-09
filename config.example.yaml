@@ -20,9 +20,12 @@ providers:
   fundamental:
     cn_stock: tushare
 
-  # A 股历史行情数据源（a-share-historical-data v0.3.0）
+  # A 股历史行情数据源（a-share-historical-data v0.3.0；etf-data-module v0.4.2 扩展 ETF）
   history:
     market_data: tushare
+    # ETF 数据源选源（etf-data-module v0.4.2）
+    etf_daily: eastmoney
+    etf_adj_factor: tushare
 
   # 第三方数据源超时（秒）：可按线上实际耗时调整；缺省时使用默认值
   timeout:
@@ -33,7 +36,7 @@ providers:
 logging:
   level: INFO
 
-# A 股历史数据同步（v0.3.0，技术方案 §57）：全部字段可省略，缺省如下
+# A 股历史数据同步（v0.3.0，技术方案 §57；etf-data-module v0.4.2 扩展 ETF）：全部字段可省略，缺省如下
 history:
   # 总开关：false 时不启动历史同步 Job（不影响已有估值/行情功能）
   enabled: true
@@ -64,12 +67,22 @@ history:
   stock_basic_refresh_hours: 24
   master_refresh_days: 7
 
+  # ETF 数据同步配置（etf-data-module v0.4.2）
+  etf_enabled: true
+  # 东财 ETF 接口请求节奏（秒/请求，覆盖 fund_etf_hist_em 与 fund_etf_category_sina）
+  etf_request_min_interval_seconds: 0.5
+  # ETF universe 刷新周期（小时）
+  etf_universe_refresh_hours: 24
+
   # 各日级数据集可用时间 cutoff（北京时间；moneyflow 为保守默认，非官方承诺）
   availability:
     adj_factor: "09:30"
     daily: "16:30"
     daily_basic: "17:30"
     moneyflow: "20:30"
+    # ETF 数据集可用时间（etf-data-module v0.4.2）
+    etf_daily: "16:30"
+    etf_adj_factor: "09:30"
 
 # 多用户认证（multi-user-auth v0.2.0）：全部字段可省略，缺省如下
 auth:

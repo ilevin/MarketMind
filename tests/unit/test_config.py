@@ -134,3 +134,61 @@ class TestHistoryMaxRetriesCompatibility:
         )
         config = load_config(cfg_file)
         assert config.history.max_retries == 0
+
+
+class TestEtfConfigDefaults:
+    """ETF 配置项默认值与显式配置覆盖测试（etf-data-module）。"""
+
+    def test_etf_config_defaults(self) -> None:
+        """缺省配置：ETF 启用，默认请求间隔 0.5 秒，universe 刷新 24 小时。"""
+        config = AppConfig()
+        assert config.history.etf_enabled is True
+        assert config.history.etf_request_min_interval_seconds == 0.5
+        assert config.history.etf_universe_refresh_hours == 24
+        assert config.providers.history.etf_daily == "eastmoney"
+        assert config.providers.history.etf_adj_factor == "tushare"
+        assert config.history.availability.etf_daily == "16:30"
+        assert config.history.availability.etf_adj_factor == "09:30"
+
+    def test_etf_enabled_false(self, tmp_path) -> None:
+        """显式配置 etf_enabled=false 正确读取。"""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            yaml.safe_dump({"history": {"etf_enabled": False}}), encoding="utf-8"
+        )
+        config = load_config(cfg_file)
+        assert config.history.etf_enabled is False
+
+    def test_etf_config_explicit_override(self, tmp_path) -> None:
+        """显式配置覆盖 ETF 配置项。"""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            yaml.safe_dump(
+                {
+                    "history": {
+                        "etf_enabled": True,
+                        "etf_request_min_interval_seconds": 1.0,
+                        "etf_universe_refresh_hours": 12,
+                        "availability": {
+                            "etf_daily": "17:00",
+                            "etf_adj_factor": "10:00",
+                        },
+                    },
+                    "providers": {
+                        "history": {
+                            "etf_daily": "tushare",
+                            "etf_adj_factor": "eastmoney",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(cfg_file)
+        assert config.history.etf_enabled is True
+        assert config.history.etf_request_min_interval_seconds == 1.0
+        assert config.history.etf_universe_refresh_hours == 12
+        assert config.providers.history.etf_daily == "tushare"
+        assert config.providers.history.etf_adj_factor == "eastmoney"
+        assert config.history.availability.etf_daily == "17:00"
+        assert config.history.availability.etf_adj_factor == "10:00"

@@ -4,6 +4,114 @@
 版本号从 v0.1.0 重新起步（marketmind 是以 stocksview 架构为基础的 DuckDB 演进版，
 不继承 stocksview 的 SQLite 版本历史）。
 
+## [v0.4.2] - 2026-10-09
+
+ETF 历史数据模块（OpenSpec 变更 etf-data-module）：ETF 主档 / 日线 / 复权因子
+三个数据集同步到本地 DuckDB，复用 v0.4.0 个股水位架构，并提供复权查询 API。
+
+### 核心变更
+
+- **三个新数据集**：`etf_basic`（ETF 主档，东财列表源）、`etf_daily`（ETF 日线行情，东财源）、`etf_adj_factor`（ETF 复权因子，Tushare `fund_adj`）——`DatasetName` 枚举扩展，同步编排把日级数据集从 4 个扩为 6 个（股票在前、ETF 在后）
+- **双数据源架构**：
+  - **universe 列表**：`get_etf_universe()` 东财 `fund_etf_spot_em` 不可达（部分网络环境 502）时备选新浪 `fund_etf_category_sina`（实测 1694 只）；代码前缀 `sz`/`sh` 解析市场、无上市日期列 → `list_date` 落 NULL（回退 `history.start_date` 起同步）。**已知偏离**：通道名 / 选源键 / metrics 键沿用 `eastmoney`，物理来源实为新浪
+  - **etf_daily**：akshare `fund_etf_hist_em`（`adjust=''` 不复权原始价）；单位口径：成交量**手**（与股票一致）、成交额**元**（东财原始口径；股票 `daily` 为 Tushare 千元口径，跨数据集计算时注意换算）、换手率百分比数值（一致）；行数上限 10000 防截断
+  - **etf_adj_factor**：Tushare `fund_adj`（需积分权限，无权限时错误码 40101）
+- **个股水位复用**：ETF 与股票共用 `stock_sync_state` / `sync_task` / Run 流水（按 dataset 区分），**零新增同步控制表**；失败隔离、自动补偿、已追平零请求、空结果推进水位、中断恢复全部沿用 v0.4.0 股票语义
+- **etf_basic 周期刷新**：默认 24 小时刷新一次 universe；本轮未见 ETF 仅置 `is_active=false`（退市保留，不删数据）；重新出现则恢复 active。刷新失败或空 universe → ETF 三数据集本轮 FAILED、零请求、不终止 Run、股票段不受影响
+- **东财请求节奏**：新增进程级 `EastmoneyRequestGate`（默认 0.5 秒/请求，`history.etf_request_min_interval_seconds`），模式对齐 Tushare gate
+- **校验规则**：`etf_daily` OHLC 非负且 `high>=max(open,close)`、`low<=min(open,close)`、量额换手非负（NULL 保留）；`etf_adj_factor` 每条 `adj_factor>0`；东财 `SCHEMA_MISMATCH` / `UNKNOWN_INSTRUMENT` 复用配置类错误快速失败
+
+### Quant API（项目首个读路径 REST API）
+
+- **`GET /api/quant/etf/daily?symbol=&start=&end=&adjust=`**（登录用户即可）：
+  - `adjust=raw` 直读原始价；`qfq` / `hfq` 复权计算：**hfq = raw × factor_t**（当日因子）、**qfq = raw × factor_t ÷ factor_latest**（全库最新因子）
+  - **qfq 基准滚动**：`factor_latest` 是全库最新因子，因子表更新后（新除权发生时全库基准前移）历史区间的 qfq 值整体变化——同一次查询内自洽，跨日对比 qfq 请注意基准已滚动
+  - 复权只作用于 OHLC 价格字段，`volume` / `amount` / `turnover_rate` 不复权
+  - 因子缺失语义化报错：区间内日线有行而因子缺失 → 列出缺失日；因子全空 → 「复权因子未同步」
+  - 422 参数校验（六位数字 symbol / adjust 枚举 / start≤end）、401 未登录、空区间 200 空 items
+
+### 管理 API 与页面
+
+- **`/admin/data/etf`（ETF 数据总览）**：universe 概况卡（活跃/总数/最近刷新）、etf_basic 主档卡、两日级数据集卡（个股口径统计同股票卡片）、当前任务 ETF 段进度、「检查并更新数据」按钮复用 POST sync；`etf_enabled=false` 时显示未启用说明态
+- **`/admin/data/etf/history`（ETF 个股历史）**：数据集 chip（etf_daily / etf_adj_factor）、状态筛选、搜索、100 条分页、失败行只读 modal——结构复刻个股历史页
+- **summary 响应扩展**：新增 `etf_universe` 块（active_count / total_count / last_refreshed_at / enabled）与 `etf_datasets[]` 三条目；`etf_enabled=false` 时不返回统计
+- **`/stocks` 端点**：dataset 白名单扩为 6 个日级数据集，JOIN 按 dataset 分派 `cn_stock_basic` / `cn_etf_basic`；`/datasets` 三分组（daily / master / etf）
+- **`overall_status` 扩展**：ETF 数据集级 FAILED → ERROR、ETF lagging → LAGGING、`etf_enabled=false` 完全不参与；ETF UNINITIALIZED 拖 LAGGING 与股票既有语义一致（升级后首次同步完成前整体显示 LAGGING 属诚实报告）
+
+### 配置项（全部带默认值，缺省可启动）
+
+```yaml
+history:
+  etf_enabled: true                      # ETF 数据集总开关；false 时完全跳过（含 universe 刷新）
+  etf_request_min_interval_seconds: 0.5   # 东财请求最小间隔（秒）
+  etf_universe_refresh_hours: 24          # universe 列表刷新周期（小时）
+providers:
+  history:
+    etf_daily: "eastmoney"               # ETF 日线选源
+    etf_adj_factor: "tushare"            # ETF 复权因子选源
+  availability:
+    etf_daily: "16:30"                   # 北京时间可用 cutoff
+    etf_adj_factor: "09:30"
+```
+
+### 数据库迁移
+
+- **Migration 0005**（`alembic/versions/0005_*.py`）：新增三张表 `cn_etf_basic`（主档，FK→instrument）、`etf_daily` / `etf_adj_factor`（事实表，无物理主键/外键/索引，对齐股票事实表设计）；`_table_exists` 幂等跳过、既有 25 张表迁移前后行数校验、downgrade 逆序 drop；**不修改任何既有表**
+- **升级步骤**：停服 → 成对备份 `.duckdb` + `.wal` → 启动自动执行 Migration 0005（秒级）
+
+### 升级注意事项
+
+- **ETF 全量回填预期**：升级后首次运行自动为约 1700 只 × 2 个日级数据集创建 `stock_sync_state` 行（watermark 初始 NULL），ETF 段完成率从 0% 起步；全区间回填受东财接口可用性与 0.5 秒请求间隔约束，分多轮自动完成，进度经 `/admin/data/etf` 查看
+- **`fund_adj` 积分依赖**：ETF 复权因子需 Tushare `fund_adj` 接口权限（积分门槛）；无权限时 `etf_adj_factor` 数据集持续 FAILED（失败域隔离设计），`etf_daily` 与 `etf_basic` 不受影响，`adjust=raw` 查询可用
+- **qfq 基准滚动**（见上文 Quant API 小节）：新除权发生后全库 qfq 基准前移，历史 qfq 值整体变化，属口径特性非数据错误
+- **东财通道依赖**：部分网络环境东财 `push2his` / `push2delay` 接口不可达（本环境实测）——`etf_daily` 持续 FAILED 且不影响股票段；universe 走新浪备选不受影响
+- **ETF 未初始化时整体 LAGGING**：`etf_enabled=true`（默认）且 ETF 未完成首次同步前，`overall_status` 显示 LAGGING；急用股票数据可临时置 `etf_enabled=false`
+
+### 测试基础设施修复（基线 v0.4.1 即存在）
+
+- **DuckDB 工作线程泄漏导致全量回归拖慢/卡死**：`create_app` 自建 engine + 测试 fixture
+  engine 指向同一 DuckDB 文件（进程内共享底层 database 实例），双 engine 交错 dispose 后
+  DuckDB 工作线程不回收——每个发请求的测试净泄漏 4 个线程，全量回归累积数百线程后
+  显著拖慢（v0.4.1 基线实测每项 6~13 秒 vs 正常 ~1 秒）且最终卡死。修复（两层）：
+  - `create_app` 支持 `session_factory` 注入：测试传入 fixture 的 session_factory，
+    app 与 fixture 复用同一 engine（单连接池），泄漏消除（26 项测试零累积）
+  - lifespan 停机路径补 `engine.dispose()`：应用停机释放数据库连接（生产正确性）
+  - 修复后全量回归恢复基线速度
+
+### 测试覆盖
+
+- **全量回归**：846 项离线测试通过，0 失败（耗时 12 分 03 秒，含上节基础设施修复后恢复
+  基线速度；另 26 项 `@pytest.mark.online` 在线冒烟按默认排除）。首次运行 845 通过
+  1 失败——`test_migrations_multi_user.py` 的 head 版本号断言未随 0005 更新
+  （`CURRENT_HEAD` 常量例行同步，v0.4.1 升级时同样更新过），修复后重跑通过
+- **新增测试**（4 个新文件，75 项）：
+  - `tests/unit/test_eastmoney_etf_provider.py`（29 项）：东财 Provider 区间参数
+    透传、单位口径清洗（手→股、换手率百分比、amount 元）、行数上限截断防护、
+    异常分类（TIMEOUT/API_ERROR/SCHEMA_MISMATCH/UNKNOWN_INSTRUMENT）、gate 节流、
+    universe 解析（FakeEastmoneyClient，无真实网络）
+  - `tests/unit/test_etf_validation.py`（14 项）：etf_daily OHLC 交叉与量额非负
+    规则、etf_adj_factor 因子必须为正、NULL 保留、0 行合法
+  - `tests/integration/test_quant_etf_data.py`（23 项）：复权公式（hfq、qfq 全库
+    基准）、因子 forward-fill 两分支、因子缺失与未同步语义化报错、REST
+    401/422/200 权限矩阵与响应序列化
+  - `tests/integration/test_etf_online_smoke.py`（9 项，`online` 标记）：东财
+    列表/历史真实请求、fund_adj 行覆盖语义、`get_etf_daily` 端到端抽样；无 Token
+    环境自动跳过（实测 1 通过 8 跳过，符合设计）
+- **扩展测试**：
+  - `test_history_sync_service.py`（32 → 44 项）：ETF 水位推进与单调不下降、
+    单 ETF 失败隔离、自动补偿、etf_daily 与 etf_adj_factor 水位独立、
+    `etf_enabled=false` 完全跳过、universe 刷新失败不终止 Run、全部追平 NOOP
+  - `test_admin_history_api.py`（57 → 68 项）：summary etf 分组与未启用行为、
+    `/stocks` ETF 数据集 JOIN 分派与 422、overall_status 四分支
+    （ETF ERROR/LAGGING/关闭/HEALTHY）
+  - `test_admin_data_page.py`：两 ETF 占位页测试改写为真实页面测试
+    （渲染、导航 active、未启用说明态）
+  - `test_migrations*.py`（3 文件 29 项）：0005 场景（全新库全链、v0.4.1 库升级
+    既有数据无损且新表为空、重复执行幂等、校验失败回滚）、EXPECTED_TABLES
+    25→28、CURRENT_HEAD 同步 0005、head 与 models schema 防漂移
+  - `test_history_repositories.py`（86 项）：ETF 事实表区间替换幂等、无重复行
+  - `test_config.py`（13 项）：ETF 配置项默认值、显式覆盖、`etf_enabled=false`
+
 ## [v0.4.1] - 2026-10-07
 
 导航重构 + ETF 占位页（OpenSpec 变更 optimize-navigation，设计稿 v2）。

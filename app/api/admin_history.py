@@ -16,6 +16,17 @@ v0.4.0 升级（个股口径）：
 - 新增 GET /tasks/{task_id}（按 id 直查 + JOIN 主档补名称）。
 - /runs 与 /runs/{run_id} 响应补充个股统计列与运行中 progress 快照。
 - 顺手修复 requested_by_user_id int→str 类型瑕疵。
+
+etf-data-module 升级（design D12）：
+- summary 新增 etf_universe 块与 etf_datasets[] 分组（etf_basic 主档同构、
+  etf_daily/etf_adj_factor 日级同构含 ETF 个股口径统计）；master_datasets
+  加 etf_basic；history.etf_enabled=false 时不返回统计。
+- /stocks dataset 白名单扩为 6 个日级数据集，JOIN 按 dataset 分派
+  （股票→cn_stock_basic、ETF→cn_etf_basic），响应 schema 兼容。
+- /tasks JOIN 主档补名称同样按 dataset 分派。
+- /datasets 新增 "etf" 分组，daily 分组仍只含股票数据集。
+- overall_status 判定链纳入 ETF 数据集（FAILED→ERROR、lagging→LAGGING；
+  enabled=false 时 ETF 完全不参与）。
 """
 
 from __future__ import annotations
@@ -29,12 +40,12 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, case, func, or_, select, text
 
 from app.auth.dependencies import require_admin
 from app.auth.session import CurrentUser
 from app.config import BUSINESS_TZ_NAME, AppConfig
-from app.models.history_market import CnStockBasic
+from app.models.history_market import CnEtfBasic, CnStockBasic
 from app.models.history_sync import (
     DatasetName,
     DatasetStatus,
@@ -42,6 +53,7 @@ from app.models.history_sync import (
     StockSyncState,
     SyncTask,
 )
+from app.models.instrument import Instrument
 from app.repositories.history_sync import (
     HistorySyncRunDatasetRepository,
     HistorySyncRunRepository,
@@ -53,6 +65,8 @@ from app.repositories.trading_calendar import TradingCalendarRepository
 from app.schemas.history_admin import (
     ActiveRunSummary,
     DailyDatasetSummary,
+    EtfDatasetSummary,
+    EtfUniverseSummary,
     HistorySummaryResponse,
     MasterDatasetSummary,
     RunDatasetDetail,
@@ -95,6 +109,9 @@ DISPLAY_NAMES: dict[str, str] = {
     DatasetName.TRADE_CAL.value: "交易日历",
     DatasetName.NAMECHANGE.value: "证券改名记录",
     DatasetName.STOCK_COMPANY.value: "公司基本信息",
+    DatasetName.ETF_BASIC.value: "ETF基础信息",
+    DatasetName.ETF_DAILY.value: "ETF日线行情",
+    DatasetName.ETF_ADJ_FACTOR.value: "ETF复权因子",
 }
 
 MASTER_DATASETS: tuple[DatasetName, ...] = (
@@ -102,6 +119,22 @@ MASTER_DATASETS: tuple[DatasetName, ...] = (
     DatasetName.TRADE_CAL,
     DatasetName.NAMECHANGE,
     DatasetName.STOCK_COMPANY,
+    DatasetName.ETF_BASIC,
+)
+
+# 股票日级数据集（summary.daily_datasets 分组；DAY_LEVEL_DATASETS 含 ETF 6 个）
+STOCK_DAY_LEVEL_DATASETS: tuple[DatasetName, ...] = (
+    DatasetName.DAILY,
+    DatasetName.ADJ_FACTOR,
+    DatasetName.DAILY_BASIC,
+    DatasetName.MONEYFLOW,
+)
+
+# ETF 数据集（summary.etf_datasets 分组：主档 1 + 日级 2，design D12）
+ETF_DATASETS: tuple[DatasetName, ...] = (
+    DatasetName.ETF_BASIC,
+    DatasetName.ETF_DAILY,
+    DatasetName.ETF_ADJ_FACTOR,
 )
 
 # 硬前置主档：失败应升级整体异常级别（§84）
@@ -321,8 +354,86 @@ def _master_summary(state) -> MasterDatasetSummary:
     )
 
 
+# ---- ETF 分组（etf-data-module，design D12） ----
+
+
+def _etf_master_summary(state) -> EtfDatasetSummary:
+    """etf_basic 条目：主档结构同构（universe 刷新状态）。"""
+    return EtfDatasetSummary(
+        dataset=state.dataset,
+        display_name=DISPLAY_NAMES.get(state.dataset, state.dataset),
+        status=state.status,
+        record_count=state.record_count or 0,
+        last_success_at=_iso(state.last_success_at),
+        master_cursor=state.master_cursor,
+        bootstrap_complete=bool(state.bootstrap_complete),
+        last_error_code=state.last_error_code,
+        last_error=state.last_error,
+    )
+
+
+def _etf_daily_summary(
+    state, *, open_days: list[date], policy: AvailabilityPolicy, stock_stats: dict | None
+) -> EtfDatasetSummary:
+    """etf_daily / etf_adj_factor 条目：日级结构同构，stock_count 为 ETF 总数。"""
+    dataset = DatasetName(state.dataset)
+    target = _dataset_target(dataset, policy=policy, open_days=open_days)
+    stats = stock_stats or {}
+    return EtfDatasetSummary(
+        dataset=state.dataset,
+        display_name=DISPLAY_NAMES.get(state.dataset, state.dataset),
+        status=state.status,
+        history_start_date=_ds(state.history_start_date),
+        data_min_date=_ds(state.data_min_date),
+        data_max_date=_ds(state.data_max_date),
+        latest_complete_trade_date=_ds(state.latest_complete_trade_date),
+        latest_expected_trade_date=_ds(target),
+        next_trade_date=_ds(
+            _next_trade_date(
+                state.latest_complete_trade_date, open_days=open_days, target=target
+            )
+        ),
+        lag_trade_days=0,  # 个股模式下无实际语义，冻结为 0
+        record_count=state.record_count or 0,
+        current_trade_date=_ds(state.current_trade_date),
+        current_attempt=state.current_attempt or 0,
+        last_success_at=_iso(state.last_success_at),
+        last_error_code=state.last_error_code,
+        last_error=state.last_error,
+        stock_count=stats.get("stock_count", 0),
+        up_to_date_count=stats.get("up_to_date_count", 0),
+        lagging_count=stats.get("lagging_count", 0),
+        today_success_count=stats.get("today_success_count", 0),
+        today_failed_count=stats.get("today_failed_count", 0),
+        completion_rate=float(stats.get("completion_rate", 0.0)),
+    )
+
+
+def _etf_universe_summary(session, states: dict[str, object]) -> EtfUniverseSummary:
+    """universe 概况：instrument 表聚合 + etf_basic 最近刷新时间（只读小表）。"""
+    row = session.execute(
+        select(
+            func.count(Instrument.instrument_id),
+            func.sum(case((Instrument.is_active.is_(True), 1), else_=0)),
+        ).where(Instrument.market == CN_MARKET, Instrument.asset_type == "ETF")
+    ).one()
+    total_count = int(row[0] or 0)
+    active_count = int(row[1] or 0)
+    etf_basic_state = states.get(DatasetName.ETF_BASIC.value)
+    last_refreshed = (
+        _iso(etf_basic_state.last_success_at) if etf_basic_state is not None else None
+    )
+    return EtfUniverseSummary(
+        active_count=active_count,
+        total_count=total_count,
+        last_refreshed_at=last_refreshed,
+    )
+
+
 def _overall_status(
-    daily: list[DailyDatasetSummary], master: list[MasterDatasetSummary]
+    daily: list[DailyDatasetSummary],
+    master: list[MasterDatasetSummary],
+    etf: list[EtfDatasetSummary] | None = None,
 ) -> str:
     """整体状态（D12）：RUNNING > ERROR > LAGGING > WAITING > HEALTHY。
 
@@ -332,27 +443,38 @@ def _overall_status(
       而是通过 lagging_count 体现为 LAGGING；
     - 无 FAILED 且 lagging_count > 0 → LAGGING；
     - 全部 up_to_date → HEALTHY。
+
+    etf-data-module（D12）：ETF 数据集纳入优先级链——ETF 数据集级
+    FAILED → ERROR（东财系统性不可用值得 ERROR 级告警）；ETF lagging →
+    LAGGING；``etf=None``（enabled=false）时 ETF 完全不参与判定。
     """
     statuses = {item.dataset: item.status for item in daily}
+    etf_statuses = {item.dataset: item.status for item in etf} if etf else {}
     # 硬前置失败升级整体异常（日历/主档失败时日级数据集根本无法推进）
     for item in master:
         if item.dataset in CORE_MASTER_DATASETS and item.status == DatasetStatus.FAILED.value:
             return OVERALL_ERROR
-    # 完全未初始化
-    if not [s for s in statuses.values() if s != DatasetStatus.UNINITIALIZED.value]:
+    # 完全未初始化（股票与 ETF 均无任何非 UNINITIALIZED 状态）
+    all_statuses = list(statuses.values()) + list(etf_statuses.values())
+    if not [s for s in all_statuses if s != DatasetStatus.UNINITIALIZED.value]:
         return OVERALL_UNINITIALIZED
-    # 系统级失败：数据集状态为 FAILED（整数据集阻塞）
-    if DatasetStatus.FAILED.value in statuses.values():
+    # 系统级失败：数据集状态为 FAILED（整数据集阻塞；含 ETF——东财系统性不可用）
+    if DatasetStatus.FAILED.value in all_statuses:
         return OVERALL_ERROR
 
-    # 个股缺口：有 lagging 股票（无失败但有落后）
-    any_lagging = any(item.lagging_count > 0 for item in daily if item.stock_count > 0)
+    # 个股缺口：有 lagging 股票/ETF（无失败但有落后）
+    lagging_items = [
+        item for item in daily if item.stock_count > 0
+    ] + [
+        item for item in (etf or []) if item.stock_count > 0
+    ]
+    any_lagging = any(item.lagging_count > 0 for item in lagging_items)
     if any_lagging:
         # 全部在等数据源发布 → WAITING（而非 LAGGING）
         waiting_all = all(
             item.status == DatasetStatus.WAITING_SOURCE.value
-            for item in daily
-            if item.stock_count > 0 and item.lagging_count > 0
+            for item in lagging_items
+            if item.lagging_count > 0
         )
         # 个股模式下 WAITING_SOURCE 状态基本不产生（target 恒为已发布日），
         # 但保留兼容逻辑
@@ -361,7 +483,7 @@ def _overall_status(
         return OVERALL_LAGGING
 
     # 无落后：等发布 → WAITING；推进中/已追平 → HEALTHY
-    if DatasetStatus.WAITING_SOURCE.value in statuses.values():
+    if DatasetStatus.WAITING_SOURCE.value in all_statuses:
         return OVERALL_WAITING
     healthy = {
         DatasetStatus.CAUGHT_UP.value,
@@ -369,7 +491,7 @@ def _overall_status(
         DatasetStatus.RETRYING.value,
         DatasetStatus.CHECKING.value,
     }
-    return OVERALL_HEALTHY if all(s in healthy for s in statuses.values()) else OVERALL_LAGGING
+    return OVERALL_HEALTHY if all(s in healthy for s in all_statuses) else OVERALL_LAGGING
 
 
 # ---- runs ----
@@ -451,7 +573,7 @@ def get_summary(request: Request):
         states = {s.dataset: s for s in HistorySyncStateRepository(session).all_states()}
         active = HistorySyncRunRepository(session).find_stale_running()
 
-        # 个股口径统计：对每个日级数据集一次 SQL 聚合
+        # 个股口径统计：对每个日级数据集（股票 4 + ETF 2）一次 SQL 聚合
         stock_stats_by_dataset: dict[str, dict] = {}
         for dataset in DAY_LEVEL_DATASETS:
             key = dataset.value
@@ -461,8 +583,15 @@ def get_summary(request: Request):
                     session, key, target
                 )
 
+        # ETF universe 概况（enabled 时只读小表聚合；disabled 不返回统计）
+        etf_universe = (
+            _etf_universe_summary(session, states)
+            if config.history.etf_enabled
+            else None
+        )
+
     daily = []
-    for dataset in DAY_LEVEL_DATASETS:
+    for dataset in STOCK_DAY_LEVEL_DATASETS:
         key = dataset.value
         if key in states:
             daily.append(
@@ -483,16 +612,47 @@ def get_summary(request: Request):
                 )
             )
 
-    master = [
-        _master_summary(states[dataset.value])
-        if dataset.value in states
-        else MasterDatasetSummary(
-            dataset=dataset.value,
-            display_name=DISPLAY_NAMES[dataset.value],
-            status=DatasetStatus.UNINITIALIZED.value,
-        )
-        for dataset in MASTER_DATASETS
-    ]
+    # ETF 数据集分组（design D12）：etf_basic 主档条目 + 两个日级条目；
+    # history.etf_enabled=false 时为空列表（不返回统计）
+    etf_datasets: list[EtfDatasetSummary] = []
+    if config.history.etf_enabled:
+        for dataset in ETF_DATASETS:
+            key = dataset.value
+            if key not in states:
+                etf_datasets.append(
+                    EtfDatasetSummary(
+                        dataset=key,
+                        display_name=DISPLAY_NAMES[key],
+                        status=DatasetStatus.UNINITIALIZED.value,
+                    )
+                )
+            elif dataset == DatasetName.ETF_BASIC:
+                etf_datasets.append(_etf_master_summary(states[key]))
+            else:
+                etf_datasets.append(
+                    _etf_daily_summary(
+                        states[key],
+                        open_days=open_days,
+                        policy=policy,
+                        stock_stats=stock_stats_by_dataset.get(key),
+                    )
+                )
+
+    # 主档分组：etf_basic 仅在 ETF 启用时纳入（disabled 不返回统计）
+    master = []
+    for dataset in MASTER_DATASETS:
+        if dataset == DatasetName.ETF_BASIC and not config.history.etf_enabled:
+            continue
+        if dataset.value in states:
+            master.append(_master_summary(states[dataset.value]))
+        else:
+            master.append(
+                MasterDatasetSummary(
+                    dataset=dataset.value,
+                    display_name=DISPLAY_NAMES[dataset.value],
+                    status=DatasetStatus.UNINITIALIZED.value,
+                )
+            )
 
     active_run = active[0] if active else None
     latest_open_day = _latest_open_day(open_days)
@@ -502,11 +662,11 @@ def get_summary(request: Request):
         # 日历过期时不能根据 lag 断言"已追平"（§84）
         overall = (
             OVERALL_UNINITIALIZED
-            if _overall_status(daily, master) in (OVERALL_UNINITIALIZED, OVERALL_ERROR)
+            if _overall_status(daily, master, etf_datasets) in (OVERALL_UNINITIALIZED, OVERALL_ERROR)
             else OVERALL_LAGGING
         )
     else:
-        overall = _overall_status(daily, master)
+        overall = _overall_status(daily, master, etf_datasets)
 
     return HistorySummaryResponse(
         overall_status=overall,
@@ -524,6 +684,8 @@ def get_summary(request: Request):
         ),
         daily_datasets=daily,
         master_datasets=master,
+        etf_universe=etf_universe,
+        etf_datasets=etf_datasets,
     )
 
 
@@ -604,15 +766,16 @@ def list_stocks(
     q: str = Query("", description="名称或 ts_code 搜索关键字"),
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
 ):
-    """个股历史同步状态列表（design D12，tasks 8.2）。
+    """个股历史同步状态列表（design D12，tasks 8.2；etf-data-module 扩展 ETF 数据集）。
 
-    - dataset 必填，仅四日级数据集，其余返回 422；
+    - dataset 必填，六个日级数据集（股票 4 + ETF 2），其余返回 422；
+    - ETF 数据集 JOIN cn_etf_basic（股票数据集仍 JOIN cn_stock_basic，
+      按 dataset 分派 JOIN 目标，响应 schema 兼容）；
     - status=all|success|failed；
     - q 按 name / ts_code LIKE 模糊匹配；
     - page_size 服务端固定 100；
     - 默认排序：last_status='failed' DESC → watermark_date ASC NULLS FIRST → ts_code ASC。
-    - 查询 = cn_stock_basic LEFT JOIN stock_sync_state ON instrument_id AND dataset=?，
-      筛选/搜索/排序全在 SQL 完成，不加载全量到 Python。
+    - 筛选/搜索/排序全在 SQL 完成，不加载全量到 Python。
     """
     if dataset not in _DAY_LEVEL_DATASET_VALUES:
         raise HTTPException(
@@ -625,6 +788,13 @@ def list_stocks(
             detail=f"status 必须是 {sorted(STOCK_STATUS_OPTIONS)} 之一",
         )
 
+    # JOIN 目标按 dataset 分派（etf-data-module D12：ETF 数据集 → cn_etf_basic）
+    basic_table = (
+        CnEtfBasic
+        if dataset in (DatasetName.ETF_DAILY.value, DatasetName.ETF_ADJ_FACTOR.value)
+        else CnStockBasic
+    )
+
     config: AppConfig = request.app.state.config
     session_factory = request.app.state.session_factory
     policy = AvailabilityPolicy(config)
@@ -633,11 +803,11 @@ def list_stocks(
 
     with session_factory() as session:
         # 总条数（用于分页）
-        count_stmt = select(func.count(CnStockBasic.instrument_id))
+        count_stmt = select(func.count(basic_table.instrument_id))
         count_stmt = count_stmt.outerjoin(
             StockSyncState,
             and_(
-                StockSyncState.instrument_id == CnStockBasic.instrument_id,
+                StockSyncState.instrument_id == basic_table.instrument_id,
                 StockSyncState.dataset == dataset,
             ),
         )
@@ -648,7 +818,7 @@ def list_stocks(
         if q:
             like = f"%{q}%"
             count_stmt = count_stmt.where(
-                or_(CnStockBasic.name.ilike(like), CnStockBasic.ts_code.ilike(like))
+                or_(basic_table.name.ilike(like), basic_table.ts_code.ilike(like))
             )
         total = int(session.scalar(count_stmt) or 0)
 
@@ -660,10 +830,10 @@ def list_stocks(
         # 列表查询
         stmt = (
             select(
-                CnStockBasic.ts_code,
-                CnStockBasic.name,
-                CnStockBasic.list_date,
-                CnStockBasic.delist_date,
+                basic_table.ts_code,
+                basic_table.name,
+                basic_table.list_date,
+                basic_table.delist_date,
                 StockSyncState.watermark_date,
                 StockSyncState.last_status,
                 StockSyncState.last_error_code,
@@ -671,11 +841,11 @@ def list_stocks(
                 StockSyncState.last_success_at,
                 StockSyncState.last_attempt_at,
             )
-            .select_from(CnStockBasic)
+            .select_from(basic_table)
             .outerjoin(
                 StockSyncState,
                 and_(
-                    StockSyncState.instrument_id == CnStockBasic.instrument_id,
+                    StockSyncState.instrument_id == basic_table.instrument_id,
                     StockSyncState.dataset == dataset,
                 ),
             )
@@ -687,13 +857,13 @@ def list_stocks(
         if q:
             like = f"%{q}%"
             stmt = stmt.where(
-                or_(CnStockBasic.name.ilike(like), CnStockBasic.ts_code.ilike(like))
+                or_(basic_table.name.ilike(like), basic_table.ts_code.ilike(like))
             )
         # 排序：失败优先 → 水位升序（NULL 最前） → ts_code 升序
         stmt = stmt.order_by(
             text("CASE WHEN stock_sync_state.last_status = 'failed' THEN 0 ELSE 1 END"),
             text("stock_sync_state.watermark_date ASC NULLS FIRST"),
-            CnStockBasic.ts_code.asc(),
+            basic_table.ts_code.asc(),
         )
         stmt = stmt.limit(STOCKS_PAGE_SIZE).offset(offset)
         rows = session.execute(stmt).all()
@@ -742,10 +912,16 @@ def get_task(request: Request, task_id: int):
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
 
-        # JOIN 主档补 stock_name
+        # JOIN 主档补 stock_name（ETF 任务查 cn_etf_basic，etf-data-module D12）
+        basic_table = (
+            CnEtfBasic
+            if task.dataset
+            in (DatasetName.ETF_DAILY.value, DatasetName.ETF_ADJ_FACTOR.value)
+            else CnStockBasic
+        )
         stock_name = session.scalar(
-            select(CnStockBasic.name).where(
-                CnStockBasic.instrument_id == task.instrument_id
+            select(basic_table.name).where(
+                basic_table.instrument_id == task.instrument_id
             )
         )
 
@@ -774,14 +950,30 @@ def get_task(request: Request, task_id: int):
 
 @router.get("/datasets")
 def list_datasets(request: Request):
-    """数据集元信息（页面 chip 切换用，前端避免硬编码数据集列表）。"""
+    """数据集元信息（页面 chip 切换用，前端避免硬编码数据集列表）。
+
+    etf-data-module：新增 "etf" 分组（etf_basic/etf_daily/etf_adj_factor），
+    daily 分组仍只含股票 4 个数据集（ETF 页面消费 etf 分组）；
+    history.etf_enabled=false 时 etf 分组为空列表。
+    """
+    config: AppConfig = request.app.state.config
+    etf_group = (
+        [
+            {"dataset": ds.value, "display_name": DISPLAY_NAMES[ds.value]}
+            for ds in ETF_DATASETS
+        ]
+        if config.history.etf_enabled
+        else []
+    )
     return {
         "daily": [
             {"dataset": ds.value, "display_name": DISPLAY_NAMES[ds.value]}
-            for ds in DAY_LEVEL_DATASETS
+            for ds in STOCK_DAY_LEVEL_DATASETS
         ],
         "master": [
             {"dataset": ds.value, "display_name": DISPLAY_NAMES[ds.value]}
             for ds in MASTER_DATASETS
+            if not (ds == DatasetName.ETF_BASIC and not config.history.etf_enabled)
         ],
+        "etf": etf_group,
     }

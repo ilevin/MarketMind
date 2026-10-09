@@ -31,6 +31,7 @@ from app.models.history_sync import (
 )
 from app.models.instrument import Instrument
 from app.providers.base import ProviderBatch
+from app.providers.eastmoney_common import EastmoneyProviderError
 from app.providers.history import HistoryProviderRegistry
 from app.providers.tushare_common import TushareError
 from app.providers.trading_calendar.provider import CalendarUnavailableError
@@ -68,6 +69,7 @@ def _elapsed_ms(started: float) -> int:
 SYNC_ERRORS: tuple[type[BaseException], ...] = (
     TushareError,
     HistoryValidationError,
+    EastmoneyProviderError,
     CalendarUnavailableError,
     TimeoutError,
 )

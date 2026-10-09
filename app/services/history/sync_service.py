@@ -41,12 +41,14 @@ from app.models.history_sync import (
     TriggerType,
 )
 from app.providers.base import ProviderBatch
+from app.providers.eastmoney_common import EastmoneyProviderError
 from app.providers.history import HistoryProviderRegistry
 from app.providers.tushare_common import TushareError
 from app.providers.trading_calendar.provider import (
     CalendarUnavailableError,
     TushareTradingCalendarProvider,
 )
+from app.repositories.etf_master import EtfMasterRepository
 from app.repositories.history_fact import HistoryFactRepository
 from app.repositories.history_master import HistoryMasterRepository
 from app.repositories.history_sync import (
@@ -65,12 +67,15 @@ from app.services.market_session_service import now_beijing
 
 logger = logging.getLogger(__name__)
 
-# 四个日级数据集的处理顺序（互不阻塞：一个 FAILED 不影响后续数据集推进）
+# 六个日级数据集的处理顺序（互不阻塞：一个 FAILED 不影响后续数据集推进；
+# 股票 4 个在前，ETF 2 个在后）
 DAY_LEVEL_DATASETS: tuple[DatasetName, ...] = (
     DatasetName.DAILY,
     DatasetName.ADJ_FACTOR,
     DatasetName.DAILY_BASIC,
     DatasetName.MONEYFLOW,
+    DatasetName.ETF_DAILY,
+    DatasetName.ETF_ADJ_FACTOR,
 )
 
 CN_MARKET = "CN"
@@ -114,13 +119,16 @@ def _safe_error_text(exc: BaseException, *, limit: int = 500) -> str:
 
 
 # 业务层可识别的异常：Provider 抛出的领域异常、日历不可用，加上超时。
-# 三者都不是彼此的父类，也不是 TushareError 子类：
+# 各家异常不是彼此的父类，也不是 TushareError 子类：
 # - ``CalendarUnavailableError`` 继承 RuntimeError（日历 Provider）；
+# - ``EastmoneyProviderError``（etf-data-module）为东财体系异常基类，
+#   含 ``EastmoneyTimeoutError``（同时是 TimeoutError 子类）；
 # - ``call_with_metrics`` 的线程级限时抛**内建** TimeoutError
 #   （app/observability/provider_metrics.py）。
 # 任何一个漏掉都会穿透重试循环，把整轮 run 拖成非终态（§27/§29）。
 SYNC_ERRORS: tuple[type[BaseException], ...] = (
     TushareError,
+    EastmoneyProviderError,
     CalendarUnavailableError,
     TimeoutError,
 )
@@ -251,6 +259,7 @@ class HistorySyncService:
         outcomes: dict[DatasetName, str] = {}
         master_ok = False
         aborted = False
+        etf_universe_ok = False
         try:
             self.recover_stale_runs(exclude_run_id=run_id)
             master_ok = self.ensure_master_prerequisites(
@@ -259,10 +268,25 @@ class HistorySyncService:
             if not master_ok:
                 return run_id
 
+            # ETF universe 周期刷新（history.etf_enabled=false 跳过；刷新失败 →
+            # etf_basic/etf_daily/etf_adj_factor 三数据集本轮 FAILED）
+            if self.config.history.etf_enabled:
+                etf_universe_ok = self._ensure_etf_universe(run_id)
+                if not etf_universe_ok:
+                    # universe 刷新失败：三个 ETF 数据集标记为 FAILED，不阻塞股票段
+                    for ds in (DatasetName.ETF_BASIC, DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+                        outcomes[ds] = "FAILED"
+
             for dataset in DAY_LEVEL_DATASETS:
                 if cancellation_event is not None and cancellation_event.is_set():
                     outcomes[dataset] = "CANCELLED"
                     continue
+                # ETF 数据集需要 etf_universe_ok
+                if dataset in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+                    if not self.config.history.etf_enabled:
+                        continue  # etf_enabled=false 跳过 ETF 数据集
+                    if not etf_universe_ok:
+                        continue  # universe 刷新失败已记录 FAILED，跳过
                 try:
                     outcomes[dataset] = self._sync_stock_dataset(
                         run_id, dataset, cancellation_event=cancellation_event
@@ -523,6 +547,68 @@ class HistorySyncService:
         age_days = (now_beijing() - state.last_success_at).total_seconds() / 86400
         return age_days >= self.config.history.master_refresh_days
 
+    def _ensure_etf_universe(self, run_id: str) -> bool:
+        """ETF universe 周期刷新（etf_universe_refresh_hours 周期未到跳过）。
+
+        返回 True 表示 universe 可用（周期未到或刷新成功）；返回 False 表示
+        刷新失败（etf_basic/etf_daily/etf_adj_factor 三数据集本轮 FAILED）。
+
+        universe 为空视为刷新失败（与刷新网络失败等价：不阻止股票段推进，
+        但 ETF 三数据集本轮 FAILED）。
+        """
+        with self.session_factory() as session:
+            state = HistorySyncStateRepository(session).get(DatasetName.ETF_BASIC)
+        if state is not None and state.last_success_at is not None:
+            age_hours = (now_beijing() - state.last_success_at).total_seconds() / 3600
+            if age_hours < self.config.history.etf_universe_refresh_hours:
+                return True  # 周期未到，跳过刷新
+
+        return self._refresh_etf_universe(run_id)
+
+    def _refresh_etf_universe(self, run_id: str) -> bool:
+        """无条件刷新 ETF universe 并落库；失败返回 False（不阻塞股票段）。
+
+        空 universe（0 行）算作成功（表示当前无 ETF，不视为网络失败）。
+        """
+        try:
+            batch: ProviderBatch = self.providers.get_etf_universe()
+            if batch.truncation_risk:
+                raise TushareError(
+                    "ETF universe 命中行数上限，截断风险", error_code="TRUNCATION_RISK"
+                )
+            fetched_at = now_beijing()
+            with write_coordinator.write():
+                with self.session_factory() as session:
+                    count = EtfMasterRepository(session).upsert_cn_etf_master(
+                        batch.records, source=batch.source, run_id=run_id,
+                        fetched_at=fetched_at,
+                    )
+                    state_repo = HistorySyncStateRepository(session)
+                    state_repo.ensure(
+                        DatasetName.ETF_BASIC, dataset_kind=DatasetKind.MASTER
+                    )
+                    state_repo.update_master(DatasetName.ETF_BASIC, record_count=count)
+                    state_repo.finish_success(
+                        DatasetName.ETF_BASIC, status=DatasetStatus.CAUGHT_UP
+                    )
+                    run_repo = HistorySyncRunDatasetRepository(session)
+                    if run_repo.get(run_id, DatasetName.ETF_BASIC) is None:
+                        run_repo.start(
+                            run_id, DatasetName.ETF_BASIC, start_watermark=None,
+                            target_trade_date=None, started_at=now_beijing(),
+                        )
+                    run_repo.add_counts(
+                        run_id, DatasetName.ETF_BASIC, rows=count, requests=1
+                    )
+                    session.commit()
+            return True
+        except SYNC_ERRORS as exc:
+            self._record_master_failure(
+                DatasetName.ETF_BASIC, run_id, _error_code_of(exc), _safe_error_text(exc)
+            )
+            logger.error("ETF universe 刷新失败（不阻塞股票段，ETF 数据集本轮 FAILED）: %s", exc)
+            return False
+
     def _ensure_stock_company(self, run_id: str) -> None:
         """每 7 天按 exchange 分片刷新（§9.2）；失败仅记录，不阻塞日级数据集。"""
         if not self._needs_master_refresh(DatasetName.STOCK_COMPANY):
@@ -730,7 +816,7 @@ class HistorySyncService:
         *,
         cancellation_event: threading.Event | None,
     ) -> str:
-        """个股模式数据集主循环；返回 SUCCESS / NOOP / CANCELLED。
+        """个股模式数据集主循环（股票与 ETF 共用）；返回 SUCCESS / NOOP / CANCELLED。
 
         流程（design D7）：
           1. 解析 target（AvailabilityPolicy）
@@ -751,20 +837,34 @@ class HistorySyncService:
             dataset, now=now, strict_open_days=open_days
         )
 
+        # 判断数据集类型：ETF 或股票
+        is_etf_dataset = dataset in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR)
+
         # 取主档全量快照（含生命周期）——一次查询，供全数据集复用
         with self.session_factory() as session:
-            instruments = HistoryMasterRepository(session).list_cn_stock_instruments()
-            lifecycle_map = HistoryMasterRepository(session).get_cn_stock_lifecycle_map()
+            if is_etf_dataset:
+                instruments = EtfMasterRepository(session).list_cn_etf_instruments()
+                lifecycle_map = EtfMasterRepository(session).get_cn_etf_lifecycle_map()
+            else:
+                instruments = HistoryMasterRepository(session).list_cn_stock_instruments()
+                lifecycle_map = HistoryMasterRepository(session).get_cn_stock_lifecycle_map()
 
         # 构造 universe 入口列表（instrument_id, ts_code, list_date, delist_date）
         universe_entries: list[tuple[str, str, date | None, date | None]] = []
         for inst in instruments:
             lc = lifecycle_map.get(inst.instrument_id)
             if lc is None:
-                # 主档中没有 cn_stock_basic 记录的证券（理论上不应发生，
-                # 防御性跳过）
+                # 主档中没有对应记录的证券（理论上不应发生，防御性跳过）
                 continue
-            ts_code, list_date, delist_date = lc
+            if is_etf_dataset:
+                # ETF lifecycle_map 返回 (list_date, delist_date)
+                list_date, delist_date = lc
+                # 构造 ts_code（从 instrument_id 提取 symbol）
+                symbol = inst.instrument_id.split(":")[-1]
+                ts_code = f"{symbol}.{'SZ' if inst.exchange == 'SZSE' else 'SH'}"
+            else:
+                # 股票 lifecycle_map 返回 (ts_code, list_date, delist_date)
+                ts_code, list_date, delist_date = lc
             universe_entries.append((inst.instrument_id, ts_code, list_date, delist_date))
 
         # 批量补建缺失 stock_sync_state 行（design D3/D7：一次写事务）
@@ -833,7 +933,17 @@ class HistorySyncService:
             lc = lifecycle_map.get(inst.instrument_id)
             if lc is None:
                 continue
-            ts_code, list_date, delist_date = lc
+
+            # 解析 lifecycle 信息（ETF 与股票格式不同）
+            if is_etf_dataset:
+                # ETF lifecycle_map 返回 (list_date, delist_date)
+                list_date, delist_date = lc
+                # 构造 ts_code（从 instrument_id 提取 symbol）
+                symbol = inst.instrument_id.split(":")[-1]
+                ts_code = f"{symbol}.{'SZ' if inst.exchange == 'SZSE' else 'SH'}"
+            else:
+                # 股票 lifecycle_map 返回 (ts_code, list_date, delist_date)
+                ts_code, list_date, delist_date = lc
 
             watermark = stock_state.watermark_date
 

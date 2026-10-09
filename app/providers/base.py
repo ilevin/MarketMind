@@ -195,6 +195,34 @@ class MoneyFlow:
     net_mf_amount: float | None = None
 
 
+@dataclass(frozen=True)
+class EtfDailyBar:
+    """ETF 日线行情（东财原始未复权；单位口径见 EastmoneyEtfHistoryProvider 文档，etf-data-module）。"""
+
+    instrument_id: str
+    ts_code: str
+    trade_date: date
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
+    volume: int | None = None
+    amount: float | None = None
+    turnover_rate: float | None = None
+
+
+@dataclass(frozen=True)
+class EtfUniverseRecord:
+    """ETF universe 列表记录（etf-data-module）。"""
+
+    ts_code: str
+    symbol: str
+    instrument_id: str
+    name: str | None = None
+    exchange: str | None = None
+    list_date: date | None = None
+
+
 T = TypeVar("T")
 
 
@@ -237,7 +265,7 @@ class InstrumentNameProvider(Protocol):
 
 @runtime_checkable
 class HistoricalMarketDataProvider(Protocol):
-    """A股历史数据 Provider（技术方案 §31.1；交易日历除外——见现有
+    """A股历史数据 Provider（技术方案 §31.1；etf-data-module 扩展 ETF 数据集；交易日历除外——见现有
     TushareTradingCalendarProvider 的 strict 模式扩展）。
 
     日级方法传入 instruments（来自 cn_stock_basic 主档），Provider 以
@@ -296,12 +324,21 @@ class HistoricalMarketDataProvider(Protocol):
         instrument: Instrument,
         start_date: date,
         end_date: date,
-    ) -> ProviderBatch:
-        """按单只股票区间拉取历史事实（个股级同步主路径，design D4）。
+    ) -> ProviderBatch[DailyBar | AdjFactor | DailyBasic | MoneyFlow | EtfDailyBar]:
+        """按单只证券区间拉取历史事实（个股级同步主路径，design D4；etf-data-module 扩展 ETF 数据集）。
 
-        ``dataset`` 取值同数据集名（daily/adj_factor/daily_basic/moneyflow）；
+        ``dataset`` 取值包括股票数据集（daily/adj_factor/daily_basic/moneyflow）
+        与 ETF 数据集（etf_daily/etf_adj_factor，etf_adj_factor 复用 AdjFactor 模型）；
         ``instrument`` 由 Service 在 run 开始时读主档快照传入（Provider 不
         自行访问数据库）；返回行经别名规范化与 instrument 映射，结构与
         按 trade_date 方法一致。
+        """
+        ...
+
+    def get_etf_universe(self) -> ProviderBatch[EtfUniverseRecord]:
+        """获取当前上市 ETF 列表（etf-data-module）。
+
+        返回当前市场全部上市 ETF 主档信息（含 ts_code/symbol/name/exchange/list_date）；
+        list_date 缺失时保存 NULL（由 planner 回退 history.start_date）。
         """
         ...

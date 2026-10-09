@@ -1,16 +1,17 @@
-"""A股证券主档模型（a-share-historical-data，技术方案 §8~§10）。
+"""A股证券与 ETF 主档模型（a-share-historical-data §8~§10；etf-data-module D1）。
 
-三张小表使用 ORM（技术方案 §5.1）：
+四张小表使用 ORM（技术方案 §5.1）：
 - ``cn_stock_basic``：Tushare stock_basic 完整主档（17 个业务字段 + 采集元数据），
   覆盖沪/深/北三市场与全部上市状态（含退市），不裁剪到 2010 年起；
 - ``cn_stock_company``：公司资料（含 introduction/office/main_business/business_scope）；
 - ``cn_stock_name_change``：历史名称，event_key 为
   SHA-256(ts_code|name|start_date) 稳定键（§10.1；在线验证后如需扩展为
-  ts_code+name+start_date+end_date+ann_date 须经显式决策，不凭猜测改语义）。
+  ts_code+name+start_date+end_date+ann_date 须经显式决策，不凭猜测改语义）；
+- ``cn_etf_basic``：ETF 业务主档（etf-data-module，universe 刷新维护）。
 
 与 ``instrument`` 的关系（§7）：instrument 继续作为全资产统一主档，
 cn_stock_basic 保存 Tushare 原始证券信息，二者经 instrument_id 关联；
-退市证券 is_active=false 但不删除（§7.2）。
+退市证券 is_active=false 但不删除（§7.2）。ETF 同理（etf-data-module）。
 """
 
 from __future__ import annotations
@@ -105,4 +106,36 @@ class CnStockNameChange(Base):
 
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sync_run_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class CnEtfBasic(Base):
+    """ETF 业务主档（etf-data-module，design D1/D2）。
+
+    与 ``cn_stock_basic`` 同构的 ETF 主档：身份落 ``instrument``
+    （``CN:ETF:<symbol>``），业务字段在此保存；universe 刷新时同事务 upsert。
+    list_date/delist_date 均可空——universe 来源接口无上市/退市日期列时
+    保存 NULL，由同步 planner 保守回退（design D8）；退市 ETF 仅置
+    instrument.is_active=false，本表与历史事实数据不删除。
+    """
+
+    __tablename__ = "cn_etf_basic"
+
+    instrument_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("instrument.instrument_id"), primary_key=True
+    )
+    # Tushare 口径（symbol + 交易所后缀，如 510300.SH），供 fund_adj 请求构造
+    ts_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128))
+    exchange: Mapped[str | None] = mapped_column(String(16))
+
+    list_date: Mapped[date | None] = mapped_column(Date)
+    delist_date: Mapped[date | None] = mapped_column(Date)
+
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     sync_run_id: Mapped[str | None] = mapped_column(String(64))

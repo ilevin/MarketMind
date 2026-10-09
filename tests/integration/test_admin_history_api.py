@@ -106,7 +106,8 @@ def app_client_factory(session_factory, duckdb_url):
 
         config = AppConfig(database=DatabaseConfig(url=duckdb_url))
         config.history.startup_catchup = False
-        app = create_app(config)
+        # 注入共享 engine（单连接池，避免双 engine DuckDB 线程泄漏——v0.4.2 修复）
+        app = create_app(config, session_factory=session_factory)
         app.state.session_factory = session_factory
         app.state.name_provider = FakeNameProvider()
         client = TestClient(app)
@@ -151,6 +152,41 @@ def _seed_state(session_factory, dataset: DatasetName, **values):
     defaults.update(values)
     with session_factory() as session:
         session.add(HistorySyncState(**defaults))
+        session.commit()
+
+
+def _seed_etf_states_caught_up(session_factory, *, status: str | None = None):
+    """三个 ETF 数据集 state 行置 CAUGHT_UP（etf_basic 主档、两日级）。
+
+    etf-data-module（tasks 8.5）：默认配置 etf_enabled=true，overall_status
+    的最终判定要求全部参与数据集处于健康集合——只 seed 股票的旧用例需补
+    ETF 三行才能断言 HEALTHY（与股票 UNINITIALIZED 拖 LAGGING 的既有
+    行为一致）。status 可覆盖（分支测试用 FAILED 等）。
+    """
+    from app.models.history_sync import HistorySyncState
+
+    rows = [
+        HistorySyncState(
+            dataset=DatasetName.ETF_BASIC.value,
+            dataset_kind="MASTER",
+            status=status or DatasetStatus.CAUGHT_UP.value,
+            history_start_date=date(2010, 1, 1),
+            updated_at=now_beijing(),
+        ),
+    ]
+    for ds in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+        rows.append(
+            HistorySyncState(
+                dataset=ds.value,
+                dataset_kind="DAILY_CONTIGUOUS",
+                status=status or DatasetStatus.CAUGHT_UP.value,
+                latest_complete_trade_date=date(2026, 9, 16),
+                history_start_date=date(2010, 1, 1),
+                updated_at=now_beijing(),
+            )
+        )
+    with session_factory() as session:
+        session.add_all(rows)
         session.commit()
 
 
@@ -216,7 +252,7 @@ class TestAuthAndCsrf:
 
 class TestSummary:
     def test_fresh_db_shape(self, client_factory, session_factory):
-        """全新库：四个日级 + 四个主档键齐全，未开始的数据集为 UNINITIALIZED。"""
+        """全新库：四个日级 + 五个主档键（含 etf_basic）+ ETF 分组齐全。"""
         with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
             body = client.get("/api/admin/history-data/summary").json()
 
@@ -226,11 +262,22 @@ class TestSummary:
             "daily", "adj_factor", "daily_basic", "moneyflow",
         ]
         assert [d["dataset"] for d in body["master_datasets"]] == [
-            "stock_basic", "trade_cal", "namechange", "stock_company",
+            "stock_basic", "trade_cal", "namechange", "stock_company", "etf_basic",
         ]
         assert all(
             d["status"] == DatasetStatus.UNINITIALIZED.value for d in body["daily_datasets"]
         )
+        # ETF 分组（etf-data-module 8.5）：三个条目全部 UNINITIALIZED
+        assert [d["dataset"] for d in body["etf_datasets"]] == [
+            "etf_basic", "etf_daily", "etf_adj_factor",
+        ]
+        assert all(
+            d["status"] == DatasetStatus.UNINITIALIZED.value for d in body["etf_datasets"]
+        )
+        # universe 概况：空库全零
+        assert body["etf_universe"] == {
+            "active_count": 0, "total_count": 0, "last_refreshed_at": None
+        }
         assert body["overall_status"] == "UNINITIALIZED"
         # 主档不得伪造交易日水位字段（§54.3）
         for master in body["master_datasets"]:
@@ -392,6 +439,7 @@ class TestSummary:
         from app.models.history_market import CnStockBasic
 
         _seed_calendar(session_factory)
+        _seed_etf_states_caught_up(session_factory)
         for ds in (
             DatasetName.DAILY, DatasetName.ADJ_FACTOR,
             DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
@@ -577,6 +625,7 @@ class TestSummary:
         self, client_factory, session_factory
     ):
         _seed_calendar(session_factory)
+        _seed_etf_states_caught_up(session_factory)
         for dataset in (
             DatasetName.DAILY, DatasetName.ADJ_FACTOR,
             DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
@@ -616,6 +665,7 @@ class TestSummary:
     ):
         """§84：stock_company/namechange 短暂失败不必然升级整体 ERROR。"""
         _seed_calendar(session_factory)
+        _seed_etf_states_caught_up(session_factory)
         for dataset in (
             DatasetName.DAILY, DatasetName.ADJ_FACTOR,
             DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
@@ -698,6 +748,7 @@ class TestSummary:
         否则页面自相矛盾：同一响应里四个 lag_trade_days 全为 0 却显示"落后"。
         """
         _seed_calendar(session_factory)
+        _seed_etf_states_caught_up(session_factory)
         for dataset in (
             DatasetName.DAILY, DatasetName.ADJ_FACTOR, DatasetName.MONEYFLOW,
         ):
@@ -752,6 +803,190 @@ class TestSummary:
             if any(f"FROM {name}" in stmt or f"from {name}" in stmt for name in fact_names)
         ]
         assert not offenders, f"summary 扫描了事实表: {offenders}"
+
+
+class TestSummaryEtfBranches:
+    """etf-data-module（tasks 8.2/8.5）：overall_status 四分支 + ETF 分组行为。
+
+    ETF 数据集纳入既有优先级链（design D12）：ETF 数据集级 FAILED → ERROR、
+    ETF lagging → LAGGING、etf_enabled=false 时 ETF 完全不参与判定、
+    股票与 ETF 全部追平 → HEALTHY。股票数据集判定逻辑零改动。
+    """
+
+    @staticmethod
+    def _seed_stocks_caught_up(session_factory):
+        _seed_calendar(session_factory)
+        for dataset in (
+            DatasetName.DAILY, DatasetName.ADJ_FACTOR,
+            DatasetName.DAILY_BASIC, DatasetName.MONEYFLOW,
+        ):
+            _seed_state(
+                session_factory, dataset,
+                status=DatasetStatus.CAUGHT_UP.value,
+                latest_complete_trade_date=date(2026, 9, 16),
+            )
+
+    def test_etf_dataset_failed_is_error(self, client_factory, session_factory):
+        """ETF 数据集级 FAILED（东财系统性不可用）→ overall ERROR。"""
+        self._seed_stocks_caught_up(session_factory)
+        _seed_state(
+            session_factory, DatasetName.ETF_BASIC,
+            dataset_kind="MASTER", status=DatasetStatus.CAUGHT_UP.value,
+        )
+        _seed_state(
+            session_factory, DatasetName.ETF_ADJ_FACTOR,
+            status=DatasetStatus.CAUGHT_UP.value,
+            latest_complete_trade_date=date(2026, 9, 16),
+        )
+        _seed_state(
+            session_factory, DatasetName.ETF_DAILY,
+            status=DatasetStatus.FAILED.value,
+            last_error_code="EASTMONEY_API_ERROR", last_error="东财接口不可用",
+        )
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        # 股票部分仍然健康，但 ETF 数据集级失败足以升级 ERROR
+        assert all(
+            d["status"] == DatasetStatus.CAUGHT_UP.value for d in body["daily_datasets"]
+        )
+        etf_daily = next(
+            d for d in body["etf_datasets"] if d["dataset"] == "etf_daily"
+        )
+        assert etf_daily["status"] == DatasetStatus.FAILED.value
+        assert etf_daily["last_error_code"] == "EASTMONEY_API_ERROR"
+        assert body["overall_status"] == "ERROR", (
+            "ETF 数据集级 FAILED 必须升级 ERROR（东财系统性不可用）"
+        )
+
+    def test_etf_lagging_is_lagging_not_error(self, client_factory, session_factory):
+        """ETF 个股缺口（lagging_count > 0 但数据集非 FAILED）→ LAGGING。"""
+        from app.models.history_sync import StockSyncState
+        from app.models.instrument import Instrument
+
+        self._seed_stocks_caught_up(session_factory)
+        _seed_state(
+            session_factory, DatasetName.ETF_BASIC,
+            dataset_kind="MASTER", status=DatasetStatus.CAUGHT_UP.value,
+        )
+        for ds in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+            _seed_state(
+                session_factory, ds,
+                status=DatasetStatus.CAUGHT_UP.value,
+                latest_complete_trade_date=date(2026, 9, 16),
+            )
+        # 两只 ETF：一只追平、一只落后（水位低于目标日 2026-09-16）
+        with session_factory() as session:
+            session.add_all([
+                Instrument(
+                    instrument_id="CN:ETF:510300", symbol="510300",
+                    name="沪深300ETF", market="CN", asset_type="ETF",
+                    currency="CNY", exchange="SSE", is_active=True,
+                ),
+                Instrument(
+                    instrument_id="CN:ETF:159915", symbol="159915",
+                    name="创业板ETF", market="CN", asset_type="ETF",
+                    currency="CNY", exchange="SZSE", is_active=True,
+                ),
+            ])
+            session.flush()
+            session.add_all([
+                StockSyncState(
+                    dataset=DatasetName.ETF_DAILY.value,
+                    instrument_id="CN:ETF:510300",
+                    ts_code="510300.SH",
+                    watermark_date=date(2026, 9, 16),
+                    last_status="success",
+                    last_success_at=now_beijing(),
+                    last_attempt_at=now_beijing(),
+                    created_at=now_beijing(),
+                    updated_at=now_beijing(),
+                ),
+                StockSyncState(
+                    dataset=DatasetName.ETF_DAILY.value,
+                    instrument_id="CN:ETF:159915",
+                    ts_code="159915.SZ",
+                    watermark_date=date(2026, 9, 14),  # 落后
+                    last_status="success",
+                    last_success_at=now_beijing(),
+                    last_attempt_at=now_beijing(),
+                    created_at=now_beijing(),
+                    updated_at=now_beijing(),
+                ),
+            ])
+            session.commit()
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        etf_daily = next(
+            d for d in body["etf_datasets"] if d["dataset"] == "etf_daily"
+        )
+        assert etf_daily["stock_count"] == 2
+        assert etf_daily["up_to_date_count"] == 1
+        assert etf_daily["lagging_count"] == 1
+        assert etf_daily["completion_rate"] == 0.5
+        assert body["overall_status"] == "LAGGING", "ETF 个股缺口 → LAGGING"
+
+    def test_etf_disabled_not_participating(self, client_factory, session_factory):
+        """etf_enabled=false：ETF 不返回统计、不参与判定（股票单独健康即 HEALTHY）。"""
+        from app.models.history_sync import HistorySyncState
+
+        self._seed_stocks_caught_up(session_factory)
+        # 不 seed 任何 ETF state 行（enabled=false 时即使残留行也不参与）
+        assert HistorySyncState  # 显式引用说明本用例刻意不留 ETF 行
+        with client_factory(
+            FakeNameProvider(),
+            login_as="admin", role="admin",
+            history_overrides={"etf_enabled": False},
+        ) as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        assert body["etf_universe"] is None
+        assert body["etf_datasets"] == []
+        assert [m["dataset"] for m in body["master_datasets"]] == [
+            "stock_basic", "trade_cal", "namechange", "stock_company",
+        ]
+        assert body["overall_status"] == "HEALTHY", (
+            "enabled=false 时 ETF 完全不参与判定：股票追平即 HEALTHY"
+        )
+
+    def test_etf_universe_summary_counts(self, client_factory, session_factory):
+        """etf_universe 聚合：active/total 来自 instrument 表，刷新时间取 etf_basic。"""
+        from app.models.instrument import Instrument
+
+        _seed_calendar(session_factory)
+        refreshed_at = datetime(2026, 9, 16, 8, 0, tzinfo=BEIJING)
+        _seed_state(
+            session_factory, DatasetName.ETF_BASIC,
+            dataset_kind="MASTER", status=DatasetStatus.CAUGHT_UP.value,
+            last_success_at=refreshed_at,
+        )
+        with session_factory() as session:
+            session.add_all([
+                Instrument(
+                    instrument_id="CN:ETF:510300", symbol="510300",
+                    name="沪深300ETF", market="CN", asset_type="ETF",
+                    currency="CNY", exchange="SSE", is_active=True,
+                ),
+                Instrument(
+                    instrument_id="CN:ETF:159915", symbol="159915",
+                    name="创业板ETF", market="CN", asset_type="ETF",
+                    currency="CNY", exchange="SZSE", is_active=True,
+                ),
+                # 退市保留：is_active=false 仍在 universe 计数（total 含 inactive）
+                Instrument(
+                    instrument_id="CN:ETF:510050", symbol="510050",
+                    name="已退市ETF", market="CN", asset_type="ETF",
+                    currency="CNY", exchange="SSE", is_active=False,
+                ),
+            ])
+            session.commit()
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/summary").json()
+
+        assert body["etf_universe"]["active_count"] == 2
+        assert body["etf_universe"]["total_count"] == 3
+        assert body["etf_universe"]["last_refreshed_at"].startswith("2026-09-16")
 
 
 class TestManualSync:
@@ -1247,6 +1482,193 @@ class TestStocks:
         assert p2["pagination"]["page"] == 2
 
 
+class TestStocksEtf:
+    """/stocks ETF 数据集测试（etf-data-module，tasks 8.2/8.5）。
+
+    ETF 数据集 JOIN cn_etf_basic（按 dataset 分派），响应 schema 与股票条目
+    完全兼容；分页/筛选/搜索/排序行为复用既有逻辑。
+    """
+
+    def _seed_etfs(self, session_factory, *, dataset="etf_daily", n=3):
+        """构造测试 ETF 数据（instrument + cn_etf_basic + 数据集 state 行）。"""
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnEtfBasic
+
+        _seed_calendar(session_factory)
+        _seed_state(
+            session_factory, DatasetName(dataset),
+            status=DatasetStatus.CAUGHT_UP.value,
+            latest_complete_trade_date=date(2026, 9, 16),
+            latest_expected_trade_date=date(2026, 9, 16),
+        )
+        with session_factory() as session:
+            # 51/56 → SSE、15 → SZSE（universe 解析规则）
+            prefixes = ("510", "560", "159")
+            for i in range(1, n + 1):
+                symbol = f"{prefixes[(i - 1) % 3]}{i:03d}"
+                exchange = "SSE" if symbol.startswith("5") else "SZSE"
+                session.add(Instrument(
+                    instrument_id=f"CN:ETF:{symbol}", symbol=symbol,
+                    name=f"ETF{i}", market="CN", asset_type="ETF",
+                    currency="CNY", exchange=exchange, is_active=True,
+                ))
+            session.flush()
+            for i in range(1, n + 1):
+                symbol = f"{prefixes[(i - 1) % 3]}{i:03d}"
+                exchange = "SSE" if symbol.startswith("5") else "SZSE"
+                session.add(CnEtfBasic(
+                    instrument_id=f"CN:ETF:{symbol}",
+                    ts_code=f"{symbol}.{'SH' if exchange == 'SSE' else 'SZ'}",
+                    symbol=symbol, name=f"ETF{i}",
+                    exchange=exchange,
+                    list_date=date(2015, 1, 5),
+                    source="eastmoney", fetched_at=now_beijing(),
+                    source_last_seen_at=now_beijing(),
+                ))
+            session.commit()
+
+    def test_etf_dataset_list_and_join_dispatch(
+        self, client_factory, session_factory
+    ):
+        """ETF 数据集 JOIN cn_etf_basic：返回 ETF 条目，不串股票（反之亦然）。"""
+        from app.models.history_sync import StockSyncState as SSS
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnStockBasic
+
+        self._seed_etfs(session_factory, n=2)
+        # 同时存在一只股票：ETF 数据集的列表不得包含它，daily 也不得包含 ETF
+        with session_factory() as session:
+            session.add(Instrument(
+                instrument_id="CN:STOCK:000001", symbol="000001",
+                name="平安银行", market="CN", asset_type="STOCK",
+                currency="CNY", exchange="SZSE", is_active=True,
+            ))
+            session.flush()
+            session.add(CnStockBasic(
+                instrument_id="CN:STOCK:000001", ts_code="000001.SZ",
+                symbol="000001", name="平安银行",
+                list_date=date(2010, 1, 4),
+                source="tushare", fetched_at=now_beijing(),
+                source_last_seen_at=now_beijing(),
+            ))
+            # 两只 ETF 的 etf_daily 同步状态（已追平）——stats 聚合口径
+            for symbol in ("510001", "560002"):
+                session.add(SSS(
+                    dataset="etf_daily", instrument_id=f"CN:ETF:{symbol}",
+                    ts_code=f"{symbol}.SH", watermark_date=date(2026, 9, 16),
+                    last_status="success",
+                    last_success_at=now_beijing(), last_attempt_at=now_beijing(),
+                    created_at=now_beijing(), updated_at=now_beijing(),
+                ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            etf = client.get("/api/admin/history-data/stocks?dataset=etf_daily").json()
+            stock = client.get("/api/admin/history-data/stocks?dataset=daily").json()
+
+        # ETF 数据集：2 条 ETF、名称来自 cn_etf_basic
+        assert len(etf["items"]) == 2
+        assert {item["name"] for item in etf["items"]} == {"ETF1", "ETF2"}
+        assert all(item["ts_code"].endswith((".SH", ".SZ")) for item in etf["items"])
+        # 股票数据集：只有股票（ETF 不出现在 daily 的列表）
+        assert len(stock["items"]) == 1
+        assert stock["items"][0]["ts_code"] == "000001.SZ"
+        # stats：按数据集聚合（etf_daily 有 2 行状态、daily 无）
+        assert etf["stats"]["stock_count"] == 2
+        assert etf["stats"]["up_to_date_count"] == 2
+        assert stock["stats"]["stock_count"] == 0
+
+    def test_etf_adj_factor_dataset_accepted(self, client_factory, session_factory):
+        """etf_adj_factor 也是合法 dataset（水位口径独立于 etf_daily）。"""
+        from app.models.history_sync import StockSyncState as SSS
+
+        self._seed_etfs(session_factory, dataset="etf_adj_factor", n=2)
+        with session_factory() as session:
+            session.add(SSS(
+                dataset="etf_adj_factor", instrument_id="CN:ETF:510001",
+                ts_code="510001.SH", watermark_date=date(2026, 9, 16),
+                last_status="success",
+                last_success_at=now_beijing(), last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.commit()
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get(
+                "/api/admin/history-data/stocks?dataset=etf_adj_factor"
+            ).json()
+
+        assert len(body["items"]) == 2
+        up_to_date = [i for i in body["items"] if i["last_status"] == "success"]
+        assert len(up_to_date) == 1
+        assert up_to_date[0]["watermark_date"] == "2026-09-16"
+        # stats 聚合口径：只有 1 行 etf_adj_factor 状态
+        assert body["stats"]["stock_count"] == 1
+        assert body["stats"]["up_to_date_count"] == 1
+
+    def test_etf_dataset_rejects_master_dataset(self, client_factory, session_factory):
+        """etf_basic 是主档（非日级）→ 422。"""
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            resp = client.get("/api/admin/history-data/stocks?dataset=etf_basic")
+            assert resp.status_code == 422
+            assert "日级数据集" in resp.json()["detail"]
+
+    def test_etf_dataset_requires_admin(self, client_factory):
+        """ETF 数据集同样受权限矩阵保护：403 / 401。"""
+        with client_factory(FakeNameProvider(), login_as="alice") as client:
+            assert (
+                client.get("/api/admin/history-data/stocks?dataset=etf_daily").status_code
+                == 403
+            )
+        with client_factory(FakeNameProvider()) as client:
+            assert (
+                client.get("/api/admin/history-data/stocks?dataset=etf_daily").status_code
+                == 401
+            )
+
+    def test_etf_search_and_status_filter(self, client_factory, session_factory):
+        """ETF 搜索（名称/代码）与状态筛选。"""
+        from app.models.history_sync import StockSyncState as SSS
+
+        self._seed_etfs(session_factory, n=3)
+        with session_factory() as session:
+            session.add(SSS(
+                dataset="etf_daily", instrument_id="CN:ETF:510001",
+                ts_code="510001.SH", watermark_date=date(2026, 9, 14),
+                last_status="failed", last_error_code="EASTMONEY_TIMEOUT",
+                last_error="东财超时",
+                last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.add(SSS(
+                dataset="etf_daily", instrument_id="CN:ETF:560002",
+                ts_code="560002.SH", watermark_date=date(2026, 9, 16),
+                last_status="success",
+                last_success_at=now_beijing(), last_attempt_at=now_beijing(),
+                created_at=now_beijing(), updated_at=now_beijing(),
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            by_name = client.get(
+                "/api/admin/history-data/stocks?dataset=etf_daily&q=ETF2"
+            ).json()
+            by_code = client.get(
+                "/api/admin/history-data/stocks?dataset=etf_daily&q=510001"
+            ).json()
+            failed = client.get(
+                "/api/admin/history-data/stocks?dataset=etf_daily&status=failed"
+            ).json()
+
+        assert len(by_name["items"]) == 1
+        assert by_name["items"][0]["name"] == "ETF2"
+        assert len(by_code["items"]) == 1
+        assert by_code["items"][0]["ts_code"] == "510001.SH"
+        # 失败行排最前（默认排序失败优先），错误信息透出
+        assert len(failed["items"]) == 1
+        assert failed["items"][0]["last_status"] == "failed"
+        assert failed["items"][0]["last_error_code"] == "EASTMONEY_TIMEOUT"
+
+
 class TestTasks:
     """GET /api/admin/history-data/tasks/{task_id} 任务详情测试（tasks 8.3）。"""
 
@@ -1304,6 +1726,44 @@ class TestTasks:
         assert "error_code" in body
         assert "error_message" in body
 
+    def test_task_detail_etf_joins_cn_etf_basic(self, client_factory, session_factory):
+        """ETF 任务的 stock_name 来自 cn_etf_basic（按 dataset 分派 JOIN）。"""
+        from app.models.instrument import Instrument
+        from app.models.history_market import CnEtfBasic
+        from app.models.history_sync import SyncTask
+
+        with session_factory() as session:
+            session.add(Instrument(
+                instrument_id="CN:ETF:510300", symbol="510300",
+                name="沪深300ETF", market="CN", asset_type="ETF",
+                currency="CNY", exchange="SSE", is_active=True,
+            ))
+            session.flush()
+            session.add(CnEtfBasic(
+                instrument_id="CN:ETF:510300", ts_code="510300.SH",
+                symbol="510300", name="沪深300ETF", exchange="SSE",
+                list_date=date(2012, 5, 28),
+                source="eastmoney", fetched_at=now_beijing(),
+                source_last_seen_at=now_beijing(),
+            ))
+            started = now_beijing()
+            session.add(SyncTask(
+                id=2, run_id="run-task-etf", dataset=DatasetName.ETF_DAILY.value,
+                instrument_id="CN:ETF:510300", ts_code="510300.SH",
+                start_date=date(2026, 9, 15), end_date=date(2026, 9, 16),
+                status="success", retry_count=0, attempt_count=1,
+                records_fetched=2, records_written=2,
+                started_at=started, finished_at=started + timedelta(seconds=3),
+                duration_ms=3000, created_at=started,
+            ))
+            session.commit()
+
+        with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
+            body = client.get("/api/admin/history-data/tasks/2").json()
+        assert body["dataset"] == "etf_daily"
+        assert body["ts_code"] == "510300.SH"
+        assert body["stock_name"] == "沪深300ETF"
+
     def test_task_not_found(self, client_factory, session_factory):
         """不存在的 task_id → 404。"""
         with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
@@ -1323,13 +1783,35 @@ class TestTasks:
 
 
 class TestDatasetsEndpoint:
-    def test_datasets_returns_daily_and_master(self, client_factory, session_factory):
+    def test_datasets_returns_daily_master_and_etf(self, client_factory, session_factory):
+        """etf-data-module：daily 仍 4 个股票数据集，新增 etf 分组（3 个）。"""
         with client_factory(FakeNameProvider(), login_as="admin", role="admin") as client:
             body = client.get("/api/admin/history-data/datasets").json()
         assert "daily" in body
         assert "master" in body
+        assert "etf" in body
         assert len(body["daily"]) == 4
         assert any(d["dataset"] == "daily" for d in body["daily"])
+        assert [d["dataset"] for d in body["etf"]] == [
+            "etf_basic", "etf_daily", "etf_adj_factor",
+        ]
+        assert [d["display_name"] for d in body["etf"]] == [
+            "ETF基础信息", "ETF日线行情", "ETF复权因子",
+        ]
+        assert "etf_basic" in [d["dataset"] for d in body["master"]]
+
+    def test_datasets_etf_group_empty_when_disabled(
+        self, client_factory, session_factory
+    ):
+        """etf_enabled=false：etf 分组为空、master 不含 etf_basic。"""
+        with client_factory(
+            FakeNameProvider(),
+            login_as="admin", role="admin",
+            history_overrides={"etf_enabled": False},
+        ) as client:
+            body = client.get("/api/admin/history-data/datasets").json()
+        assert body["etf"] == []
+        assert "etf_basic" not in [d["dataset"] for d in body["master"]]
 
 
 class TestNoTokenLeak:

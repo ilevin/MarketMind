@@ -298,6 +298,11 @@ def make_service(session_factory, frozen_now):
         config = AppConfig(tushare=TushareConfig(token="fake-token"))
         config.history.start_date = LEGACY_DAY
         config.history.max_retries = 3  # 总尝试 4 次
+        # 本文件聚焦股票数据集（Tushare alias/水位语义）：关闭 ETF 段。
+        # SpyRegistry 只注入 market_data 源，etf_daily 键仍按默认配置
+        # 懒构造真实东财 Provider——不关闭会真实发起网络请求
+        # （etf-data-module v0.4.2 修复：全量回归被拖入小时级）。
+        config.history.etf_enabled = False
         return HistorySyncService(
             config,
             session_factory,

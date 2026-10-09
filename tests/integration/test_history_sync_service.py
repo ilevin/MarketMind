@@ -43,6 +43,8 @@ from app.providers.base import (
     AdjFactor,
     DailyBar,
     DailyBasic,
+    EtfDailyBar,
+    EtfUniverseRecord,
     MoneyFlow,
     ProviderBatch,
     StockBasicRecord,
@@ -107,6 +109,12 @@ class FakeStockHistoryProviders:
     ``empty_stocks`` : {ts_code: {dataset}} —— 指定股票某数据集恒返回 0 行
     ``list_dates``   : {ts_code: date} —— 每只股票的上市日（写入主档）
     ``delist_dates`` : {ts_code: date} —— 每只股票的退市日（写入主档）
+
+    ETF 相关：
+    ``etf_symbols``     : ETF 代码列表（如 ("510300", "159915")）
+    ``etf_list_dates``  : {ts_code: date} —— ETF 上市日（写入主档）
+    ``etf_delist_dates``: {ts_code: date} —— ETF 退市日（写入主档）
+    ``etf_universe_fail``: 前 N 次 get_etf_universe 抛 TushareError
     """
 
     source = "tushare"
@@ -121,6 +129,11 @@ class FakeStockHistoryProviders:
         list_dates: dict[str, date] | None = None,
         delist_dates: dict[str, date] | None = None,
         exchange: str = "SZSE",
+        # ETF 相关
+        etf_symbols: tuple[str, ...] = (),
+        etf_list_dates: dict[str, date] | None = None,
+        etf_delist_dates: dict[str, date] | None = None,
+        etf_universe_fail: int = 0,
     ):
         self.symbols = symbols
         self.fail_stocks = fail_stocks or {}
@@ -136,6 +149,13 @@ class FakeStockHistoryProviders:
         self._remaining_fail: dict[str, dict[str, int]] = {
             ts: dict(ds_map) for ts, ds_map in self.fail_stocks.items()
         }
+        # ETF 相关
+        self.etf_symbols = etf_symbols
+        self.etf_list_dates = etf_list_dates or {}
+        self.etf_delist_dates = etf_delist_dates or {}
+        self.etf_universe_fail = etf_universe_fail
+        self.etf_universe_calls = 0
+        self._etf_universe_remaining_fail = etf_universe_fail
 
     # -- 主档 --
 
@@ -184,6 +204,43 @@ class FakeStockHistoryProviders:
         ]
         return ProviderBatch(records=records, source=self.source, raw_row_count=len(records))
 
+    def get_etf_universe(self) -> ProviderBatch:
+        """ETF universe mock：根据 etf_symbols 构造 EtfUniverseRecord 列表。
+
+        代码前缀 51/56/58 开头判为 SSE（.SH），15 开头判为 SZSE（.SZ）。
+        支持 etf_universe_fail 注入：前 N 次调用抛 TushareError。
+        """
+        self.etf_universe_calls += 1
+        if self._etf_universe_remaining_fail > 0:
+            self._etf_universe_remaining_fail -= 1
+            raise TushareError(
+                "模拟 ETF universe 刷新失败（测试注入）",
+                error_code=self.error_code,
+            )
+        records = []
+        for symbol in self.etf_symbols:
+            exchange = self._etf_exchange_of(symbol)
+            suffix = "SH" if exchange == "SSE" else "SZ"
+            ts_code = f"{symbol}.{suffix}"
+            records.append(
+                EtfUniverseRecord(
+                    ts_code=ts_code,
+                    symbol=symbol,
+                    instrument_id=f"CN:ETF:{symbol}",
+                    name=f"ETF{symbol}",
+                    exchange=exchange,
+                    list_date=self.etf_list_dates.get(ts_code),
+                )
+            )
+        return ProviderBatch(records=records, source=self.source, raw_row_count=len(records))
+
+    @staticmethod
+    def _etf_exchange_of(symbol: str) -> str:
+        """根据 ETF 代码前缀判断交易所。"""
+        if symbol.startswith(("51", "56", "58")):
+            return "SSE"
+        return "SZSE"
+
     # -- 个股区间 --
 
     def get_history_by_stock(
@@ -214,6 +271,9 @@ class FakeStockHistoryProviders:
         return ProviderBatch(records=records, source=self.source, raw_row_count=len(records))
 
     def _ts_code_of(self, instrument: Instrument) -> str:
+        if instrument.asset_type == "ETF":
+            suffix = "SH" if instrument.exchange == "SSE" else "SZ"
+            return f"{instrument.symbol}.{suffix}"
         return self._ts_code(instrument.symbol)
 
     def _build_records(
@@ -224,6 +284,8 @@ class FakeStockHistoryProviders:
             "adj_factor": _adj_factor,
             "daily_basic": _daily_basic,
             "moneyflow": _moneyflow,
+            "etf_daily": _etf_daily,
+            "etf_adj_factor": _etf_adj_factor,
         }
         build = builders[dataset]
         records = []
@@ -280,6 +342,38 @@ def _moneyflow(instrument_id: str, trade_date: date) -> MoneyFlow:
     )
 
 
+def _etf_daily(instrument_id: str, trade_date: date) -> EtfDailyBar:
+    """ETF 日线行情构造函数（东财口径：volume=手、amount=元、turnover_rate=百分比数值）。"""
+    symbol = instrument_id.split(":")[-1]
+    if symbol.startswith(("51", "56", "58")):
+        suffix = "SH"
+    else:
+        suffix = "SZ"
+    return EtfDailyBar(
+        instrument_id=instrument_id,
+        ts_code=f"{symbol}.{suffix}",
+        trade_date=trade_date,
+        open=2.0, high=2.1, low=1.9, close=2.05,
+        volume=10000, amount=20500.0,
+        turnover_rate=0.5,
+    )
+
+
+def _etf_adj_factor(instrument_id: str, trade_date: date) -> AdjFactor:
+    """ETF 复权因子构造函数（复用 AdjFactor 模型）。"""
+    symbol = instrument_id.split(":")[-1]
+    if symbol.startswith(("51", "56", "58")):
+        suffix = "SH"
+    else:
+        suffix = "SZ"
+    return AdjFactor(
+        instrument_id=instrument_id,
+        ts_code=f"{symbol}.{suffix}",
+        trade_date=trade_date,
+        adj_factor=1.0,
+    )
+
+
 # ---- fixture ----
 
 
@@ -305,10 +399,12 @@ def make_service(session_factory, frozen_now):
         calendar: FakeCalendarProvider | None = None,
         start_date: date = date(2026, 9, 10),
         max_retries: int = 3,  # 默认总尝试 4 次（与生产一致）
+        etf_enabled: bool = True,
     ) -> tuple[HistorySyncService, FakeStockHistoryProviders, FakeCalendarProvider, list[float]]:
         config = AppConfig()
         config.history.start_date = start_date
         config.history.max_retries = max_retries
+        config.history.etf_enabled = etf_enabled
         fake_providers = providers if providers is not None else FakeStockHistoryProviders()
         fake_calendar = calendar if calendar is not None else FakeCalendarProvider()
         slept: list[float] = []
@@ -1116,3 +1212,356 @@ class TestProgressTracking:
         assert hasattr(service.progress, "succeeded")
         assert hasattr(service.progress, "failed")
         assert hasattr(service.progress, "skipped")
+
+
+# ===================================================================
+# ETF 同步集成测试（etf-data-module tasks 6.4 / 6.5）
+# ===================================================================
+
+
+class TestEtfSync:
+    """ETF 同步核心场景：水位推进、失败隔离、自动补偿、零请求等。"""
+
+    def test_etf_watermark_advances_and_stable(self, make_service, session_factory):
+        """Scenario "ETF 水位推进与单调不下降"：首次 run 水位推进到 target，
+        再 run 一次水位不变。"""
+        providers = FakeStockHistoryProviders(etf_symbols=("510300",))
+        service, _p, _c, _ = make_service(providers=providers)
+        service.run(trigger=TriggerType.MANUAL)
+
+        # etf_daily / etf_adj_factor 水位均推进到 09-16
+        for ds in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+            state = _stock_state(session_factory, ds, "CN:ETF:510300")
+            assert state.watermark_date == date(2026, 9, 16), (
+                f"{ds.value} 水位未推进到目标日"
+            )
+            assert state.last_status == TASK_STATUS_SUCCESS
+            assert state.ts_code == "510300.SH"
+
+        # 再 run 一次：水位不变（单调不下降）
+        service.run(trigger=TriggerType.MANUAL)
+        for ds in (DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+            state = _stock_state(session_factory, ds, "CN:ETF:510300")
+            assert state.watermark_date == date(2026, 9, 16)
+
+    def test_single_etf_failure_isolation(self, make_service, session_factory):
+        """Scenario "单 ETF 失败隔离"：一只 ETF 的 etf_daily 耗尽重试失败，
+        不影响另一只 ETF，Run 仍为 SUCCESS。"""
+        providers = FakeStockHistoryProviders(
+            etf_symbols=("510300", "159915"),
+            fail_stocks={"510300.SH": {"etf_daily": 10}},  # 510300 的 etf_daily 恒失败
+        )
+        service, _p, _c, _ = make_service(providers=providers, max_retries=3)
+        run_id = service.run(trigger=TriggerType.MANUAL)
+
+        # 失败的 ETF：水位不动、status=failed
+        s_fail = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s_fail.watermark_date is None
+        assert s_fail.last_status == TASK_STATUS_FAILED
+
+        # 成功的 ETF：水位推进
+        s_ok = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:159915")
+        assert s_ok.watermark_date == date(2026, 9, 16)
+        assert s_ok.last_status == TASK_STATUS_SUCCESS
+
+        # Run 仍为 SUCCESS
+        with session_factory() as session:
+            run = HistorySyncRunRepository(session).get(run_id)
+        assert run.status == RunStatus.SUCCESS.value
+
+        # run_dataset 计数：2 只 ETF 全部 processed，1 失败
+        rd = _run_dataset(session_factory, run_id, DatasetName.ETF_DAILY)
+        assert rd.task_failed_count == 1
+        assert rd.task_success_count == 1
+        assert rd.processed_count == 2
+
+    def test_auto_compensation(self, make_service, session_factory):
+        """Scenario "自动补偿"：失败 ETF 下轮 run 追平，水位推进、facts 落库。"""
+        providers = FakeStockHistoryProviders(
+            etf_symbols=("510300",),
+            fail_stocks={"510300.SH": {"etf_daily": 10}},
+        )
+        service, _p, _c, _ = make_service(providers=providers)
+        run1 = service.run(trigger=TriggerType.MANUAL)
+
+        s1 = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s1.last_status == TASK_STATUS_FAILED
+        assert s1.watermark_date is None
+
+        # 清除失败注入（模拟上游恢复）
+        providers.fail_stocks.clear()
+        providers._remaining_fail.clear()
+
+        run2 = service.run(trigger=TriggerType.SCHEDULED)
+        s2 = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s2.watermark_date == date(2026, 9, 16)
+        assert s2.last_status == TASK_STATUS_SUCCESS
+
+        # facts 落库：3 个交易日各 1 行
+        for day in OPEN_DAYS:
+            assert _fact_rows(session_factory, DatasetName.ETF_DAILY, day) == 1
+
+        with session_factory() as session:
+            run = HistorySyncRunRepository(session).get(run2)
+        assert run.status == RunStatus.SUCCESS.value
+
+    def test_caught_up_zero_requests(self, make_service, session_factory):
+        """Scenario "已追平零请求"：追平后再 run，ETF 相关调用为 0。"""
+        providers = FakeStockHistoryProviders(etf_symbols=("510300",))
+        service, _p, _c, _ = make_service(providers=providers)
+        service.run(trigger=TriggerType.MANUAL)
+
+        calls_before = len(providers.stock_calls)
+        service.run(trigger=TriggerType.MANUAL)
+        assert len(providers.stock_calls) == calls_before, (
+            "已追平 ETF 不应被再次请求"
+        )
+
+    def test_empty_result_advances_watermark(self, make_service, session_factory):
+        """Scenario "空结果推进"：某 ETF etf_daily 返回空 → 水位仍推进到 target。"""
+        providers = FakeStockHistoryProviders(
+            etf_symbols=("510300",),
+            empty_stocks={"510300.SH": {"etf_daily"}},
+        )
+        service, _p, _c, slept = make_service(providers=providers)
+        run_id = service.run(trigger=TriggerType.MANUAL)
+
+        state = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert state.watermark_date == date(2026, 9, 16), (
+            "空结果应推进水位到区间终点"
+        )
+        assert state.last_status == TASK_STATUS_SUCCESS
+        assert slept == [], "空结果不是错误，不进入退避重试"
+
+        with session_factory() as session:
+            task = session.scalar(
+                select(SyncTask).where(
+                    SyncTask.run_id == run_id, SyncTask.dataset == "etf_daily"
+                )
+            )
+        assert task.records_fetched == 0
+        assert task.records_written == 0
+
+    def test_universe_fail_does_not_block_stocks(self, make_service, session_factory, frozen_now):
+        """Scenario "universe 刷新失败不阻塞股票段"：首轮 universe 失败 →
+        ETF 数据集本轮不推进、股票段（daily 等）正常 SUCCESS、Run 整体 FAILED；
+        下轮 universe 成功后 ETF 恢复同步。"""
+        providers = FakeStockHistoryProviders(
+            symbols=("000001",),  # 股票段正常
+            etf_symbols=("510300",),
+            etf_universe_fail=1,  # 第一次失败
+        )
+        service, _p, _c, _ = make_service(providers=providers)
+
+        # 第一轮：universe 刷新失败
+        run1 = service.run(trigger=TriggerType.MANUAL)
+
+        with session_factory() as session:
+            run = HistorySyncRunRepository(session).get(run1)
+        # 有数据集 FAILED → Run 整体 FAILED（数据集级 FAILED 语义 = 系统级失败）
+        assert run.status == RunStatus.FAILED.value
+
+        # etf_basic state 标记失败（universe 刷新失败）
+        etf_basic_state = _dataset_state(session_factory, DatasetName.ETF_BASIC)
+        assert etf_basic_state.status == DatasetStatus.FAILED.value
+        assert etf_basic_state.last_error_code == "TUSHARE_TIMEOUT"
+
+        # 股票段 daily 正常 SUCCESS
+        rd_daily = _run_dataset(session_factory, run1, DatasetName.DAILY)
+        assert rd_daily.status == RunDatasetStatus.SUCCESS.value
+
+        # 股票水位正常推进（universe 失败不阻塞股票段）
+        s_stock = _stock_state(session_factory, DatasetName.DAILY, "CN:STOCK:000001")
+        assert s_stock.watermark_date == date(2026, 9, 16)
+
+        # ETF 水位未推进（universe 失败，etf_daily 未执行）
+        s_etf_before = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s_etf_before is None or s_etf_before.watermark_date is None
+
+        # 第二轮：universe 刷新成功（剩余失败次数耗尽），ETF 恢复同步
+        run2 = service.run(trigger=TriggerType.SCHEDULED)
+
+        s_etf = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s_etf.watermark_date == date(2026, 9, 16)
+        assert s_etf.last_status == TASK_STATUS_SUCCESS
+
+        rd_etf = _run_dataset(session_factory, run2, DatasetName.ETF_DAILY)
+        assert rd_etf.status == RunDatasetStatus.SUCCESS.value
+
+    def test_etf_disabled_skips_entirely(self, make_service, session_factory):
+        """Scenario "enabled=false 完全跳过"：etf_enabled=False →
+        get_etf_universe 零调用、ETF 数据集无 run_dataset 行、股票段正常。"""
+        providers = FakeStockHistoryProviders(
+            symbols=("000001",),
+            etf_symbols=("510300",),
+        )
+        service, _p, _c, _ = make_service(providers=providers, etf_enabled=False)
+        run_id = service.run(trigger=TriggerType.MANUAL)
+
+        # universe 零调用
+        assert providers.etf_universe_calls == 0
+
+        # ETF 相关数据集无 run_dataset 行
+        for ds in (DatasetName.ETF_BASIC, DatasetName.ETF_DAILY, DatasetName.ETF_ADJ_FACTOR):
+            rd = _run_dataset(session_factory, run_id, ds)
+            assert rd is None, f"{ds.value} 在 etf_enabled=false 时不应有 run_dataset 行"
+
+        # 股票段正常
+        rd_daily = _run_dataset(session_factory, run_id, DatasetName.DAILY)
+        assert rd_daily.status == RunDatasetStatus.SUCCESS.value
+        s_stock = _stock_state(session_factory, DatasetName.DAILY, "CN:STOCK:000001")
+        assert s_stock.watermark_date == date(2026, 9, 16)
+
+    def test_etf_daily_and_adj_factor_independent(self, make_service, session_factory):
+        """Scenario "etf_daily 与 etf_adj_factor 水位独立"：
+        仅 etf_adj_factor 失败 → etf_daily 追平而 etf_adj_factor 不动。"""
+        providers = FakeStockHistoryProviders(
+            etf_symbols=("510300",),
+            fail_stocks={"510300.SH": {"etf_adj_factor": 10}},
+        )
+        service, _p, _c, _ = make_service(providers=providers)
+        service.run(trigger=TriggerType.MANUAL)
+
+        # etf_daily 成功推进
+        s_daily = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert s_daily.watermark_date == date(2026, 9, 16)
+        assert s_daily.last_status == TASK_STATUS_SUCCESS
+
+        # etf_adj_factor 失败不动
+        s_adj = _stock_state(session_factory, DatasetName.ETF_ADJ_FACTOR, "CN:ETF:510300")
+        assert s_adj.watermark_date is None
+        assert s_adj.last_status == TASK_STATUS_FAILED
+
+    def test_all_caught_up_is_noop(self, make_service, session_factory):
+        """Scenario "全部追平时 NOOP"：股票 + ETF 全追平 → Run NOOP。"""
+        providers = FakeStockHistoryProviders(
+            symbols=("000001",),
+            etf_symbols=("510300",),
+        )
+        service, _p, _c, _ = make_service(providers=providers)
+        service.run(trigger=TriggerType.MANUAL)
+
+        run_id = service.run(trigger=TriggerType.MANUAL)
+        with session_factory() as session:
+            run = HistorySyncRunRepository(session).get(run_id)
+        assert run.status == RunStatus.NOOP.value
+
+
+class TestEtfLifecycle:
+    """ETF 生命周期边界：list_date 回退、消失 ETF is_active=false、stale run 恢复。"""
+
+    def test_list_date_null_falls_back_to_start_date(self, make_service, session_factory):
+        """Scenario "list_date NULL 回退"：ETF list_date 不提供 →
+        首次 run 从 history.start_date（09-10）开始同步到 target（水位 09-16、
+        facts 从 09-14 起 3 行）。"""
+        providers = FakeStockHistoryProviders(
+            etf_symbols=("510300",),
+            # etf_list_dates 不提供 → list_date=None
+        )
+        service, _p, _c, _ = make_service(
+            providers=providers, start_date=date(2026, 9, 10)
+        )
+        service.run(trigger=TriggerType.MANUAL)
+
+        state = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert state.watermark_date == date(2026, 9, 16)
+
+        total = _fact_total_rows(session_factory, DatasetName.ETF_DAILY)
+        assert total == 3  # 09-14 / 09-15 / 09-16 共 3 个交易日
+
+    def test_delisted_etf_zero_requests_after_caught_up(self, make_service, session_factory, monkeypatch):
+        """Scenario "消失 ETF 空结果追平后零请求"：首轮 universe 含 159915，
+        第二轮 universe 不再含它 → is_active=false、历史事实不变、不再请求。"""
+        providers = FakeStockHistoryProviders(etf_symbols=("510300", "159915"))
+        service, _p, _c, _ = make_service(providers=providers)
+
+        # 第一轮：两只 ETF 都同步
+        run1 = service.run(trigger=TriggerType.MANUAL)
+
+        # 验证两只都追平
+        for sym in ("510300", "159915"):
+            s = _stock_state(session_factory, DatasetName.ETF_DAILY, f"CN:ETF:{sym}")
+            assert s.watermark_date == date(2026, 9, 16)
+
+        # 第二轮前：修改 universe 列表（移除 159915），模拟退市/消失
+        providers.etf_symbols = ("510300",)
+        # 强制 universe 刷新：清除 etf_basic last_success_at
+        from app.repositories.history_sync import HistorySyncStateRepository
+        from app.models.history_sync import HistorySyncState
+        with session_factory() as session:
+            session.execute(
+                update(HistorySyncState)
+                .where(HistorySyncState.dataset == "etf_basic")
+                .values(last_success_at=None)
+            )
+            session.commit()
+
+        calls_before = len(providers.stock_calls)
+        run2 = service.run(trigger=TriggerType.MANUAL)
+
+        # 验证 159915 的 stock_calls：第二轮不应再有请求
+        etf15_calls_after = [
+            c for c in providers.stock_calls[calls_before:]
+            if c[1] == "159915.SZ"
+        ]
+        assert len(etf15_calls_after) == 0, "消失 ETF 不应再被请求"
+
+        # 验证 is_active=false
+        from app.models.instrument import Instrument
+        with session_factory() as session:
+            inst = session.get(Instrument, "CN:ETF:159915")
+        assert inst is not None
+        assert inst.is_active is False, "消失 ETF 应置 is_active=false"
+
+        # 历史事实不变
+        total = _fact_total_rows(session_factory, DatasetName.ETF_DAILY)
+        assert total == 6  # 2 只 × 3 交易日
+
+        # 510300 仍然追平（skipped）
+        rd = _run_dataset(session_factory, run2, DatasetName.ETF_DAILY)
+        assert rd.status == RunDatasetStatus.NOOP.value
+
+    def test_stale_run_recovery_for_etf(self, make_service, session_factory):
+        """Scenario "stale run 中断恢复（ETF）"：手动把 ETF 的 sync_task
+        置 running（模拟 stale）+ run 一条新 run → 旧 task 置 interrupted、
+        水位不动（参照 TestStaleRunRecovery 模式）。"""
+        providers = FakeStockHistoryProviders(etf_symbols=("510300",))
+        service, _p, _c, _ = make_service(providers=providers)
+        # 先正常 run 一次让 ETF 主档到位
+        service.run(trigger=TriggerType.MANUAL)
+
+        with session_factory() as session:
+            run_repo = HistorySyncRunRepository(session)
+            run_repo.create(
+                "stale-etf-run-001", trigger_type=TriggerType.SCHEDULED,
+                requested_by_user_id=None, started_at=FROZEN_NOW,
+            )
+            task_repo = SyncTaskRepository(session)
+            task_repo.create(
+                run_id="stale-etf-run-001",
+                dataset=DatasetName.ETF_DAILY,
+                instrument_id="CN:ETF:510300",
+                ts_code="510300.SH",
+                start_date=date(2026, 9, 14),
+                end_date=date(2026, 9, 16),
+                started_at=FROZEN_NOW,
+            )
+            session.commit()
+
+        service.run(trigger=TriggerType.STARTUP)
+
+        with session_factory() as session:
+            stale = HistorySyncRunRepository(session).get("stale-etf-run-001")
+            assert stale.status == RunStatus.INTERRUPTED.value
+            assert stale.finished_at is not None
+
+            tasks = list(session.scalars(
+                select(SyncTask).where(SyncTask.run_id == "stale-etf-run-001")
+            ))
+        assert len(tasks) == 1
+        assert tasks[0].status == "interrupted"
+        assert tasks[0].finished_at is not None
+
+        # 水位不动（之前已追平到 09-16）
+        state = _stock_state(session_factory, DatasetName.ETF_DAILY, "CN:ETF:510300")
+        assert state.watermark_date == date(2026, 9, 16)

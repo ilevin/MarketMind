@@ -1,5 +1,7 @@
-{# ETF 历史占位页（optimize-navigation，admin-data-management spec『ETF 历史占位页面』）：
-   仅「敬请期待」空状态说明，不提供任何数据操作；功能由后续变更实现。 #}
+{# ETF 个股历史页（etf-data-module，tasks 8.4 / design D12）：
+   结构复刻 /admin/data/stocks——数据集 chip（etf_daily/etf_adj_factor）、
+   状态筛选、名称/代码搜索、100 条服务端分页、失败行只读 modal。
+   数据由原生 JS 调 /api/admin/history-data/stocks?dataset=etf_* 填充。 #}
 {% set nav_section = "data" %}
 {% set nav_item = "ETF历史" %}
 {% set page_id = "admin-data-etf-history" %}
@@ -8,6 +10,94 @@
 
 {% block content %}
     <section class="panel">
-      <p class="empty">ETF 历史数据功能建设中，敬请期待。</p>
+      <div class="data-overview">
+        <div class="overview-item">
+          <span class="overview-label">数据集</span>
+          <span id="dataset-display">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">ETF 总数</span>
+          <span id="stock-count">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">已追平</span>
+          <span id="up-to-date-count" class="status-badge ok">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">有缺口</span>
+          <span id="lagging-count" class="status-badge warn">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">今日成功</span>
+          <span id="today-success">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">今日失败</span>
+          <span id="today-failed">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">完整度</span>
+          <span id="completion-rate">—</span>
+        </div>
+      </div>
     </section>
+
+    <section class="panel">
+      <div class="stocks-toolbar">
+        <div id="dataset-chips" class="chip-group">
+          <!-- 数据集切换 chip 由 JS 渲染 -->
+        </div>
+        <div class="stocks-filter">
+          <select id="status-filter">
+            <option value="all">全部状态</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+          <input type="text" id="search-input" placeholder="搜索名称 / 代码…" />
+        </div>
+      </div>
+
+      <table class="table" id="stocks-table">
+        <thead>
+          <tr>
+            <th>代码</th>
+            <th>名称</th>
+            <th>上市日</th>
+            <th>退市日</th>
+            <th>水位日期</th>
+            <th>状态</th>
+            <th>最后成功</th>
+            <th>最后尝试</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="9" class="muted">加载中…</td></tr>
+        </tbody>
+      </table>
+      <p id="stocks-empty" class="empty hidden">没有匹配的 ETF。</p>
+
+      <div class="pagination">
+        <button id="prev-page" disabled>上一页</button>
+        <span id="page-info">第 1 / 1 页 · 共 0 条</span>
+        <button id="next-page" disabled>下一页</button>
+      </div>
+      <p class="muted">每页 100 条；运行中每 10 秒自动刷新。</p>
+    </section>
+
+    <!-- 失败详情 modal（只读） -->
+    <div id="error-modal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="error-modal-title">失败详情</h3>
+        <div class="modal-hint">
+          <span id="error-modal-tscode"></span>
+          <span class="muted"> · </span>
+          <span id="error-modal-errorcode"></span>
+        </div>
+        <div id="error-modal-message" class="error-detail"></div>
+        <div class="modal-actions">
+          <button id="error-modal-close">关闭</button>
+        </div>
+      </div>
+    </div>
 {% endblock %}

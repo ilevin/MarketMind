@@ -69,13 +69,29 @@ def _warn_if_password_setup_pending(session_factory, logger) -> None:
         )
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
+def create_app(
+    config: AppConfig | None = None,
+    *,
+    session_factory=None,
+) -> FastAPI:
+    """构建 FastAPI 应用。
+
+    ``session_factory``（可选，测试注入）：传入时复用调用方的 engine，
+    lifespan / 后台 Job / 全部内部组件共用同一连接池——避免测试里
+    "fixture engine + app 自建 engine" 双 engine 指向同一 DuckDB 文件
+    （进程内共享底层 database 实例，双 engine 交错 dispose 后 DuckDB
+    工作线程不回收，全量回归累积数百线程显著拖慢——v0.4.2 修复）。
+    生产路径不传（按 config.database.url 自建）。
+    """
     config = config or load_config()
     setup_logging(config)
     logger = logging.getLogger(__name__)
 
-    engine = create_db_engine(config.database.url)
-    session_factory = make_session_factory(engine)
+    if session_factory is not None:
+        engine = session_factory.kw["bind"]
+    else:
+        engine = create_db_engine(config.database.url)
+        session_factory = make_session_factory(engine)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -165,6 +181,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await fundamental_job.stop()
             if history_job is not None:
                 await history_job.stop()
+            # 停机释放数据库连接：DuckDB 工作线程随连接关闭回收。
+            # 不 dispose 时每个应用实例的线程会残留（生产单进程影响小，
+            # 测试每个 TestClient 一个 app 实例，全量回归累积数百线程后
+            # 显著拖慢甚至卡死——v0.4.2 修复，基线 v0.4.1 即存在）。
+            engine.dispose()
             logger.info("应用已停止")
 
     # 匿名可达路由仅 /login、/setup、/health、/static/*（user-authentication spec），
@@ -203,6 +224,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         admin_users,
         auth,
         index_watchlist,
+        quant,
         quotes,
         status,
         tags,
@@ -218,6 +240,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.include_router(admin_users.router)
     app.include_router(status.router)
     app.include_router(tags.router)
+    app.include_router(quant.router)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request, exc):
@@ -314,7 +337,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def admin_data_etf_page(
         request: Request, current_user: CurrentUser = Depends(require_admin_page)
     ):
-        """ETF 数据占位页（optimize-navigation）：导航入口先就位，功能由后续变更实现。"""
+        """ETF 数据总览页（etf-data-module，tasks 8.3）：服务端渲染首屏壳，
+        数据由原生 JS 调 /api/admin/history-data/summary 填充（运行中每 10 秒轮询）。"""
         return templates.TemplateResponse(
             request, "admin_data_etf.html", {"current_user": current_user}
         )
@@ -323,7 +347,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def admin_data_etf_history_page(
         request: Request, current_user: CurrentUser = Depends(require_admin_page)
     ):
-        """ETF 历史占位页（optimize-navigation）：导航入口先就位，功能由后续变更实现。"""
+        """ETF 个股历史页（etf-data-module，tasks 8.4）：数据集切换、
+        状态筛选、搜索、分页；失败行详情 modal。"""
         return templates.TemplateResponse(
             request, "admin_data_etf_history.html", {"current_user": current_user}
         )

@@ -27,7 +27,7 @@ from alembic.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# head（0004）应创建的全部 25 张业务表（不含 alembic_version 系统表）
+# head（0005）应创建的全部 28 张业务表（不含 alembic_version 系统表）
 EXPECTED_TABLES = {
     "instrument",
     "watchlist",
@@ -56,8 +56,12 @@ EXPECTED_TABLES = {
     # --- per-stock-history-sync（0004） ---
     "stock_sync_state",
     "sync_task",
+    # --- etf-data-module（0005） ---
+    "cn_etf_basic",
+    "etf_daily",
+    "etf_adj_factor",
 }
-HEAD_REVISION = "0004_per_stock_history_sync"
+HEAD_REVISION = "0005_etf_data_module"
 
 
 def _alembic_config(db_path: Path) -> Config:

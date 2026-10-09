@@ -40,6 +40,8 @@ class AvailabilityPolicy:
             DatasetName.DAILY.value: _parse_cutoff(config.history.availability.daily),
             DatasetName.DAILY_BASIC.value: _parse_cutoff(config.history.availability.daily_basic),
             DatasetName.MONEYFLOW.value: _parse_cutoff(config.history.availability.moneyflow),
+            DatasetName.ETF_DAILY.value: _parse_cutoff(config.history.availability.etf_daily),
+            DatasetName.ETF_ADJ_FACTOR.value: _parse_cutoff(config.history.availability.etf_adj_factor),
         }
 
     def cutoff_for(self, dataset: DatasetName | str) -> time:

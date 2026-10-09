@@ -197,17 +197,53 @@ def test_setup_page_has_no_nav(client_factory):
     assert '<div class="subbar">' not in body
 
 
-# ---- ETF 占位页（admin-data-management spec『ETF 数据占位页面』『ETF 历史占位页面』） ----
+# ---- ETF 数据页（etf-data-module，tasks 8.5；原占位页测试改写为真实页面） ----
 
 
-def test_etf_pages_admin_renders_placeholder(client_factory):
-    """管理员访问两个 ETF 占位页：200、仅「敬请期待」空状态、无任何数据操作。"""
+def test_etf_overview_page_renders(client_factory):
+    """管理员访问 /admin/data/etf：200、总览壳完整（数据由 JS 拉 summary 填充）。"""
     with _admin_client(client_factory) as client:
-        for path in ("/admin/data/etf", "/admin/data/etf/history"):
-            resp = client.get(path)
-            assert resp.status_code == 200, path
-            assert "敬请期待" in resp.text, path
-            assert "<input" not in resp.text and "<textarea" not in resp.text, path
+        resp = client.get("/admin/data/etf")
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'data-page="admin-data-etf"' in body
+    for anchor in (
+        'id="overall-status"',          # 整体状态徽章
+        'id="etf-active-count"',        # universe 概况：活跃 ETF
+        'id="etf-total-count"',         # universe 概况：全部 ETF
+        'id="etf-universe-refreshed"',  # universe 最近刷新
+        'id="history-start-date"',
+        'id="sync-button"',             # 手动同步（复用 POST /sync）
+        'id="etf-cards"',               # etf_basic 主档卡 + 两个日级卡容器
+        'id="active-run"',              # 当前任务进度
+        'id="etf-disabled-panel"',      # 未启用说明态
+    ):
+        assert anchor in body, f"缺少页面元素 {anchor}"
+    assert "敬请期待" not in body, "占位文案应已移除"
+    # 总览页无任何数据编辑入口（spec：只读展示 + 单一同步按钮）
+    assert "<input" not in body and "<textarea" not in body
+
+
+def test_etf_history_page_renders(client_factory):
+    """管理员访问 /admin/data/etf/history：200、结构复刻个股历史页。"""
+    with _admin_client(client_factory) as client:
+        resp = client.get("/admin/data/etf/history")
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'data-page="admin-data-etf-history"' in body
+    for anchor in (
+        'id="dataset-chips"',   # 数据集 chip（etf_daily/etf_adj_factor，JS 渲染）
+        'id="status-filter"',
+        'id="search-input"',
+        'id="stocks-table"',
+        'id="prev-page"',
+        'id="next-page"',
+        'id="page-info"',
+        'id="error-modal"',
+    ):
+        assert anchor in body, f"缺少页面元素 {anchor}"
+    assert 'id="error-modal-title"' in body
+    assert "没有匹配的 ETF" in body, "空状态文案应为 ETF 口径"
 
 
 def test_etf_pages_normal_user_403(client_factory):

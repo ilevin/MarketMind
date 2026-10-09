@@ -49,9 +49,11 @@ class FundamentalProviderConfig(BaseModel):
 
 
 class HistoryProviderConfig(BaseModel):
-    """历史行情数据源选源（a-share-historical-data，技术方案 §31.4）。"""
+    """历史行情数据源选源（a-share-historical-data，技术方案 §31.4；etf-data-module 扩展 ETF 数据集）。"""
 
     market_data: str = "tushare"
+    etf_daily: str = "eastmoney"
+    etf_adj_factor: str = "tushare"
 
 
 class TimeoutConfig(BaseModel):
@@ -70,7 +72,7 @@ class ProvidersConfig(BaseModel):
 
 
 class HistoryAvailabilityConfig(BaseModel):
-    """各日级数据集默认可用时间 cutoff（技术方案 §27，北京时间）。
+    """各日级数据集默认可用时间 cutoff（技术方案 §27，北京时间；etf-data-module 扩展 ETF 数据集）。
 
     moneyflow 的 20:30 属保守运行策略，非 Tushare 官方承诺。
     """
@@ -79,10 +81,12 @@ class HistoryAvailabilityConfig(BaseModel):
     daily: str = "16:30"
     daily_basic: str = "17:30"
     moneyflow: str = "20:30"
+    etf_daily: str = "16:30"
+    etf_adj_factor: str = "09:30"
 
 
 class HistoryConfig(BaseModel):
-    """历史数据同步配置（a-share-historical-data，技术方案 §57；per-stock-history-sync D13）。"""
+    """历史数据同步配置（a-share-historical-data，技术方案 §57；per-stock-history-sync D13；etf-data-module 扩展 ETF 配置）。"""
 
     enabled: bool = True
     start_date: date = date(2010, 1, 1)
@@ -108,6 +112,11 @@ class HistoryConfig(BaseModel):
     # 主档刷新周期（技术方案 §41）
     stock_basic_refresh_hours: int = Field(default=24, ge=1)
     master_refresh_days: int = Field(default=7, ge=1)
+
+    # ETF 数据同步配置（etf-data-module）
+    etf_enabled: bool = True
+    etf_request_min_interval_seconds: float = Field(default=0.5, gt=0)
+    etf_universe_refresh_hours: int = Field(default=24, ge=1)
 
     availability: HistoryAvailabilityConfig = Field(
         default_factory=HistoryAvailabilityConfig

@@ -26,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_REVISION = "0001_duckdb_baseline"
 HEAD_REVISION = "0002_multi_user_auth"
-CURRENT_HEAD = "0004_per_stock_history_sync"
+CURRENT_HEAD = "0005_etf_data_module"
 LEGACY_USERNAME = "admin"
 PLACEHOLDER_HASH = "!unloginable-placeholder"
 
@@ -105,7 +105,7 @@ def test_upgrade_from_0001_assigns_all_data_to_legacy_owner(tmp_path):
     engine = _open_engine(db)
     try:
         with engine.connect() as conn:
-            # 版本就位（0002 迁移已执行；0003 为纯增量，head 指向当前链尾）
+            # 版本就位（0002 迁移已执行；0003-0005 为纯增量，head 指向当前链尾）
             assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() \
                 == CURRENT_HEAD
 

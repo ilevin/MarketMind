@@ -458,6 +458,12 @@ _STOCK_RANGE_DATASETS: dict[str, dict] = {
         "required": MONEYFLOW_REQUIRED,
         "build": _build_moneyflow_row,
     },
+    "etf_adj_factor": {
+        "endpoint": "fund_adj",
+        "fields": ("ts_code", "trade_date", "adj_factor"),
+        "required": ("ts_code", "trade_date", "adj_factor"),
+        "build": _build_adj_factor_row,  # 复用股票 adj_factor 行构建器
+    },
 }
 
 
@@ -572,6 +578,15 @@ class TushareHistoricalMarketDataProvider:
         return ProviderBatch(
             records=records, source=SOURCE, raw_row_count=len(df)
         )
+
+    def get_etf_universe(self) -> ProviderBatch:
+        """获取当前上市 ETF 列表（etf-data-module，fund_basic market=E）。
+
+        Tushare fund_basic 接口返回全部基金，market=E 筛选 ETF。
+        返回空 batch（ETF universe 由 EastmoneyEtfHistoryProvider 提供，
+        Tushare 仅提供 adj_factor）。
+        """
+        return ProviderBatch(records=[], source=SOURCE, raw_row_count=0)
 
     # ---- 日级数据集 ----
 
@@ -694,7 +709,7 @@ class TushareHistoricalMarketDataProvider:
             build=_build_moneyflow_row,
         )
 
-    # ---- 个股区间拉取（design D4） ----
+    # ---- 个股区间拉取（design D4；etf-data-module 扩展 ETF 数据集） ----
 
     def get_history_by_stock(
         self,
@@ -703,7 +718,7 @@ class TushareHistoricalMarketDataProvider:
         start_date: date,
         end_date: date,
     ) -> ProviderBatch:
-        """按单只股票区间拉取历史事实（个股级同步主路径）。
+        """按单只证券区间拉取历史事实（个股级同步主路径；etf-data-module 扩展 ETF 数据集）。
 
         一次请求覆盖完整区间，**不**逐日拆分；``ts_code`` 由传入 Instrument
         的主档当前代码构造（不按代码首位推断交易所）。返回行经别名
@@ -712,6 +727,9 @@ class TushareHistoricalMarketDataProvider:
         ``raw_row_count`` 取别名规范化前的上游行数；
         ``truncation_risk`` 按 ``raw_rows >= DAILY_ROW_CAP`` 判定（异常
         放大返回的防护，单股 16 年约 4000 行正常不触发）。
+
+        支持数据集：股票（daily/adj_factor/daily_basic/moneyflow）与 ETF
+        （etf_adj_factor，调用 fund_adj 接口，复用 AdjFactor 模型）。
         """
         spec = _STOCK_RANGE_DATASETS.get(dataset)
         if spec is None:

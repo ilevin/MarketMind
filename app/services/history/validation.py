@@ -21,6 +21,7 @@ from app.providers.base import (
     AdjFactor,
     DailyBar,
     DailyBasic,
+    EtfDailyBar,
     MoneyFlow,
     ProviderBatch,
     StockBasicRecord,
@@ -323,6 +324,82 @@ def _validate_moneyflow(
             _non_negative(getattr(record, field), field, context)
 
 
+def _validate_etf_daily(
+    batch: ProviderBatch[EtfDailyBar],
+    *,
+    trade_date,
+    known_instrument_ids,
+    allow_empty,
+    date_range=None,
+    lifecycle=None,
+) -> None:
+    """ETF 日线专项校验：OHLC 非负且 high>=max(open,close)、low<=min(open,close)；
+    volume/amount/turnover_rate 非负；NULL 保留。
+    """
+    context = _day_context("etf_daily", trade_date, date_range)
+    _check_common(
+        batch,
+        context=context,
+        allow_empty=allow_empty,
+        known_instrument_ids=known_instrument_ids,
+        expected_trade_date=trade_date,
+        require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
+    )
+    for record in batch.records:
+        _non_negative(record.open, "open", context)
+        _non_negative(record.high, "high", context)
+        _non_negative(record.low, "low", context)
+        _non_negative(record.close, "close", context)
+        _non_negative(record.volume, "volume", context)
+        _non_negative(record.amount, "amount", context)
+        _non_negative(record.turnover_rate, "turnover_rate", context)
+        # OHLC 完整时检查 high/low 约束（与 _validate_daily 口径一致）
+        if all(
+            value is not None and value > 0
+            for value in (record.open, record.high, record.low, record.close)
+        ):
+            if record.high < record.open or record.high < record.close or record.high < record.low:
+                raise InvalidValueError(
+                    f"{context}: high({record.high}) 低于 OHLC 其余值 "
+                    f"(open={record.open}, close={record.close}, low={record.low})"
+                )
+            if record.low > record.open or record.low > record.close:
+                raise InvalidValueError(
+                    f"{context}: low({record.low}) 高于 open/close "
+                    f"(open={record.open}, close={record.close})"
+                )
+
+
+def _validate_etf_adj_factor(
+    batch: ProviderBatch[AdjFactor],
+    *,
+    trade_date,
+    known_instrument_ids,
+    allow_empty,
+    date_range=None,
+    lifecycle=None,
+) -> None:
+    """ETF 复权因子专项校验：每条 adj_factor > 0（与股票 adj_factor 规则一致）。"""
+    context = _day_context("etf_adj_factor", trade_date, date_range)
+    _check_common(
+        batch,
+        context=context,
+        allow_empty=allow_empty,
+        known_instrument_ids=known_instrument_ids,
+        expected_trade_date=trade_date,
+        require_trade_date=True,
+        date_range=date_range,
+        lifecycle=lifecycle,
+    )
+    for record in batch.records:
+        if record.adj_factor <= 0:
+            raise InvalidValueError(
+                f"{context}: adj_factor 必须 > 0，得到 {record.adj_factor}"
+            )
+
+
 # ---- 主档专项 ----
 
 
@@ -396,13 +473,15 @@ _HANDLERS: dict[str, Callable] = {
     "adj_factor": _validate_adj_factor,
     "daily_basic": _validate_daily_basic,
     "moneyflow": _validate_moneyflow,
+    "etf_daily": _validate_etf_daily,
+    "etf_adj_factor": _validate_etf_adj_factor,
     "stock_basic": _validate_stock_basic,
     "stock_company": _validate_stock_company,
     "namechange": _validate_namechange,
 }
 
-# 支持区间模式（date_range）的数据集（design D6：仅四个日级事实数据集）
-_DAY_LEVEL_DATASETS = frozenset({"daily", "adj_factor", "daily_basic", "moneyflow"})
+# 支持区间模式（date_range）的数据集（design D6：股票四个日级事实数据集 + ETF 两个日级数据集）
+_DAY_LEVEL_DATASETS = frozenset({"daily", "adj_factor", "daily_basic", "moneyflow", "etf_daily", "etf_adj_factor"})
 
 
 def validate_batch(

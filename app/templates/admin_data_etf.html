@@ -1,5 +1,7 @@
-{# ETF 数据占位页（optimize-navigation，admin-data-management spec『ETF 数据占位页面』）：
-   仅「敬请期待」空状态说明，不提供任何数据操作；功能由后续变更实现。 #}
+{# ETF 数据总览页（etf-data-module，tasks 8.3 / design D12）：
+   universe 概况卡 + etf_basic 主档卡 + etf_daily/etf_adj_factor 数据集卡 +
+   当前任务进度 + 手动同步（复用 POST /api/admin/history-data/sync）；
+   数据由原生 JS 调 /api/admin/history-data/summary 填充（运行中每 10 秒轮询）。 #}
 {% set nav_section = "data" %}
 {% set nav_item = "ETF数据" %}
 {% set page_id = "admin-data-etf" %}
@@ -7,7 +9,58 @@
 {% extends "base.html" %}
 
 {% block content %}
+    <section class="panel" id="etf-main">
+      <div class="data-overview">
+        <div class="overview-item">
+          <span class="overview-label">整体状态</span>
+          <span id="overall-status" class="status-badge">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">活跃 ETF</span>
+          <span id="etf-active-count">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">全部 ETF</span>
+          <span id="etf-total-count">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">universe 最近刷新</span>
+          <span id="etf-universe-refreshed">—</span>
+        </div>
+        <div class="overview-item">
+          <span class="overview-label">数据起点</span>
+          <span id="history-start-date">—</span>
+        </div>
+        <div class="overview-action">
+          <button id="sync-button">检查并更新数据</button>
+        </div>
+      </div>
+      <p id="sync-message" class="message hidden"></p>
+      <p class="muted">
+        ETF universe 每天刷新一次（列表来源东财）；日线行情来自东财、复权因子来自 Tushare fund_adj。
+        首次回填 ETF 全量历史预期跨多次运行完成。
+      </p>
+    </section>
+
+    <section class="panel" id="etf-datasets-panel">
+      <h2>ETF 数据集</h2>
+      <div id="etf-cards" class="data-cards">
+        <p class="muted">加载中…</p>
+      </div>
+    </section>
+
     <section class="panel">
-      <p class="empty">ETF 数据管理功能建设中，敬请期待。</p>
+      <h2>当前任务进度</h2>
+      <div id="active-run">
+        <p class="muted">当前没有运行中的同步任务。</p>
+      </div>
+    </section>
+
+    {# etf_enabled=false 时的未启用说明态（数据区隐藏，仅说明） #}
+    <section class="panel hidden" id="etf-disabled-panel">
+      <p class="empty">
+        ETF 数据模块未启用（配置 history.etf_enabled=false）。股票数据同步不受影响；
+        需要启用 ETF 数据时修改配置后重启服务即可，首次启用将自动回填全量历史。
+      </p>
     </section>
 {% endblock %}

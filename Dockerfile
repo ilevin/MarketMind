@@ -12,7 +12,12 @@ COPY dist/wheels /tmp/wheels
 COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels marketmind==0.4.1 \
+# 安装版本由构建方注入：单一来源是 pyproject.toml，由 scripts/build-docker.sh 解析后
+# 经 --build-arg 传入。本文件 SHALL NOT 硬编码版本字面量（deployment 规格「Dockerfile」要求）。
+ARG APP_VERSION
+RUN test -n "${APP_VERSION}" \
+      || { echo "ERROR: 缺少 APP_VERSION 构建参数（应用安装版本）。请使用 --build-arg APP_VERSION=<版本> 重新构建，版本取自 pyproject.toml；或直接运行 ./scripts/build-docker.sh <TAG>。" >&2; exit 1; } \
+    && pip install --no-cache-dir --no-index --find-links /tmp/wheels "marketmind==${APP_VERSION}" \
     && rm -rf /tmp/wheels
 
 RUN mkdir -p /app/data

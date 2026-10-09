@@ -31,7 +31,7 @@
 - [x] 5.1 镜像内容校验：`sudo docker run --rm marketmind:v0.4.2 pip show marketmind` 输出的 Version 为 `0.4.2`，与 `pyproject.toml` 一致
 - [x] 5.2 启动容器后 `curl http://localhost:8000/health` 返回 `version: v0.4.2`，与 `app/version.py` 一致
 - [x] 5.3 全量离线回归 `python -m pytest -m "not online" -q` 全绿（新增一致性测试纳入默认收集），且 `openspec validate fix-docker-version-drift` 通过
-- [ ] 5.4 以约定前缀（`fix:` 或 `build:`）提交；验证：`git show --stat HEAD` 确认本次未改动 `app/version.py` 与 `pyproject.toml` 的版本号（本次不升版本），且改动集中在 `Dockerfile`、`scripts/build-docker.sh`、`docs/Docker构建指南.md`、新增测试
+- [x] 5.4 以约定前缀（`fix:` 或 `build:`）提交；验证：`git show --stat HEAD` 确认本次未改动 `app/version.py` 与 `pyproject.toml` 的版本号（本次不升版本），且改动集中在 `Dockerfile`、`scripts/build-docker.sh`、`docs/Docker构建指南.md`、新增测试
 
 ## Workflow follow-up
 
